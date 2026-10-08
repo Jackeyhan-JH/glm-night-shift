@@ -95,6 +95,52 @@ test('不在 git 仓库里时：FAKE_GH_REPO 兜底，再兜底 fake-owner/fake-
   assert.equal(fallback.stdout, 'https://github.com/fake-owner/fake-repo/pull/1\n');
 });
 
+test('验收：pr list --state open --json url 未设 FAKE_GH_EXISTING_PR_URL 时输出 []', async (t) => {
+  const res = runFakeGh(t, ['pr', 'list', '--repo', 'a/b', '--head', 'x', '--state', 'open', '--json', 'url'], {});
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '[]\n');
+  assert.equal(res.stderr, '');
+});
+
+test('设 FAKE_GH_EXISTING_PR_URL 时 pr list 输出含该 URL 的数组（JSON 可解析）', async (t) => {
+  const res = runFakeGh(t, ['pr', 'list', '--repo', 'a/b', '--head', 'x', '--state', 'open', '--json', 'url'], {
+    env: { FAKE_GH_EXISTING_PR_URL: 'https://github.com/a/b/pull/5' },
+  });
+  assert.equal(res.code, 0);
+  assert.deepEqual(JSON.parse(res.stdout), [{ url: 'https://github.com/a/b/pull/5' }]);
+  assert.ok(res.stdout.endsWith('\n'));
+});
+
+test('FAKE_GH_BODY_COPY：pr create 把 --body-file 的内容复制过去（两种写法都支持）', async (t) => {
+  const dir = makeTempHome(t);
+  const bodyFile = path.join(dir, 'body.md');
+  fs.writeFileSync(bodyFile, '# 正文\n\n由 GLM 夜班自动创建\n');
+  const forms = [['空格写法', ['--body-file', bodyFile]], ['等号写法', [`--body-file=${bodyFile}`]]];
+  for (const [label, form] of forms) {
+    const copyTo = path.join(dir, `copy-${label}.md`);
+    const res = runFakeGh(t, ['pr', 'create', '--repo', 'a/b', '--title', 't', ...form], {
+      env: { FAKE_GH_BODY_COPY: copyTo },
+      cwd: dir,
+    });
+    assert.equal(res.code, 0, label);
+    assert.equal(res.stdout, 'https://github.com/a/b/pull/1\n', label);
+    assert.equal(fs.readFileSync(copyTo, 'utf8'), '# 正文\n\n由 GLM 夜班自动创建\n', label);
+  }
+});
+
+test('FAKE_GH_BODY_COPY 与 FAKE_GH_FAIL=1 同时设置时不复制（失败路径没有正文可给）', async (t) => {
+  const dir = makeTempHome(t);
+  const bodyFile = path.join(dir, 'body.md');
+  fs.writeFileSync(bodyFile, 'x');
+  const copyTo = path.join(dir, 'copy.md');
+  const res = runFakeGh(t, ['pr', 'create', '--repo', 'a/b', '--body-file', bodyFile], {
+    env: { FAKE_GH_BODY_COPY: copyTo, FAKE_GH_FAIL: '1' },
+    cwd: dir,
+  });
+  assert.equal(res.code, 1);
+  assert.equal(fs.existsSync(copyTo), false);
+});
+
 test('其他子命令与无参数：静默退出 0', async (t) => {
   for (const args of [[], ['auth', 'status'], ['pr', 'view', '1'], ['repo', 'list']]) {
     const res = runFakeGh(t, args, {});
