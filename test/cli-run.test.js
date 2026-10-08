@@ -233,6 +233,140 @@ test('usage 空库：已用 0 / 1600、0 / 8000，退出 0', async (t) => {
   assert.ok(res.stdout.includes('已用 0 / 8000'), res.stdout);
 });
 
+// ---------------------------------------------------------------- usage 阈值提示（#82）
+
+/** 建一个排队任务并返回其 id（阈值测试都要先有任务行才能挂运行）。 */
+function makeTask(home) {
+  const db = openDb(path.join(home, 'night-shift.db'));
+  try {
+    return createTask(db, { repo: 'a/b', prompt: '额度阈值' }).id;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * 造一条带 quotaUnits 的历史运行（仿 seedRun）：quotaUnits 有值就按它计、不再乘倍率，
+ * 所以落笔时刻的高峰状态不影响扣减量；started_at 事后改写以摆进/摆出五小时窗口。
+ */
+function seedUnits(home, taskId, { startedAt, quotaUnits }) {
+  const db = openDb(path.join(home, 'night-shift.db'));
+  try {
+    const run = startRun(db, {
+      taskId, attempt: 1, model: 'glm-5.3', effort: 'medium', peak: false, logPath: '/tmp/x.log',
+    });
+    finishRun(db, run.id, { status: 'succeeded', quotaUnits });
+    db.prepare('UPDATE runs SET started_at = ? WHERE id = ?')
+      .run(new Date(startedAt).toISOString(), run.id);
+  } finally {
+    db.close();
+  }
+}
+
+test('验收: usage 第二行固定是本地估算说明；空库默认阈值不出现阈值行；--json 只有 plan/fiveHour/weekly', async (t) => {
+  const home = makeTempHome(t);
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  const lines = res.stdout.split('\n');
+  const planIdx = lines.indexOf('套餐：v2-max');
+  assert.notEqual(planIdx, -1, res.stdout);
+  assert.equal(
+    lines[planIdx + 1],
+    '额度是本地估算，不是官方账单。一次运行算 1 次 prompt，再乘模型倍率。',
+    res.stdout,
+  );
+  assert.equal(res.stdout.includes('5 小时额度已达安全阈值'), false, res.stdout);
+  assert.equal(res.stdout.includes('每周额度已达安全阈值'), false, res.stdout);
+  assert.equal(res.stdout.includes('暂不领'), false, res.stdout);
+  assert.ok(res.stdout.includes('已用 0 / 1600'), res.stdout);
+  assert.ok(res.stdout.includes('已用 0 / 8000'), res.stdout);
+
+  const j = await runCli(['usage', '--json'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(j.code, 0, j.stderr);
+  const parsed = JSON.parse(j.stdout);
+  assert.deepEqual(Object.keys(parsed).sort(), ['fiveHour', 'plan', 'weekly']);
+  assert.deepEqual(Object.keys(parsed.fiveHour).sort(), ['limit', 'ratio', 'resetsAt', 'used']);
+  assert.deepEqual(Object.keys(parsed.weekly).sort(), ['limit', 'ratio', 'resetsAt', 'used']);
+  assert.equal(j.stdout.includes('额度是本地估算'), false, j.stdout);
+  assert.equal(j.stdout.includes('安全阈值'), false, j.stdout);
+});
+
+test('验收: usage 只五小时超阈值：五小时窗口内 1440，1440+1 > 1600×0.9，只出五小时那行', async (t) => {
+  const home = makeTempHome(t);
+  const taskId = makeTask(home);
+  seedUnits(home, taskId, { startedAt: '2026-10-10T06:00:00Z', quotaUnits: 1440 });
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(res.stdout.includes('5 小时额度已达安全阈值'), res.stdout);
+  assert.equal(res.stdout.includes('每周额度已达安全阈值'), false, res.stdout);
+});
+
+test('验收: usage 只每周超阈值：窗口外、7 天内一条 7200，五小时 used 0，只出每周那行', async (t) => {
+  const home = makeTempHome(t);
+  const taskId = makeTask(home);
+  seedUnits(home, taskId, { startedAt: '2026-10-09T07:00:00Z', quotaUnits: 7200 });
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(res.stdout.includes('每周额度已达安全阈值'), res.stdout);
+  assert.equal(res.stdout.includes('5 小时额度已达安全阈值'), false, res.stdout);
+});
+
+test('验收: usage 两窗口都超阈值：两行都在，五小时那行在每周那行前面', async (t) => {
+  const home = makeTempHome(t);
+  const taskId = makeTask(home);
+  seedUnits(home, taskId, { startedAt: '2026-10-10T06:00:00Z', quotaUnits: 1440 });
+  seedUnits(home, taskId, { startedAt: '2026-10-09T07:00:00Z', quotaUnits: 5760 });
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  const fiveIdx = res.stdout.indexOf('5 小时额度已达安全阈值');
+  const weeklyIdx = res.stdout.indexOf('每周额度已达安全阈值');
+  assert.notEqual(fiveIdx, -1, res.stdout);
+  assert.notEqual(weeklyIdx, -1, res.stdout);
+  assert.ok(fiveIdx < weeklyIdx, res.stdout);
+});
+
+test('验收: usage 恰好等于阈值仍放得下：非高峰 nextCost 1，used 1439，1439+1 === 1440', async (t) => {
+  const home = makeTempHome(t);
+  const taskId = makeTask(home);
+  seedUnits(home, taskId, { startedAt: '2026-10-10T06:00:00Z', quotaUnits: 1439 });
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stdout.includes('5 小时额度已达安全阈值'), false, res.stdout);
+  assert.equal(res.stdout.includes('每周额度已达安全阈值'), false, res.stdout);
+});
+
+test('验收: usage 阈值用 config 的 safetyRatio（0.5），不是写死 0.9', async (t) => {
+  const home = makeTempHome(t);
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ plan: 'v2-max', safetyRatio: 0.5 }));
+  const taskId = makeTask(home);
+  seedUnits(home, taskId, { startedAt: '2026-10-10T06:00:00Z', quotaUnits: 800 }); // 801 > 800
+  const res = await runCli(['usage'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  // 若错用 0.9：801 <= 1440，这行就不该出现——这条断言专抓写死 0.9
+  assert.ok(res.stdout.includes('5 小时额度已达安全阈值'), res.stdout);
+  assert.equal(res.stdout.includes('每周额度已达安全阈值'), false, res.stdout);
+});
+
+test('验收: usage 下一笔倍率取当前时刻（高峰 3 / 非高峰 1），不是写死 1', async (t) => {
+  // 高峰（周四北京 15:00）：1438 + 3 > 1440 → 有五小时阈值行
+  const peakHome = makeTempHome(t);
+  const peakTaskId = makeTask(peakHome);
+  seedUnits(peakHome, peakTaskId, { startedAt: '2026-10-08T06:00:00Z', quotaUnits: 1438 });
+  const peak = await runCli(['usage'], { home: peakHome, env: { NIGHT_SHIFT_NOW: '2026-10-08T07:00:00Z' } });
+  assert.equal(peak.code, 0, peak.stderr);
+  assert.ok(peak.stdout.includes('5 小时额度已达安全阈值'), peak.stdout);
+  assert.equal(peak.stdout.includes('每周额度已达安全阈值'), false, peak.stdout);
+
+  // 同样用量换非高峰（周六）：1438 + 1 <= 1440 → 没有阈值行
+  const offHome = makeTempHome(t);
+  const offTaskId = makeTask(offHome);
+  seedUnits(offHome, offTaskId, { startedAt: '2026-10-10T06:00:00Z', quotaUnits: 1438 });
+  const off = await runCli(['usage'], { home: offHome, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(off.code, 0, off.stderr);
+  assert.equal(off.stdout.includes('5 小时额度已达安全阈值'), false, off.stdout);
+  assert.equal(off.stdout.includes('每周额度已达安全阈值'), false, off.stdout);
+});
+
 // ---------------------------------------------------------------- start
 
 test('验收: start 跑完任务：show 变 succeeded 带 prUrl，stdout 有启动行/领取/成功行；SIGINT 3 秒内退出 0', async (t) => {
