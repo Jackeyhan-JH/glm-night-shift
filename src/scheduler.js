@@ -12,7 +12,7 @@
 import { EventEmitter } from 'node:events';
 import { isPeak, getStatus } from './peak.js';
 import { usage as quotaUsage, canStart, multiplierFor } from './quota.js';
-import { startDecision } from './gate.js';
+import * as gateModule from './gate.js';
 import { formatLocalMinute } from './format.js';
 import { runTask } from './runner.js';
 import * as gitModule from './git.js';
@@ -49,6 +49,8 @@ const STALE_INFO_PATTERN = /stale info/i;
  * @param {object} [options.git] Git 集成模块，缺省 #8 的 src/git.js（测试注入假替身，
  *   只需提供 ensureRepoCache / defaultBranch / createWorktree / runTestCommand /
  *   commitAll / pushBranch / createPr / removeWorktree / prTitle / buildPrBody）
+ * @param {object} [options.gate] 高峰/额度闸门模块，缺省 src/gate.js（只需提供
+ *   startDecision；测试注入假替身以覆盖「领取后二次确认不通过」的退回路径）
  * @param {number} [options.cancelPollMs=1000] 轮询「运行中任务是否在库里被取消」的间隔
  * @param {object} [options.env=process.env] 子进程环境变量的基底，**原样**（不做任何
  *   清洗）传给 runner 的 `env` 参数和 git.createPr / findOpenPr 的 `env` 选项。
@@ -63,7 +65,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  */
 export function createScheduler({
   db, config, home,
-  clock = () => new Date(), runner = runTask, git = gitModule,
+  clock = () => new Date(), runner = runTask, git = gitModule, gate = gateModule,
   cancelPollMs = 1000, env = process.env,
 } = {}) {
   assertObject(db, 'db');
@@ -160,14 +162,21 @@ export function createScheduler({
      * 要求「现在就跑」），走完整流水线，返回最终任务对象（Promise）。
      * 任务会在 running 里登记（stop / 取消轮询 / status 都能看到它）。
      * id 接受数字或数字字符串（"12"）；只领 queued 的任务。
+     * 正在停止（stop() 之后、再次 start() 之前）时拒绝：调度器已承诺不再执行任务，
+     * 此时点名跑会跟停机收尾抢任务。先 start() 重启调度器再 runNow。
      * @param {number|string} taskId 正整数或其字符串形式
      * @returns {Promise<import('./tasks.js').TaskRow>} 流水线结束后的任务（终态或重新排队）
      * @throws {TypeError} taskId 不是正整数（或数字字符串）
+     * @throws {Error} 调度器正在停止（stop 后未重启）
      * @throws {import('./tasks.js').NotFoundError} 任务不存在
-     * @throws {InvalidTransitionError} 任务当前不是 queued（如已 succeeded）
+     * @throws {InvalidTransitionError} 任务当前不是 queued（如已 succeeded、或已被
+     *   tick 领走正在 running——原子领取保证同一任务绝不会被执行两次）
      */
     async runNow(taskId) {
       const id = normalizeTaskId(taskId);
+      if (stopping) {
+        throw new Error(`调度器正在停止，runNow 被拒绝（任务 ${id} 未领取；重启调度器后再试）`);
+      }
       const task = claimTaskById(db, id); // 非 queued 直接抛 InvalidTransitionError
       return processTask(task);
     },
@@ -246,7 +255,10 @@ export function createScheduler({
         break;
       }
       // 闸门按任务实际模型再确认一次；不通过就放回队列（不扣次数）并停止本轮。
-      const decision = startDecision({
+      // 注意：前面的预检已按 glm-5.3（倍率最高的模型）算过，正常配置下这里的二次确认
+      // 不会比预检更严（模型倍率只会更低），这一步是防御性不变量——万一配置/模型表
+      // 让单任务成本超过预检成本，也要保证任务原样退回而不是被误扣次数。
+      const decision = gate.startDecision({
         now: nowEach,
         model: config.difficulty?.[task.difficulty]?.model,
         allowPeak: task.allowPeak,
@@ -284,15 +296,52 @@ export function createScheduler({
   /**
    * 登记并执行一个已领取的任务（tick 领到的与 runNow 点名的都走这里）。
    * 同步登记 running / 发 claim 事件后再异步跑流水线，保证并发计数立即生效。
-   * 返回的 Promise 永不 reject，resolve 值是流水线结束后的任务对象。
+   * 返回的 Promise 永不 reject，resolve 值是流水线结束后的任务对象；无论流水线
+   * 怎么炸，running 登记总会在收尾里清掉（任务绝不会因此永久占着并发名额）。
    */
   function processTask(task) {
     const controller = new AbortController();
     running.set(task.id, { controller, task });
     lastBlockedKey = null; // 有任务被领取：清空 blocked 事件去重
-    events.emit('claim', { taskId: task.id });
+    try {
+      events.emit('claim', { taskId: task.id });
+    } catch (err) {
+      // 监听器抛错不该拦住任务执行（EventEmitter 会同步向上抛）
+      console.error(`[night-shift] claim 事件监听器出错（任务 ${task.id} 照常执行）：`, err);
+    }
     ensureCancelPolling();
-    return runPipeline(task, controller);
+    return runPipeline(task, controller)
+      .catch((err) => {
+        // runPipeline 自身承诺不 reject；这层兜底保证实现失误（如收尾读库抛错）也
+        // 绝不把任务永久留在 running：按剩余次数放回队列或落终态，退还这次尝试。
+        console.error(`[night-shift] 任务 ${task.id} 流水线意外中断：`, err);
+        try {
+          finishTask(db, task.id, {
+            status: task.attempts < task.maxAttempts ? 'queued' : 'failed',
+            lastError: `internal: ${err instanceof Error ? err.message : String(err)}`,
+            refundAttempt: true,
+          });
+        } catch (finishErr) {
+          console.error(`[night-shift] 记录任务 ${task.id} 的中断结果时出错：`, finishErr);
+        }
+        try {
+          return getTask(db, task.id) ?? task;
+        } catch {
+          return task;
+        }
+      })
+      .finally(() => {
+        running.delete(task.id);
+        if (running.size === 0) {
+          if (stopping && resolveStop !== null) {
+            const resolve = resolveStop;
+            stopPromise = null;
+            resolveStop = null;
+            resolve();
+          }
+          teardownCancelPollIfIdle();
+        }
+      });
   }
 
   async function runPipeline(task, controller) {
@@ -367,6 +416,8 @@ export function createScheduler({
           pausedUntil = retryAt;
           setBlocked({ reason: 'rate-limit', retryAt });
           finish('queued', {
+            // 「本地时间」= 进程所在时区（formatLocalMinute 用 Date 的本地 getter 渲染，
+            // 跟随 TZ 环境变量；测试用同一函数算期望值，断言与机器时区无关）
             lastError: `被限流，${formatLocalMinute(retryAt.toISOString())} 后重试`,
             notBefore: retryAt,
             refundAttempt: true,
@@ -471,21 +522,15 @@ export function createScheduler({
     }
 
     finalTask = getTask(db, task.id) ?? finalTask;
-    events.emit('done', {
-      taskId: task.id,
-      status: outcome ?? finalTask.status,
-      prUrl: finalTask.prUrl ?? null,
-      error: finalTask.lastError ?? null,
-    });
-    running.delete(task.id);
-    if (running.size === 0) {
-      if (stopping && resolveStop !== null) {
-        const resolve = resolveStop;
-        stopPromise = null;
-        resolveStop = null;
-        resolve();
-      }
-      teardownCancelPollIfIdle();
+    try {
+      events.emit('done', {
+        taskId: task.id,
+        status: outcome ?? finalTask.status,
+        prUrl: finalTask.prUrl ?? null,
+        error: finalTask.lastError ?? null,
+      });
+    } catch (err) {
+      console.error(`[night-shift] done 事件监听器出错（任务 ${task.id} 已收尾）：`, err);
     }
     return finalTask;
   }

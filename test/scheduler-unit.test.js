@@ -6,9 +6,11 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { openDb } from '../src/db.js';
 import {
-  createTask, getTask, startRun, finishRun, listRuns, cancelTask, claimTaskById, InvalidTransitionError,
+  createTask, getTask, startRun, finishRun, listRuns, cancelTask, claimTaskById, finishTask,
+  InvalidTransitionError, NotFoundError,
 } from '../src/tasks.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
+import { formatLocalMinute } from '../src/format.js';
 import { usage as quotaUsage } from '../src/quota.js';
 import { createScheduler } from '../src/scheduler.js';
 import * as realGit from '../src/git.js';
@@ -135,6 +137,7 @@ function setup(t, {
   taskCount = 1, taskSpec = {},
   config: configOverrides = {}, runner: runnerOpts = {}, git: gitScript = {},
   clockAt = '2026-10-10T07:00:00Z',
+  runnerOverride, gateOverride,
 } = {}) {
   const home = makeTempHome(t);
   const db = openDb(path.join(home, 'night-shift.db'));
@@ -152,7 +155,8 @@ function setup(t, {
   const env = fakeEnv({ FAKE_ENV_MARKER: 'unit' });
   const scheduler = createScheduler({
     db, config, home, clock,
-    runner: fakeRunner.runner, git: fakeGit.git,
+    runner: runnerOverride ?? fakeRunner.runner, git: fakeGit.git,
+    gate: gateOverride,
     cancelPollMs: 20, env,
   });
   // 先停调度器再关库，避免取消轮询在测试结束后还去读一个已关闭的连接
@@ -421,6 +425,8 @@ test('单元·限流退避：T 时刻退回队列退还尝试并全局暂停；T
   assert.equal(task.status, 'queued');
   assert.equal(task.attempts, 0, '限流退还这次尝试');
   assert.ok(task.lastError.includes('被限流'), task.lastError);
+  // 「本地时间」由 formatLocalMinute 按进程时区渲染；用同一函数算期望值，断言与机器时区无关
+  assert.equal(task.lastError, `被限流，${formatLocalMinute('2026-10-10T07:15:00.000Z')} 后重试`);
   assert.equal(task.notBefore, '2026-10-10T07:15:00.000Z');
   assert.deepEqual(ctx.scheduler.status().pausedUntil, new Date('2026-10-10T07:15:00Z'));
   assert.equal(ctx.scheduler.status().blocked.reason, 'rate-limit');
@@ -709,3 +715,128 @@ test('status() 初始：running 空、未停止、无暂停、无拦截', (t) =>
   });
 });
 
+
+// ---------------------------------------------------------------- 加固轮（自查）
+
+test('闸门二次确认不通过：任务原样退回队列（attempts/not_before 不变、无 run 行），blocked 带原因', async (t) => {
+  const retryAt = new Date('2026-10-10T08:00:00Z');
+  const ctx = setup(t, {
+    gateOverride: { startDecision: () => ({ ok: false, reason: 'five-hour', retryAt }) },
+  });
+  const id = ctx.tasks[0].id;
+  // 预置一个带历史 not_before 的 queued 任务（时刻已过，可被领取），验证退回时不被改写
+  claimTaskById(ctx.db, id);
+  finishTask(ctx.db, id, { status: 'queued', refundAttempt: true, notBefore: '2026-10-10T06:00:00.000Z' });
+  const before = getTask(ctx.db, id);
+  assert.equal(before.status, 'queued');
+  const blockedEvents = collectEvents(t, ctx.scheduler.events, ['blocked']);
+
+  assert.deepEqual(await ctx.scheduler.tick(), [], '二次确认不通过：本轮不执行任何任务');
+  const after = getTask(ctx.db, id);
+  assert.equal(after.status, 'queued', '任务回到 queued');
+  assert.equal(after.attempts, before.attempts, '领取的这次尝试被退还');
+  assert.equal(after.notBefore, before.notBefore, 'not_before 不被二次确认改写');
+  assert.deepEqual(listRuns(ctx.db), [], '没有创建任何 run 行');
+  assert.equal(ctx.scheduler.status().blocked.reason, 'five-hour');
+  assert.deepEqual(ctx.scheduler.status().blocked.retryAt, retryAt);
+  assert.ok(blockedEvents.some((e) => e.payload.reason === 'five-hour'));
+});
+
+test('runNow：停止中明确拒绝且不领任务；任务不存在抛 NotFoundError；已被领走不会执行两次', async (t) => {
+  const ctx = setup(t, {
+    runner: { script: [{ hang: true, onAbort: { status: 'failed', error: 'interrupted' } }] },
+  });
+  await assert.rejects(() => ctx.scheduler.runNow(9999), (err) => err instanceof NotFoundError);
+  await ctx.scheduler.stop();
+  await assert.rejects(
+    () => ctx.scheduler.runNow(ctx.tasks[0].id),
+    (err) => err instanceof Error && err.message.includes('停止'),
+  );
+  assert.equal(getTask(ctx.db, ctx.tasks[0].id).status, 'queued', '拒绝时任务未被领取');
+
+  // 重启后：tick 先领走（挂起中），再 runNow 同一个 → InvalidTransitionError，绝不二次执行
+  ctx.scheduler.start();
+  assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id]);
+  await waitUntil(() => ctx.scheduler.status().running.includes(ctx.tasks[0].id));
+  await assert.rejects(
+    () => ctx.scheduler.runNow(ctx.tasks[0].id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'running',
+  );
+  await ctx.scheduler.stop({ force: true });
+  assert.equal(getTask(ctx.db, ctx.tasks[0].id).status, 'queued');
+  assert.deepEqual(ctx.scheduler.status().running, []);
+});
+
+test('removeWorktree 抛错：任务结果不受影响，running 登记照常清空', async (t) => {
+  const ctx = setup(t, {
+    git: { removeWorktree: () => { throw new Error('cleanup boom'); } },
+  });
+  const dones = collectEvents(t, ctx.scheduler.events, ['done']);
+  assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id]);
+  await waitUntil(() => dones.length >= 1);
+  assert.equal(getTask(ctx.db, ctx.tasks[0].id).status, 'succeeded', '清理失败不影响任务结果');
+  assert.deepEqual(ctx.scheduler.status().running, [], '并发名额已释放');
+});
+
+test('runner 同步抛错 → 普通失败（run: 前缀），running 清空', async (t) => {
+  const ctx = setup(t, {
+    runnerOverride: () => { throw new Error('runner sync boom'); },
+  });
+  assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id]);
+  await waitUntil(() => getTask(ctx.db, ctx.tasks[0].id).status === 'queued');
+  const task = getTask(ctx.db, ctx.tasks[0].id);
+  assert.equal(task.lastError, 'run: runner sync boom');
+  assert.equal(task.attempts, 1);
+  assert.deepEqual(ctx.scheduler.status().running, []);
+});
+
+test('claim/done 事件监听器抛错：不拦流水线，任务照常收尾、照常清理 running', async (t) => {
+  const ctx = setup(t);
+  const badClaim = () => { throw new Error('claim listener boom'); };
+  const badDone = () => { throw new Error('done listener boom'); };
+  ctx.scheduler.events.on('claim', badClaim);
+  ctx.scheduler.events.on('done', badDone);
+  t.after(() => {
+    ctx.scheduler.events.off('claim', badClaim);
+    ctx.scheduler.events.off('done', badDone);
+  });
+  assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id]);
+  await waitUntil(() => getTask(ctx.db, ctx.tasks[0].id).status === 'succeeded');
+  assert.deepEqual(ctx.scheduler.status().running, []);
+});
+
+test('取消轮询读库抛错：记日志跳过该轮不崩，读库恢复后仍能把任务取消掉', async (t) => {
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const task = createTask(db, { repo: 'a/b', prompt: 'x', title: 't', testCommand: null });
+  let failReads = false;
+  const dbProxy = new Proxy(db, {
+    get(target, prop, receiver) {
+      if (failReads && prop === 'prepare') throw new Error('db boom');
+      const value = Reflect.get(target, prop, receiver);
+      // 原生 DatabaseSync 方法必须绑定到真实实例上调用（否则 Illegal invocation）
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const { runner } = makeFakeRunner([{ hang: true }]);
+  const { git } = makeFakeGit();
+  const scheduler = createScheduler({
+    db: dbProxy, config: { ...DEFAULT_CONFIG }, home,
+    clock: () => new Date('2026-10-10T07:00:00Z'), runner, git,
+    cancelPollMs: 20, env: fakeEnv(),
+  });
+  t.after(() => {
+    scheduler.stop();
+    db.close();
+  });
+  const dones = collectEvents(t, scheduler.events, ['done']);
+  assert.deepEqual(await scheduler.tick(), [task.id]);
+  await waitUntil(() => scheduler.status().running.includes(task.id));
+  failReads = true;
+  await new Promise((resolve) => setTimeout(resolve, 60)); // 几轮轮询全部抛错：只记日志
+  failReads = false;
+  cancelTask(db, task.id);
+  await waitUntil(() => dones.length >= 1, { message: '读库恢复后应能取消任务' });
+  assert.equal(getTask(db, task.id).status, 'canceled');
+  assert.deepEqual(scheduler.status().running, []);
+});
