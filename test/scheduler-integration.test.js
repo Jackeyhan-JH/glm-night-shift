@@ -435,7 +435,9 @@ test('验收·集成·额度：五小时窗口用满 → tick 返回 []，blocke
 test('验收·集成·并发：concurrency 2 + slow(300ms) + 3 任务 → 同时最多 2 个，最终全部成功', async (t) => {
   const ctx = setup(t, {
     taskSpecs: [{ title: 'a' }, { title: 'b' }, { title: 'c' }],
-    config: { concurrency: 2 },
+    // 3 个任务同仓库（setup 固定 repo a/b）：#47 的默认 oneTaskPerRepo 会挡住同仓库并发，
+    // 本条验证并发上限本身，显式关掉该锁（该锁自己的验收见 test/one-per-repo.test.js）
+    config: { concurrency: 2, oneTaskPerRepo: false },
     env: { FAKE_CLAUDE_SCENARIO: 'slow', FAKE_CLAUDE_DELAY_MS: '300' },
   });
   // 用 claim/done 事件观察并发：任意时刻「已领未完」数量不超过 2

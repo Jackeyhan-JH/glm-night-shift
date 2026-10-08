@@ -37,6 +37,8 @@ export const DEFAULT_CONFIG = deepFreeze({
   diagnoseTimeoutMinutes: 5,   // 诊断超时（诊断不该比任务本身还久）
   // —— issue #18 新增（一键启动 serve 与 systemd 用户服务），按约定追加在对象末尾 ——
   systemctlBin: 'systemctl',   // install/uninstall-service 用的 systemctl 可执行文件
+  // —— issue #47 新增（同一仓库同时最多跑一个任务），按约定追加在对象末尾 ——
+  oneTaskPerRepo: true,        // true 时某仓库已有 running 任务就先不领它的其他排队任务
 });
 
 /**

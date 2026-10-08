@@ -207,6 +207,21 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
 `install-service` / `uninstall-service` 调用的 systemctl 可执行文件，默认 `"systemctl"`。
 环境变量 `NIGHT_SHIFT_SYSTEMCTL_BIN` 覆盖（测试指向假替身）。
 
+### oneTaskPerRepo
+
+布尔值，默认 `true`：某仓库已经有 `running` 的任务时，先不领这个仓库的其他排队任务，
+别的仓库照常领，直到凑满 `concurrency`。被挡住的任务留在队列里，等先跑的结束（成功或
+失败）后下一轮轮询自然会领走；这不算被拦截（`status()` 的 `blocked` 仍是 `null`，调度器
+按 `pollSeconds` 正常等待，不空转）。
+
+- 只在 `concurrency` 大于 1 时看得到差别：并发为 1 时同一时刻本来就只有一个任务在跑，
+  默认安装无感。
+- 设成 `false` 允许同一仓库并行跑多个任务。注意代价：它们各自一份 worktree，但都往同一
+  个默认分支开 PR，后推的常和先推的打架（`--force-with-lease` 拒绝、PR 互相覆盖）。
+- 只限制**同时跑**几条，不限制一个仓库能排多少条任务；同一仓库不管分支一律算同一把锁
+  （不按分支细分）。
+- `runNow`（点名立刻跑）不受此锁约束。
+
 ## 完整 config.json 示例
 
 下面的值全部等于默认值，可以直接拷去改（删掉不想显式写的键即可，缺省键自动用默认值）：
@@ -241,7 +256,8 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
   "autoDiagnose": true,
   "diagnoseModel": "glm-5.3-flash",
   "diagnoseTimeoutMinutes": 5,
-  "systemctlBin": "systemctl"
+  "systemctlBin": "systemctl",
+  "oneTaskPerRepo": true
 }
 ```
 

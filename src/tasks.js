@@ -283,17 +283,28 @@ export function listTasks(db, { status, limit = 100 } = {}) {
  * 字符串（比较前规范化成 UTC ISO，与写入方 finishTask 的格式一致，字典序即时间序），
  * 缺省为当前时间；它**只**用于 not_before 过滤，started_at / updated_at 仍取真实
  * 当前时间（不跟着测试时钟走）。
+ *
+ * oneTaskPerRepo（#47）：true 时某仓库已有 running 任务，就先不领它的其他排队任务
+ * （并发 > 1 时两个任务各自开 worktree 却都往同一默认分支推 PR，后推的常和先推的打架）。
+ * 过滤同样是 NOT EXISTS 子查询，仍在这一条原子 UPDATE 的 SELECT 里——不是先领再退回
+ * （那会白加 attempts）。只挡领取，不限制一个仓库能排多少条；同一仓库不管分支算同一把锁。
+ * 调度器按配置传入；缺省 false = 行为与本开关加入前完全一致（claimTaskById 点名领取
+ * 不走这里，不受此锁约束）。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {object} [options]
  * @param {boolean} [options.allowPeakOnly=false] true 时只领 allow_peak = 1 的任务
+ * @param {boolean} [options.oneTaskPerRepo=false] true 时跳过所在仓库已有 running 任务的排队任务
  * @param {Date|string} [options.now] 判断 not_before 的基准时刻，缺省当前时间
  * @returns {?TaskRow} 被领取的任务；没有可领的返回 null。
  *   started_at 语义：最近一次领取时间（重试后再领会覆盖，配合 attempts 递增读）
- * @throws {ValidationError} allowPeakOnly 非布尔，或 now 不是合法时间（field='now'）
+ * @throws {ValidationError} allowPeakOnly / oneTaskPerRepo 非布尔，或 now 不是合法时间（field='now'）
  */
-export function claimNextTask(db, { allowPeakOnly = false, now } = {}) {
+export function claimNextTask(db, { allowPeakOnly = false, oneTaskPerRepo = false, now } = {}) {
   if (typeof allowPeakOnly !== 'boolean') {
     throw new ValidationError('allowPeakOnly', `必须是布尔值（当前值：${allowPeakOnly}）`);
+  }
+  if (typeof oneTaskPerRepo !== 'boolean') {
+    throw new ValidationError('oneTaskPerRepo', `必须是布尔值（当前值：${oneTaskPerRepo}）`);
   }
   const readyIso = now === undefined ? null : toIso(now, 'now');
   const currentIso = nowIso();
@@ -309,6 +320,11 @@ export function claimNextTask(db, { allowPeakOnly = false, now } = {}) {
           FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
           WHERE d.task_id = tasks.id AND dep.status != 'succeeded'
         )
+        ${oneTaskPerRepo ? `AND NOT EXISTS (
+          SELECT 1
+          FROM tasks busy
+          WHERE busy.repo = tasks.repo AND busy.status = 'running'
+        )` : ''}
       ORDER BY priority DESC, created_at ASC, id ASC
       LIMIT 1
     ) AND status = 'queued'

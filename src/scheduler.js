@@ -50,7 +50,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  * @param {object} options.config 配置（loadConfig 的结果；用 concurrency / pollSeconds /
  *   plan / weekStart / safetyRatio / allowPeak / maxAttempts / rateLimitBackoffMinutes /
  *   keepFailedWorktrees / timeoutMinutes / killGraceSeconds / difficulty /
- *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin …）
+ *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin / oneTaskPerRepo …）
  * @param {string} options.home 数据目录（仓库缓存、worktree、日志都在它下面）
  * @param {() => Date} [options.clock] 取「现在」；缺省真实时间，测试注入可调时钟
  * @param {Function} [options.runner] 执行器，缺省 #7 的 runTask（签名见其 JSDoc）
@@ -71,7 +71,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   （各方法的语义见下方 JSDoc）
  * @throws {TypeError} 任一参数缺失或类型不符（db/config/home/env 非对象、home 非非空
  *   字符串、clock/runner 非函数、concurrency 非正整数、pollSeconds / cancelPollMs /
- *   rateLimitBackoffMinutes 非正数）
+ *   rateLimitBackoffMinutes 非正数、oneTaskPerRepo 非布尔）
  */
 export function createScheduler({
   db, config, home,
@@ -95,6 +95,10 @@ export function createScheduler({
   assertPositiveNumber(config.concurrency, 'config.concurrency', true);
   assertPositiveNumber(config.pollSeconds, 'config.pollSeconds');
   assertPositiveNumber(config.rateLimitBackoffMinutes, 'config.rateLimitBackoffMinutes');
+  // #47：oneTaskPerRepo 非布尔在创建调度器时就得报出来（loadConfig 的整体校验不管这个键）
+  if (typeof config.oneTaskPerRepo !== 'boolean') {
+    throw new TypeError(`config.oneTaskPerRepo 必须是布尔值，收到：${describe(config.oneTaskPerRepo)}`);
+  }
 
   const events = new EventEmitter();
   /** 运行中的任务：taskId -> { controller, task }。controller 用于取消与停机中止。 */
@@ -281,7 +285,11 @@ export function createScheduler({
       setBlocked(peakOnly
         ? { reason: 'peak', retryAt: getStatus(nowEach).nextSwitch }
         : null);
-      const task = claimNextTask(db, { allowPeakOnly: peakOnly, now: nowEach });
+      const task = claimNextTask(db, {
+        allowPeakOnly: peakOnly,
+        oneTaskPerRepo: config.oneTaskPerRepo, // #47：true 时同一仓库不并发领
+        now: nowEach,
+      });
       if (task === null) {
         if (!peakOnly) setBlocked(null); // 队列空：不是被拦，是没事干
         break;
