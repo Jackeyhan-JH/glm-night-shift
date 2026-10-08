@@ -2,10 +2,12 @@
 // POST /api/tasks 请求体、HTML 转义、lastError 第一行；#46 增加编辑排队中任务的
 // 纯函数（行操作按钮、表单模式视图、任务 → 表单值、表单 → PATCH 请求体）；#50 增加
 // 仓库筛选与「从 GitHub 导入 / 清理磁盘」两个面板的纯函数（选项、过滤、请求体、结果
-// 文案）；#62 增加队列行的 PR 结果标签（已合并 / 已关闭）判定。全部是无副作用纯函数——
-// 不碰 DOM、不发请求，import 时不依赖浏览器环境，
-// node:test 直接单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js /
+// 文案）；#62 增加队列行的 PR 结果标签（已合并 / 已关闭）判定；#74 增加状态条的
+// 「为什么还没领」一句与排队行的「等这个仓库」判定（retryAt 的格式化引 ./common.js
+// 的 fmtTime）。全部是无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器
+// 环境，node:test 直接单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js /
 // test/board-import.test.js）；DOM 与网络逻辑在 queue.js。
+import { fmtTime } from './common.js';
 
 /** 历史标签最多展示的条数（issue 规格：最近 100 条）。 */
 export const HISTORY_LIMIT = 100;
@@ -121,6 +123,31 @@ export function pauseToggleView(status) {
     buttonLabel: paused ? '恢复领任务' : '暂停领任务',
     pausedText: paused ? '已暂停领取' : '',
   };
+}
+
+// ---------------------------------------------------------------- 状态条的拦截原因（#74）
+
+/**
+ * 「为什么还没领」的一句人话（#74）：/api/status 里 scheduler.blocked 的 reason 为
+ * five-hour / weekly / rate-limit 之一时返回对应整句；有 retryAt 再接
+ * 「；预计 <浏览器本地时间到分钟> 恢复」。其余一律 ''——调用方一个字都不接：
+ * - peak 不在这里说：高峰与否已由 statusBarText 的「高峰时段 / 非高峰时段」表达，
+ *   这里不重复高峰相关的话；
+ * - blocked 为 null、scheduler 缺失、未知 reason、retryAt 缺失或非法（fmtTime 得
+ *   '-'）都不多接半句，尤其不写「预计 - 恢复」。
+ * @param {object} [status] GET /api/status 的返回
+ * @returns {string}
+ */
+export function blockedHint(status) {
+  const blocked = status?.scheduler?.blocked;
+  if (blocked === null || typeof blocked !== 'object') return '';
+  let sentence = '';
+  if (blocked.reason === 'five-hour') sentence = '5 小时额度已达安全阈值';
+  else if (blocked.reason === 'weekly') sentence = '每周额度已达安全阈值';
+  else if (blocked.reason === 'rate-limit') sentence = '触发限流，全局退避中';
+  else return ''; // peak / 未知 reason
+  const time = fmtTime(blocked.retryAt); // null / undefined / 空串 / 非法时间都得到 '-'
+  return time === '-' ? sentence : `${sentence}；预计 ${time} 恢复`;
 }
 
 /** 数字输入（字符串）→ 安全整数；空 / 非整数 → null（该字段不进请求体）。 */
@@ -371,4 +398,32 @@ export function prOutcomeLabel(task) {
   if (task?.prOutcome === 'merged') return '已合并';
   if (task?.prOutcome === 'closed') return '已关闭';
   return '';
+}
+
+// ---------------------------------------------------------------- 排队行的「等这个仓库」（#74）
+
+/**
+ * 排队行的「等这个仓库」（#74）：oneTaskPerRepo 开着且已取回的任务里有同仓库正在
+ * 跑的另一条时，回答这一行「排着怎么还没被领」——同仓库那条跑完才会领它。其余情况
+ * 都返回 ''（调用方一个节点都不建）：
+ * - 只认 config.oneTaskPerRepo === true（严格布尔）：false、缺字段、字符串 "true"、
+ *   config 为 null / undefined（请求失败）都不显示——不假设磁盘默认值是开的；
+ * - task 不是排队中：running / 终态都不显示；
+ * - 找的是 status === 'running' 且 repo 严格全等（不 trim、不大小写折叠）的另一条；
+ *   同仓库只有别的排队任务、没有 running 的不说；有 id 时用 id 区分「另一条」。
+ * 读的是设置接口里的磁盘配置：刚改完还没重启时调度器可能仍按旧值领任务，这句允许
+ * 暂时对不上。
+ * @param {object} [task] 当前行（用到 id / status / repo）
+ * @param {Array<object>} [tasks] 已取回的完整任务列表（不是仓库筛选后的可见列表）
+ * @param {object} [config] GET /api/config 的返回；请求失败时 null
+ * @returns {'等这个仓库'|''}
+ */
+export function repoWaitLabel(task, tasks, config) {
+  if (config?.oneTaskPerRepo !== true) return '';
+  if (task?.status !== 'queued') return '';
+  const list = Array.isArray(tasks) ? tasks : [];
+  const anotherRunning = list.some((t) => t?.status === 'running'
+    && t?.repo === task.repo
+    && (t.id === undefined || task.id === undefined || t.id !== task.id));
+  return anotherRunning ? '等这个仓库' : '';
 }
