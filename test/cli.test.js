@@ -576,6 +576,255 @@ test('验收: --json 形状不变：status 是裸状态串，prOutcome 原样，
   }
 });
 
+// —— #85：list / show 说明排队任务「在等这个仓库」（oneTaskPerRepo 开着且同仓库另有 running）——
+// 造数都在本进程直连 home 的 night-shift.db（claimNextTask 缺省不看 oneTaskPerRepo 开关，
+// 可以直接把队首排队任务领成 running），再用子进程读同一个文件库；repo 全等比较
+// （===，不 trim、不 toLowerCase）的边界用直写 UPDATE 模拟（repo 列没有 CHECK）。
+
+/** 在 home 的 night-shift.db 上跑一次 build(db, api)（api 是 tasks.js 的函数表）。 */
+async function seedTasks(home, build) {
+  const { openDb } = await import('../src/db.js');
+  const api = await import('../src/tasks.js');
+  const db = openDb(path.join(home, 'night-shift.db'));
+  try {
+    build(db, api);
+  } finally {
+    db.close();
+  }
+}
+
+/** list 表格里 id 那一行（ID 是首列，单元格以「<id> 」开头）。 */
+const rowOf = (out, id) => out.trimEnd().split('\n').find((l) => l.startsWith(`${id} `));
+
+/** 同仓库「一条 running + 一条 queued」的常用造数；返回两边的 id。 */
+function seedRunningAndQueued(db, api, repo = 'a/b') {
+  api.createTask(db, { repo, prompt: '先跑的' });
+  api.claimNextTask(db); // 领走队首（#1）→ running
+  api.createTask(db, { repo, prompt: '后到的' }); // 同仓库排队
+}
+
+test('验收: 同仓库一条 running、一条 queued：排队行标「queued（等这个仓库）」，running 行不标', async (t) => {
+  const home = makeTempHome(t); // 没有 config.json：loadConfig 合并默认值，oneTaskPerRepo 是 true
+  await seedTasks(home, seedRunningAndQueued);
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(rowOf(res.stdout, 2).includes('queued（等这个仓库）'),
+    `#2 的状态列应是 queued（等这个仓库）：${rowOf(res.stdout, 2)}`);
+  const runningRow = rowOf(res.stdout, 1);
+  assert.ok(runningRow.includes('running'), `#1 的状态列应是 running：${runningRow}`);
+  assert.ok(!runningRow.includes('等这个仓库'), `running 行不该标：${runningRow}`);
+});
+
+test('验收: 排队等依赖又等仓库：queued（等 #1，等这个仓库）；两个依赖 queued（等 #1,#2，等这个仓库）', async (t) => {
+  const home = makeTempHome(t);
+  await seedTasks(home, (db, { createTask, claimNextTask, setDependencies }) => {
+    createTask(db, { repo: 'a/b', prompt: '正在跑' }); // #1 → running，也是依赖目标
+    claimNextTask(db);
+    createTask(db, { repo: 'a/b', prompt: '等一个' }); // #2
+    setDependencies(db, 2, [1]);
+    createTask(db, { repo: 'a/b', prompt: '等两个' }); // #3
+    setDependencies(db, 3, [1, 2]);
+  });
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(rowOf(res.stdout, 2).includes('queued（等 #1，等这个仓库）'),
+    `一个依赖：${rowOf(res.stdout, 2)}`);
+  assert.ok(rowOf(res.stdout, 3).includes('queued（等 #1,#2，等这个仓库）'),
+    `两个依赖（依赖之间仍是 ,#）：${rowOf(res.stdout, 3)}`);
+});
+
+test('验收: 同仓库另一条也只是 queued（没有 running）：状态列与现在相同，不出现「等这个仓库」', async (t) => {
+  const home = makeTempHome(t); // 默认开关是 true，但没有 running，照样不标
+  await seedTasks(home, (db, { createTask, setDependencies }) => {
+    createTask(db, { repo: 'a/b', prompt: '排队一' }); // #1 queued
+    createTask(db, { repo: 'a/b', prompt: '排队二' }); // #2 queued，同仓库无 running
+    createTask(db, { repo: 'a/b', prompt: '等依赖' }); // #3
+    setDependencies(db, 3, [1]);
+  });
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  for (const id of [1, 2]) {
+    assert.ok(rowOf(res.stdout, id).includes(' queued '),
+      `#${id} 仍是光秃秃的 queued：${rowOf(res.stdout, id)}`);
+  }
+  assert.ok(rowOf(res.stdout, 3).includes('queued（等 #1）'),
+    `#3 仍是 queued（等 #1）：${rowOf(res.stdout, 3)}`);
+  assert.ok(!res.stdout.includes('等这个仓库'), '同仓库只有另一条 queued 不算在等仓库');
+});
+
+test('验收: oneTaskPerRepo 为 false / 字符串 "true" / 数字 1：同仓库有 running 也不出现「等这个仓库」', async (t) => {
+  for (const value of [false, 'true', 1]) {
+    const home = makeTempHome(t);
+    fs.writeFileSync(path.join(home, 'config.json'), `${JSON.stringify({ oneTaskPerRepo: value })}\n`);
+    await seedTasks(home, seedRunningAndQueued);
+    const res = await spawnCli(t, ['list'], { cwd: home });
+    assert.equal(res.code, 0, res.stderr);
+    assert.ok(!res.stdout.includes('等这个仓库'),
+      `oneTaskPerRepo=${JSON.stringify(value)}（非全等 true）不该标`);
+    assert.ok(rowOf(res.stdout, 2).includes(' queued '),
+      `仍是裸 queued：${rowOf(res.stdout, 2)}`);
+  }
+});
+
+test('验收: repo 大小写不同（A/B 与 a/b）或只差首尾空白（a/b 与 "a/b "）：不算同仓库', async (t) => {
+  const caseHome = makeTempHome(t);
+  await seedTasks(caseHome, (db, { createTask, claimNextTask }) => {
+    createTask(db, { repo: 'A/B', prompt: '大写在跑' });
+    claimNextTask(db);
+    createTask(db, { repo: 'a/b', prompt: '小写在等' }); // 'a/b' !== 'A/B'，不 toLowerCase
+  });
+  const caseRes = await spawnCli(t, ['list'], { cwd: caseHome });
+  assert.equal(caseRes.code, 0, caseRes.stderr);
+  assert.ok(!caseRes.stdout.includes('等这个仓库'), '大小写不同不算同仓库');
+
+  const trimHome = makeTempHome(t);
+  await seedTasks(trimHome, (db, { createTask, claimNextTask }) => {
+    createTask(db, { repo: 'a/b', prompt: '在跑的' });
+    claimNextTask(db);
+    const queued = createTask(db, { repo: 'a/b', prompt: '在等的' });
+    // createTask 会 trim，尾部空白只能直写库模拟（repo 列没有 CHECK，脏值能进）
+    db.prepare('UPDATE tasks SET repo = ? WHERE id = ?').run('a/b ', queued.id);
+  });
+  const trimRes = await spawnCli(t, ['list'], { cwd: trimHome });
+  assert.equal(trimRes.code, 0, trimRes.stderr);
+  assert.ok(!trimRes.stdout.includes('等这个仓库'), '差一个尾部空格不算同仓库（不 trim）');
+});
+
+test('验收: list --status queued --limit 1：running 不在列表结果里，同仓库排队行仍标「等这个仓库」', async (t) => {
+  const home = makeTempHome(t);
+  await seedTasks(home, (db, { createTask, claimNextTask }) => {
+    createTask(db, { repo: 'a/b', prompt: '在跑的' }); // #1 → running
+    claimNextTask(db);
+    createTask(db, { repo: 'a/b', prompt: '在等的' }); // #2，排队队首
+    createTask(db, { repo: 'c/d', prompt: '别的仓库' }); // #3
+  });
+  const res = await spawnCli(t, ['list', '--status', 'queued', '--limit', '1'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(!res.stdout.includes('running'), 'running 任务不在这次列表结果里');
+  const lines = res.stdout.trimEnd().split('\n');
+  assert.equal(lines.length, 2, '表头 + 一行（--limit 1）');
+  assert.ok(lines[1].startsWith('2 '), `--limit 1 取排队队首 #2：${lines[1]}`);
+  assert.ok(lines[1].includes('queued（等这个仓库）'),
+    `running 是另查的（limit 固定 1000），不受本次 --limit 影响：${lines[1]}`);
+});
+
+test('验收: succeeded（已合并）的任务即使同仓库有 running：该行仍是 succeeded（已合并）', async (t) => {
+  const home = makeTempHome(t);
+  await seedTasks(home, (db, { createTask, claimNextTask, finishTask }) => {
+    createTask(db, { repo: 'a/b', prompt: '在跑的' }); // #1 → running
+    claimNextTask(db);
+    const done = createTask(db, { repo: 'a/b', prompt: '已合并的' }); // #2
+    claimNextTask(db); // 领走 #2（claimNextTask 缺省不看 oneTaskPerRepo）
+    finishTask(db, done.id, { status: 'succeeded', prUrl: 'https://example.test/pr/2' });
+    db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run('merged', done.id);
+    createTask(db, { repo: 'a/b', prompt: '在等的' }); // #3 queued
+  });
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  const mergedRow = rowOf(res.stdout, 2);
+  assert.ok(mergedRow.includes('succeeded（已合并）'), `#2 仍是 succeeded（已合并）：${mergedRow}`);
+  assert.ok(!mergedRow.includes('等这个仓库'), `succeeded 不吃「等这个仓库」：${mergedRow}`);
+  assert.ok(rowOf(res.stdout, 3).includes('queued（等这个仓库）'),
+    `#3 排队照常标：${rowOf(res.stdout, 3)}`);
+});
+
+test('验收: show 该等的时候：「状态」值就是 queued（等这个仓库）；有依赖也不塞 等 #，依赖行仍在', async (t) => {
+  const home = makeTempHome(t);
+  await seedTasks(home, (db, { createTask, claimNextTask, setDependencies }) => {
+    createTask(db, { repo: 'a/b', prompt: '在跑的' }); // #1 → running
+    claimNextTask(db);
+    createTask(db, { repo: 'a/b', prompt: '无依赖的排队' }); // #2
+    createTask(db, { repo: 'a/b', prompt: '等上游的排队' }); // #3，依赖另一条排队任务
+    setDependencies(db, 3, [2]);
+  });
+  const plain = await spawnCli(t, ['show', '2'], { cwd: home });
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.match(plain.stdout, /^状态\s+queued（等这个仓库）$/m,
+    '状态值就是 queued（等这个仓库），值在行尾，后面没有别的字');
+  assert.equal(plain.stdout.match(/等这个仓库/g)?.length, 1, '只出现在状态格里，不另加一行');
+
+  const withDeps = await spawnCli(t, ['show', '3'], { cwd: home });
+  assert.equal(withDeps.code, 0, withDeps.stderr);
+  assert.match(withDeps.stdout, /^状态\s+queued（等这个仓库）$/m,
+    '有依赖时状态值仍只是 queued（等这个仓库），不包含 等 #');
+  assert.ok(/^依赖：#2 queued$/m.test(withDeps.stdout), '依赖行保持原样、单独一行');
+});
+
+test('验收: show 不该等的时候（开关 false / 同仓库只有另一条 queued / 自己是 running）：状态是原始状态', async (t) => {
+  const offHome = makeTempHome(t);
+  fs.writeFileSync(path.join(offHome, 'config.json'), `${JSON.stringify({ oneTaskPerRepo: false })}\n`);
+  await seedTasks(offHome, seedRunningAndQueued);
+  const offRes = await spawnCli(t, ['show', '2'], { cwd: offHome });
+  assert.equal(offRes.code, 0, offRes.stderr);
+  assert.ok(!offRes.stdout.includes('等这个仓库'), '开关是 false 不标');
+  assert.match(offRes.stdout, /^状态\s+queued$/m, '状态是原始 queued');
+
+  const queuedHome = makeTempHome(t);
+  await seedTasks(queuedHome, (db, { createTask, setDependencies }) => {
+    createTask(db, { repo: 'a/b', prompt: '排队一' }); // #1 queued
+    createTask(db, { repo: 'a/b', prompt: '排队二' }); // #2 queued
+    setDependencies(db, 2, [1]);
+  });
+  const queuedRes = await spawnCli(t, ['show', '2'], { cwd: queuedHome });
+  assert.equal(queuedRes.code, 0, queuedRes.stderr);
+  assert.ok(!queuedRes.stdout.includes('等这个仓库'), '同仓库只有另一条 queued 不标');
+  assert.match(queuedRes.stdout, /^状态\s+queued$/m, '状态是原始 queued');
+  assert.ok(/^依赖：#1 queued$/m.test(queuedRes.stdout), '不该等时依赖行仍在');
+
+  const runningHome = makeTempHome(t); // 开关默认 true、同仓库也真有 running，但自己是 running
+  await seedTasks(runningHome, seedRunningAndQueued);
+  const runningRes = await spawnCli(t, ['show', '1'], { cwd: runningHome });
+  assert.equal(runningRes.code, 0, runningRes.stderr);
+  assert.ok(!runningRes.stdout.includes('等这个仓库'), '任务是 running 不标');
+  assert.match(runningRes.stdout, /^状态\s+running$/m, '状态是原始 running');
+});
+
+test('验收: --json 不受影响：status 是裸状态串、prOutcome 原样，没有新键；坏掉的 config.json 也不退出 1', async (t) => {
+  const home = makeTempHome(t);
+  await seedTasks(home, (db, { createTask, claimNextTask, finishTask }) => {
+    createTask(db, { repo: 'a/b', prompt: '在跑的' }); // #1 → running
+    claimNextTask(db);
+    const done = createTask(db, { repo: 'a/b', prompt: '已合并的' }); // #2
+    claimNextTask(db);
+    finishTask(db, done.id, { status: 'succeeded', prUrl: 'https://example.test/pr/2' });
+    db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run('merged', done.id);
+    createTask(db, { repo: 'a/b', prompt: '在等的' }); // #3 queued
+  });
+  const listJson = await spawnCli(t, ['list', '--json'], { cwd: home });
+  assert.equal(listJson.code, 0, listJson.stderr);
+  const byId = new Map(JSON.parse(listJson.stdout).map((task) => [task.id, task]));
+  assert.equal(byId.get(1).status, 'running');
+  assert.equal(byId.get(2).status, 'succeeded', 'status 是裸的 succeeded，不是 succeeded（已合并）');
+  assert.equal(byId.get(2).prOutcome, 'merged');
+  assert.equal(byId.get(3).status, 'queued', 'status 是裸的 queued，不是 queued（等这个仓库）');
+  assert.ok(!listJson.stdout.includes('等这个仓库'), 'list --json 不掺「等这个仓库」');
+
+  for (const [id, status] of [[1, 'running'], [3, 'queued']]) {
+    const showJson = await spawnCli(t, ['show', String(id), '--json'], { cwd: home });
+    assert.equal(showJson.code, 0, showJson.stderr);
+    const detail = JSON.parse(showJson.stdout);
+    assert.equal(detail.status, status, 'show --json 顶层 status 是裸状态串');
+    const knownKeys = new Set(['id', 'repo', 'source', 'gitRef', 'title', 'prompt', 'difficulty',
+      'priority', 'testCommand', 'allowPeak', 'status', 'attempts', 'maxAttempts', 'branch',
+      'prUrl', 'prOutcome', 'lastError', 'notBefore', 'createdAt', 'updatedAt', 'startedAt',
+      'finishedAt', 'dependsOn', 'blockedBy', 'runs']);
+    for (const key of Object.keys(detail)) {
+      assert.ok(knownKeys.has(key), `不该出现新造的键（如 waitingSameRepo / sameRepo）：${key}`);
+    }
+  }
+
+  // 坏掉的 config.json：--json 路径不读配置，不该突然退出 1
+  const brokenHome = makeTempHome(t);
+  fs.writeFileSync(path.join(brokenHome, 'config.json'), '{oops');
+  await seedTasks(brokenHome, seedRunningAndQueued);
+  const brokenList = await spawnCli(t, ['list', '--json'], { cwd: brokenHome });
+  assert.equal(brokenList.code, 0, brokenList.stderr);
+  assert.ok(!brokenList.stdout.includes('等这个仓库'));
+  const brokenShow = await spawnCli(t, ['show', '2', '--json'], { cwd: brokenHome });
+  assert.equal(brokenShow.code, 0, brokenShow.stderr);
+  assert.equal(JSON.parse(brokenShow.stdout).status, 'queued');
+});
+
 test('cancel 已是终态的任务：退出 1（非法状态转换，中文原因）', async (t) => {
   const home = makeTempHome(t);
   await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: home });
