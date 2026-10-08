@@ -377,6 +377,12 @@ pre.log {
   font-size: 13px;
   padding: 10px 2px 0;
 }
+/* 手动暂停/恢复按钮（#38）：跟状态文案并排在同一行 */
+.statusbar #pause-toggle {
+  margin-left: 10px;
+  padding: 1px 10px;
+  font-size: 12px;
+}
 
 /* 三个标签（排队中/运行中/历史），带数量 */
 .tabs {

@@ -1,6 +1,6 @@
-// 队列与操作页（issue #15）：状态条、三个标签（排队中 / 运行中 / 历史）、每行取消/重试、
-// 新增任务表单（模板下拉 + 按模板动态生成变量输入 + 依赖多选）。DOM 与网络都在这里，
-// 纯函数（分组、提示文本、表单转请求体……）在 queue-lib.js。
+// 队列与操作页（issue #15）：状态条（含 #38 的手动暂停/恢复按钮）、三个标签（排队中 /
+// 运行中 / 历史）、每行取消/重试、新增任务表单（模板下拉 + 按模板动态生成变量输入 +
+// 依赖多选）。DOM 与网络都在这里，纯函数（分组、提示文本、表单转请求体……）在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
 // 刷新只重绘状态条 / 标签 / 表格 / 依赖下拉的选项，不重建表单其余输入——正在填写的
@@ -12,6 +12,7 @@ import {
   firstLine,
   formToBody,
   groupTasks,
+  pauseToggleView,
   statusBarText,
 } from '/queue-lib.js';
 
@@ -47,6 +48,14 @@ const els = {
   depends: document.getElementById('f-depends'),
 };
 
+// 状态条 = 文本 span + 暂停/恢复按钮（#38）。按钮只建一次，轮询刷新只改文本与
+// 文案——之前用 textContent 渲染整条状态条，会把按钮冲掉，不能再那么写。
+const statusText = document.createElement('span');
+const pauseToggle = document.createElement('button');
+pauseToggle.type = 'button';
+pauseToggle.id = 'pause-toggle';
+els.statusbar.append(statusText, pauseToggle);
+
 /** 页面状态：最近一次拉到的任务 / 模板 / 状态与当前标签。 */
 const state = { tasks: [], templates: [], status: null, activeTab: 'queued' };
 
@@ -67,7 +76,10 @@ async function refresh() {
 }
 
 function renderStatusBar() {
-  els.statusbar.textContent = statusBarText(state.status);
+  const view = pauseToggleView(state.status);
+  const text = statusBarText(state.status);
+  statusText.textContent = view.pausedText === '' ? text : `${text} · ${view.pausedText}`;
+  pauseToggle.textContent = view.buttonLabel;
 }
 
 function renderTabs() {
@@ -169,6 +181,24 @@ function showPageError(message) {
 
 function hidePageError() {
   els.pageError.hidden = true;
+}
+
+// ---------------------------------------------------------------- 手动暂停/恢复（#38）
+
+/** 状态条按钮：按当前状态发 pause / resume，成功后刷新状态条；失败走页面错误条。 */
+async function onPauseToggleClick() {
+  const { paused } = pauseToggleView(state.status);
+  pauseToggle.disabled = true;
+  try {
+    // body:{} 只为带上 Content-Type: application/json（服务端对所有 POST 都要求它）。
+    await api(`/api/scheduler/${paused ? 'resume' : 'pause'}`, { method: 'POST', body: {} });
+    hidePageError();
+    await refresh();
+  } catch (err) {
+    showPageError(err.message);
+  } finally {
+    pauseToggle.disabled = false;
+  }
 }
 
 // ---------------------------------------------------------------- 新增任务表单
@@ -303,6 +333,9 @@ els.tabs.addEventListener('click', (event) => {
 });
 els.table.addEventListener('click', (event) => {
   onTableClick(event).catch((err) => showPageError(err.message));
+});
+pauseToggle.addEventListener('click', () => {
+  onPauseToggleClick().catch((err) => showPageError(err.message));
 });
 // 切回页面立即刷新；隐藏期间跳过轮询（visibilitychange 与 interval 双保险）。
 document.addEventListener('visibilitychange', () => {

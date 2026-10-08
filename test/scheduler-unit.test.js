@@ -708,10 +708,10 @@ test('单元·启动恢复：库里有 running 任务与未结束 run，start() 
 
 // ---------------------------------------------------------------- status 初始态
 
-test('status() 初始：running 空、未停止、无暂停、无拦截', (t) => {
+test('status() 初始：running 空、未停止、无暂停、无拦截、未手动暂停', (t) => {
   const ctx = setup(t);
   assert.deepEqual(ctx.scheduler.status(), {
-    running: [], stopping: false, pausedUntil: null, blocked: null,
+    running: [], stopping: false, pausedUntil: null, blocked: null, userPaused: false,
   });
 });
 

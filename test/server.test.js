@@ -13,6 +13,7 @@ import {
   claimNextTask,
   createTask,
   finishRun,
+  getUserPaused,
   startRun,
 } from '../src/tasks.js';
 import { makeTempHome } from './helpers.js';
@@ -517,6 +518,80 @@ test('/api/status：给了 scheduler 时带上它的 status()；用量窗口覆�
   // 与 #4 验收同款窗口：五小时窗口内 3 + 1.2 + 1 = 5.2
   assert.equal(status.usage.fiveHour.used, 5.2);
   assert.equal(status.usage.fiveHour.limit, 1600);
+});
+
+// ---------- 手动暂停 / 恢复领取（#38） ----------
+
+test('验收: POST /api/scheduler/pause 返回 {"userPaused": true} 并写库；非 JSON → 415；跨站 Origin → 403；resume 返回 false', async (t) => {
+  const { db, base } = await startServer(t);
+  const res = await postJson(`${base}/api/scheduler/pause`, {});
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { userPaused: true });
+  assert.equal(getUserPaused(db), true, '库里写入了暂停标记');
+
+  const plain = await fetch(`${base}/api/scheduler/pause`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: '{}',
+  });
+  assert.equal(plain.status, 415);
+
+  const evil = await postJson(`${base}/api/scheduler/pause`, {}, { Origin: 'http://evil.example' });
+  assert.equal(evil.status, 403);
+
+  const resume = await postJson(`${base}/api/scheduler/resume`, {});
+  assert.equal(resume.status, 200);
+  assert.deepEqual(await resume.json(), { userPaused: false });
+  assert.equal(getUserPaused(db), false);
+});
+
+test('#38: /api/status 顶层 userPaused 来自数据库，不从 scheduler 的 status() 抄', async (t) => {
+  const { base } = await startServer(t, {
+    scheduler: { status: () => ({ running: 1, paused: false }) }, // 故意没有 userPaused 字段
+  });
+  const before = await (await fetch(`${base}/api/status`)).json();
+  assert.equal(before.userPaused, false);
+  assert.deepEqual(before.scheduler, { running: 1, paused: false }, 'scheduler 字段原样透传');
+
+  await postJson(`${base}/api/scheduler/pause`, {});
+  const after = await (await fetch(`${base}/api/status`)).json();
+  assert.equal(after.userPaused, true, '顶层跟库走');
+  assert.deepEqual(after.scheduler, { running: 1, paused: false }, 'scheduler 字段不被补字段、不被包一层');
+});
+
+test('验收: 暂停在库里：关掉 server 与连接、同一文件再 createServer（无 scheduler），GET /api/status 顶层 userPaused 仍为 true', async (t) => {
+  const home = makeTempHome(t);
+  const dbPath = path.join(home, 'night-shift.db');
+  const listen = (server) => new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${server.address().port}`));
+  });
+
+  const db1 = openDb(dbPath);
+  const server1 = createServer({ db: db1, config: loadConfig({ home, env: {} }), home, clock: systemClock({}) });
+  const base1 = await listen(server1);
+  const paused = await postJson(`${base1}/api/scheduler/pause`, {});
+  assert.deepEqual(await paused.json(), { userPaused: true });
+  server1.close();
+  server1.closeAllConnections();
+  db1.close();
+
+  // 新进程视角：新连接 + 新 server；serve-api 场景没有 scheduler 对象也能读到暂停
+  const db2 = openDb(dbPath);
+  const server2 = createServer({ db: db2, config: loadConfig({ home, env: {} }), home, clock: systemClock({}) });
+  t.after(() => {
+    server2.close();
+    server2.closeAllConnections();
+    db2.close();
+  });
+  const base2 = await listen(server2);
+  const status = await (await fetch(`${base2}/api/status`)).json();
+  assert.equal(status.scheduler, null);
+  assert.equal(status.userPaused, true, '重启进程后暂停还在（在库里，不在内存里）');
+
+  const resume = await postJson(`${base2}/api/scheduler/resume`, {});
+  assert.deepEqual(await resume.json(), { userPaused: false });
+  assert.equal((await (await fetch(`${base2}/api/status`)).json()).userPaused, false);
 });
 
 // ---------- /api/usage/history ----------
