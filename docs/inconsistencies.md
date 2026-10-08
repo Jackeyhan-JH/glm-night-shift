@@ -25,8 +25,9 @@
    1 prompt × 倍率」累计，不是官方账单 API；官方若调整套餐或倍率，这两张表需要手动同步。
    README 与本文档均已按「本地估算」的口径书写。
 
-5. **帮助文案只写了「再按一次 Ctrl-C」。**
+5. **（已解决）帮助文案只写了「再按一次 Ctrl-C」。**
    `start` 与 `serve` 的帮助原文是「再按一次 Ctrl-C 强制停止」。代码里第二次 SIGINT 和
    第二次 SIGTERM 都走强制停止（`src/cli/run-commands.js`、`src/cli/serve-run.js` 的
    `onSignal`），并且 `scheduler.stop()` 无论成功还是失败都让进程退出 0。README 与
    configuration.md 按代码写了第二次 SIGTERM；帮助字符串本身没改。
+   本条的帮助文案和运行时文案已经改过：`start` 的用法改为「再来一次强制停止」，`start` 与 `serve` 第一次停止的括号改为「再来一次 Ctrl-C 或 SIGTERM 强制停止」。
