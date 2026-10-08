@@ -20,6 +20,7 @@ import {
 } from '../src/cli/task-commands.js';
 import { configCommand } from '../src/cli/config-command.js';
 import { templatesCommand } from '../src/cli/template-commands.js';
+import { serveCommand } from '../src/cli/serve-command.js';
 
 // 通过 import.meta.url 相对路径读 package.json，任意 cwd / npm link 下都能找到。
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -46,6 +47,7 @@ const COMMANDS = {
   retry: retryCommand,
   config: configCommand,
   templates: templatesCommand,
+  'serve-api': serveCommand,
   help: {
     summary: '显示帮助',
     usage: 'night-shift help',
@@ -87,7 +89,8 @@ function usageText() {
     '取配置的 maxAttempts；list / show 的时间按本地时区显示到分钟。数据目录：',
     '$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
     '',
-    'start / peak / logs / serve（调度器、看板）等命令将在后续版本加入。',
+    'start / peak / logs / serve（调度器一键启动）等命令将在后续版本加入；',
+    '看板服务见 serve-api。',
     '',
   ].join('\n');
 }
