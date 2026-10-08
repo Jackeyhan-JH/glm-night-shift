@@ -105,6 +105,90 @@ export function loadConfig({ home, env } = {}) {
 }
 
 /**
+ * 看板设置页可改的七个键（issue #61）。顺序即 GET /api/config 的字段顺序与未知键报错里
+ * 的「允许」清单；启动时生效的其余配置（端口、路径、模型表等）不在这份清单里。
+ */
+export const SETTINGS_KEYS = Object.freeze([
+  'allowPeak',
+  'concurrency',
+  'oneTaskPerRepo',
+  'autoFollowReviews',
+  'followPollMinutes',
+  'prStatus',
+  'prStatusPollMinutes',
+]);
+
+/**
+ * 从生效配置里只挑出七个设置键，按 SETTINGS_KEYS 的顺序组装（GET /api/config 与
+ * PATCH 成功响应的形状）。port / 路径 / 令牌环境 / 模型表等绝不外漏。
+ */
+export function pickSettings(config) {
+  const out = {};
+  for (const key of SETTINGS_KEYS) out[key] = config[key];
+  return out;
+}
+
+/**
+ * 把若干键值合并写进 <home>/config.json（#61，PATCH /api/config 的写盘半边；校验在
+ * 调用方先做完，这里不认识「允许哪些键」之外的规则）：
+ * - 文件已存在：解析后只替换 patch 带来的键，其他键（含未知自定义键、嵌套对象、null）
+ *   原样保留；已有键位置不动，新键追加在后面。
+ * - 文件不存在：新建的对象里只有本次带来的键，不把整份 DEFAULT_CONFIG 写进去。
+ * - 文件不是合法 JSON 或顶层不是对象：抛错且不覆盖原字节。
+ * - 同目录临时文件 + rename 原子替换；JSON.stringify(obj, null, 2) 末尾加换行。
+ * @param {string} home 数据目录
+ * @param {object} patch 要写入的键值子集（键已通过白名单与类型校验）
+ * @returns {object} 写盘后的完整配置对象
+ */
+export function patchConfigFile(home, patch) {
+  const file = configPath(home);
+
+  let current = {};
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      raw = undefined; // 没有配置文件：从空对象开始新建
+    } else {
+      throw new Error(`无法读取配置文件 ${file}：${err.message}`);
+    }
+  }
+  if (raw !== undefined) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`配置文件不是合法 JSON：${file}（${err.message}）`);
+    }
+    if (!isPlainObject(parsed)) {
+      throw new Error(`配置文件顶层必须是 JSON 对象：${file}`);
+    }
+    current = parsed;
+  }
+
+  const next = { ...current };
+  for (const [key, value] of Object.entries(patch)) next[key] = value;
+
+  const tmp = path.join(home, `config.json.tmp-${process.pid}-${++tmpSeq}`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp); // 写坏 / 改名失败的临时文件不留盘（原 config.json 未被动过）
+    } catch {
+      // 临时文件本来就没写成：无事可清理
+    }
+    throw new Error(`无法写入配置文件 ${file}：${err.message}`);
+  }
+  return next;
+}
+
+/** patchConfigFile 的临时文件序号（写盘全程同步，单线程内不会重名）。 */
+let tmpSeq = 0;
+
+/**
  * 创建数据目录及其子目录（幂等），返回各目录的绝对路径。
  */
 export function ensureHome(home) {

@@ -196,13 +196,14 @@ CHANGES_REQUESTED 评审在原 night-shift 分支上入队跟进任务：gitRef 
 
 ## 看板
 
-serve（或 serve-api）启动后浏览器打开 `http://127.0.0.1:<端口>`，共三页：
+serve（或 serve-api）启动后浏览器打开 `http://127.0.0.1:<端口>`，共四页：
 
 | 页面 | 文件 | 一句话说明 |
 | --- | --- | --- |
 | 队列 | `web/index.html` + `web/queue.js` | 任务总览与新增表单：排队中 / 运行中 / 历史三栏任务表、按模板建任务、高峰与额度概要 |
 | 任务详情 | `web/task.html` | 单个任务的字段、每次运行记录（含失败诊断）、实时日志流 |
 | 额度与高峰 | `web/usage.html` | 当前高峰状态与各模型倍率、5 小时 / 每周额度进度、按小时用量图 |
+| 设置 | `web/settings.html` + `web/settings.js` | 改常用开关（高峰、并发、同仓库一个、自动跟进、PR 状态）；写入配置文件，重启后才按新值运行 |
 
 ![队列页](docs/images/queue.png)
 
@@ -302,7 +303,7 @@ src/git.js            仓库缓存、worktree、提交推送、开 PR
 src/peak.js           高峰判定（逐字节复制自 glm-peak-clock）
 src/quota.js          额度估算与放行判定
 src/server.js         看板 HTTP 服务与 API
-web/                  看板三页（队列 / 任务详情 / 额度与高峰）
+web/                  看板四页（队列 / 任务详情 / 额度与高峰 / 设置）
 templates/            内置任务模板（fix-issue、docs、refactor、add-tests）
 test/                 测试、假替身（fixtures/）与辅助（helpers.js）
 docs/                 配置详解（configuration.md）、已知不一致（inconsistencies.md）、截图

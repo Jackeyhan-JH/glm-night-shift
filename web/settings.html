@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GLM 夜班 · 设置</title>
+  <link rel="icon" href="data:,"><!-- 空 data 图标：避免浏览器请求 /favicon.ico 打出 404 -->
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="page-header">
+    <h1>GLM 夜班</h1>
+  </header>
+  <div id="nav"></div>
+  <main>
+    <!-- 读取 / 保存失败的错误条（打开页面先 GET /api/config 填表单） -->
+    <p id="settings-error" class="error" hidden></p>
+
+    <form id="settings-form" class="card">
+      <h2>常用开关</h2>
+      <p class="muted">只改下面这七个开关；写入数据目录的 config.json，正在运行的看板要重启后才按新值运行。端口、模型等其余配置改配置文件后重启。</p>
+      <div class="form-grid">
+        <label class="field field-check">
+          <input type="checkbox" name="allowPeak" id="s-allow-peak">
+          <span>允许高峰时段运行（任务级缺省值 allowPeak）</span>
+        </label>
+        <label class="field">
+          <span class="field-label">并发数（concurrency，同时运行的任务数）</span>
+          <input type="number" min="1" step="1" name="concurrency" id="s-concurrency">
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="oneTaskPerRepo" id="s-one-per-repo">
+          <span>同一仓库同时最多跑一个任务（oneTaskPerRepo）</span>
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="autoFollowReviews" id="s-auto-follow">
+          <span>自动跟进 PR 评审（autoFollowReviews，非高峰扫描并入队跟进）</span>
+        </label>
+        <label class="field">
+          <span class="field-label">评审扫描间隔（followPollMinutes，分钟）</span>
+          <input type="number" min="0.5" step="0.5" name="followPollMinutes" id="s-follow-poll">
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="prStatus" id="s-pr-status">
+          <span>记录 PR 已合并或关闭（prStatus，定期查 PR 状态）</span>
+        </label>
+        <label class="field">
+          <span class="field-label">PR 状态查询间隔（prStatusPollMinutes，分钟）</span>
+          <input type="number" min="0.5" step="0.5" name="prStatusPollMinutes" id="s-pr-poll">
+        </label>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="primary" id="settings-save">保存</button>
+        <p id="settings-saved" class="muted" aria-live="polite"></p>
+      </div>
+    </form>
+  </main>
+  <script type="module" src="/settings.js"></script>
+</body>
+</html>
