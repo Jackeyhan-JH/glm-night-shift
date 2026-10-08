@@ -3,6 +3,9 @@ GLM 夜班：把编码任务排进队列，错峰自动派给 Claude Code + GLM 
 
 ## 开发
 
-- Node.js 22+，零依赖；跑测试：`npm test`（即 `node --test`）。
-- 数据目录由 `NIGHT_SHIFT_HOME` 指定，默认 `~/.glm-night-shift`。
-- 测试不碰真实的 `claude` / `gh`，也不联网：一律用 `test/fixtures/fake-claude.mjs`、`test/fixtures/fake-gh.mjs`（行为用 `FAKE_CLAUDE_*` / `FAKE_GH_*` 环境变量控制）。
+- Node.js 22+（用到 `node:sqlite` 时需 22.13+ 且 Node 22 会打印 ExperimentalWarning，Node 24 没有）；零依赖，跑测试：`npm test`（即 `node --test`）。
+- 数据目录：环境变量 `NIGHT_SHIFT_HOME`，默认 `~/.glm-night-shift`。
+- 测试一律通过 `test/helpers.js` 的 `fakeEnv()` 构造子进程环境，用仓库里的假替身 `test/fixtures/fake-claude.mjs`、`test/fixtures/fake-gh.mjs`，**绝不调用真实的 `claude` / `gh`，也不联网**。
+  - 假 claude：`FAKE_CLAUDE_SCENARIO`（success/fail/hang/slow/noop）、`FAKE_CLAUDE_ARGS_LOG`、`FAKE_CLAUDE_DELAY_MS`。
+  - 假 gh：`FAKE_GH_LOG`、`FAKE_GH_PR_NUMBER`、`FAKE_GH_FAIL`、`FAKE_GH_REPO`、`FAKE_GH_DEFAULT_BRANCH`。
+- 注意：`node --test` 会把 `test/` 下所有 `.js`/`.mjs` 当测试文件执行（包括 `test/fixtures/*.mjs` 和 `test/helpers.js`），这些文件被无参数运行时必须零副作用。

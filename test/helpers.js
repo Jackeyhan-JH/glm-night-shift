@@ -51,11 +51,14 @@ export function fixturePath(name) {
  *   MAX_THINKING_TOKENS，以及所有 NIGHT_SHIFT_* 和 FAKE_CLAUDE_* / FAKE_GH_*
  *   （FAKE_* / MAX_THINKING_TOKENS 只能通过 overrides 显式给）。
  * - 指向仓库里的假替身：NIGHT_SHIFT_CLAUDE_BIN / NIGHT_SHIFT_GH_BIN。
- * - GH_CONFIG_DIR / CLAUDE_CONFIG_DIR 指向空临时目录：即使意外跑到真实 gh/claude，也是未登录状态。
- * - PATH 前置一个临时 shim 目录，里面有可执行的 `claude` 和 `gh`（exec 到假替身），
+ * - NIGHT_SHIFT_HOME 默认指向沙箱里的全新临时目录：忘了传它的测试也绝不会碰到真实
+ *   ~/.glm-night-shift（overrides 仍可覆盖）。
+ * - GH_CONFIG_DIR / CLAUDE_CONFIG_DIR 指向沙箱里的空目录：即使意外跑到真实 gh/claude，也是未登录状态。
+ * - PATH 前置沙箱里的 shim 目录，其中有可执行的 `claude` 和 `gh`（exec 到假替身），
  *   所以只写 `claudeBin: 'claude'` 的默认配置也会命中假替身。
- * - 最后应用 overrides（覆盖或新增，例如 NIGHT_SHIFT_HOME、FAKE_CLAUDE_SCENARIO）。
- * 临时沙箱目录在首次调用时创建一次并被复用，属于测试机临时目录，无需清理。
+ * - 最后应用 overrides（覆盖或新增，例如 FAKE_CLAUDE_SCENARIO）。
+ * 沙箱目录（os.tmpdir() 下的 night-shift-sandbox-*）首次调用时创建一次并被复用，
+ * 进程退出时自动删除，不会在 /tmp 里残留。
  */
 export function fakeEnv(overrides = {}) {
   const env = {};
@@ -68,6 +71,7 @@ export function fakeEnv(overrides = {}) {
   const box = ensureSandbox();
   env.NIGHT_SHIFT_CLAUDE_BIN = fixturePath('fake-claude.mjs');
   env.NIGHT_SHIFT_GH_BIN = fixturePath('fake-gh.mjs');
+  env.NIGHT_SHIFT_HOME = fs.mkdtempSync(path.join(box.root, 'home-'));
   env.GH_CONFIG_DIR = box.ghConfig;
   env.CLAUDE_CONFIG_DIR = box.claudeConfig;
   env.PATH = `${box.shim}${path.delimiter}${process.env.PATH ?? ''}`;
@@ -93,6 +97,8 @@ function ensureSandbox() {
     fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${fixturePath(fixture)}" "$@"\n`);
     fs.chmodSync(shim, 0o755);
   }
+  // 进程退出时删掉整个沙箱，避免在 /tmp 残留。
+  process.once('exit', () => fs.rmSync(root, { recursive: true, force: true }));
   sandbox = dirs;
   return sandbox;
 }
