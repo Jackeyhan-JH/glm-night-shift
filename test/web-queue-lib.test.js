@@ -10,6 +10,7 @@ import {
   formToBody,
   groupTasks,
   pauseToggleView,
+  prOutcomeLabel,
   statusBarText,
 } from '../web/queue-lib.js';
 
@@ -208,4 +209,50 @@ test('web/queue-lib.js 是 ESM 且可被 Node 直接 import（无 DOM 依赖）'
   assert.equal(typeof groupTasks, 'function');
   assert.equal(typeof formToBody, 'function');
   assert.equal(typeof depHint, 'function');
+});
+
+// ---------- 队列行的 PR 结果标签（#62） ----------
+
+test('验收: prOutcome 为 merged 的成功任务 → 「已合并」，且 task.status 仍是 succeeded（函数不改状态）', () => {
+  const task = { id: 4, status: 'succeeded', prOutcome: 'merged' };
+  assert.equal(prOutcomeLabel(task), '已合并');
+  assert.equal(task.status, 'succeeded', '任务状态不被改');
+});
+
+test('验收: prOutcome 为 closed → 「已关闭」', () => {
+  const task = { id: 5, status: 'succeeded', prOutcome: 'closed' };
+  assert.equal(prOutcomeLabel(task), '已关闭');
+  assert.equal(task.status, 'succeeded');
+});
+
+test('验收: open / null / 缺字段 / 空串 → 空串，返回值里既没有「已合并」也没有「已关闭」', () => {
+  const cases = [
+    { id: 1, status: 'succeeded', prOutcome: 'open' },
+    { id: 2, status: 'succeeded', prOutcome: null },
+    { id: 3, status: 'succeeded' }, // 不带 prOutcome 字段
+    { id: 4, status: 'succeeded', prOutcome: '' },
+    { id: 5, status: 'succeeded', prOutcome: undefined },
+  ];
+  for (const task of cases) {
+    const label = prOutcomeLabel(task);
+    assert.equal(label, '', `prOutcome=${String(task.prOutcome)} 不显示`);
+    assert.ok(!label.includes('已合并'), '不出现「已合并」');
+    assert.ok(!label.includes('已关闭'), '不出现「已关闭」');
+  }
+});
+
+test('验收: 大小写不同或带空白的值（MERGED / closed ）→ 空串（只认全等）', () => {
+  for (const value of ['MERGED', 'CLOSED', 'merged ', 'closed ', 'Merged', 1, true]) {
+    const label = prOutcomeLabel({ status: 'succeeded', prOutcome: value });
+    assert.equal(label, '', `prOutcome=${JSON.stringify(value)} 不显示`);
+  }
+});
+
+test('验收: 函数不修改入参对象（含 task 为 null / undefined 不抛错）', () => {
+  const task = { id: 9, status: 'succeeded', prOutcome: 'merged', title: '标题' };
+  const before = structuredClone(task);
+  prOutcomeLabel(task);
+  assert.deepEqual(task, before);
+  assert.equal(prOutcomeLabel(null), '');
+  assert.equal(prOutcomeLabel(undefined), '');
 });

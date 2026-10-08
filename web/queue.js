@@ -2,8 +2,9 @@
 // 运行中 / 历史）、每行取消/重试、新增任务表单（模板下拉 + 按模板动态生成变量输入 +
 // 依赖多选）。#46：排队中的行多了「修改」，复用新增表单装进任务值、提交改走 PATCH。
 // #50：状态条附近多了「从 GitHub 导入」「清理磁盘」两个入口（先预览后确认）与表格
-// 上方的仓库筛选（浏览器内过滤，不发 repo 参数）。DOM 与网络都在这里，纯函数（分组、
-// 提示文本、表单转请求体、筛选、预览文案……）在 queue-lib.js。
+// 上方的仓库筛选（浏览器内过滤，不发 repo 参数）。#62：成功任务的状态徽章旁边补一个
+// PR 结果标签（已合并 / 已关闭，用 DOM textContent 画，不进 innerHTML）。DOM 与网络
+// 都在这里，纯函数（分组、提示文本、表单转请求体、筛选、预览文案……）在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
 // 刷新只重绘状态条 / 标签 / 仓库筛选 / 表格 / 依赖下拉的选项，不重建表单其余输入、
@@ -27,6 +28,7 @@ import {
   importDoneText,
   importPreviewText,
   pauseToggleView,
+  prOutcomeLabel,
   repoFilterOptions,
   statusBarText,
   taskRowActions,
@@ -176,6 +178,28 @@ function renderTable() {
     .join('');
   els.table.innerHTML = `<div class="table-card"><table>` +
     `<thead><tr>${head}</tr></thead><tbody>${tasks.map(rowHtml).join('')}</tbody></table></div>`;
+  appendPrOutcomeLabels(tasks);
+}
+
+/**
+ * PR 结果标签（#62）：表格用 innerHTML 画完后，按行把「已合并 / 已关闭」补到状态
+ * 单元格里（徽章旁边，不是新列）。文案用 createElement + textContent 设置——不进
+ * 任何 innerHTML / 模板字符串；prOutcomeLabel 返回空串（open / 没查过 / 值不认识）
+ * 的一行一个节点都不建（连空格也不加），行文本里不会出现这两个词。行序 = tasks 序。
+ */
+function appendPrOutcomeLabels(tasks) {
+  const rows = els.table.querySelectorAll('tbody tr');
+  tasks.forEach((task, i) => {
+    const label = prOutcomeLabel(task);
+    if (label === '') return; // 不建空 span，也不加空格
+    const cell = rows[i]?.cells[1];
+    if (cell === undefined) return; // 行与任务对不上时宁可不显示（正常不会发生）
+    const span = document.createElement('span');
+    span.className = 'pr-outcome';
+    span.textContent = label;
+    // 徽章是 inline-block 的胶囊，直接接文本会粘成「成功已合并」：先补一个空格文本节点。
+    cell.append(document.createTextNode(' '), span);
+  });
 }
 
 /** 一行任务：ID、状态徽章、难度、优先级、仓库、标题（进详情页）、创建时间、操作。 */
