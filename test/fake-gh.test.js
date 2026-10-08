@@ -160,3 +160,52 @@ test('fakeEnv 的 PATH shim：裸 gh 命令也命中假替身', (t) => {
   assert.equal(res.status, 0);
   assert.equal(res.stdout, 'https://github.com/a/b/pull/1\n');
 });
+
+// —— issue view（issue #13 的任务模板用） ——
+
+test('验收: issue view 3 --repo a/b --json title,body 输出可解析 JSON，title 为 Fake issue #3', async (t) => {
+  const res = runFakeGh(t, ['issue', 'view', '3', '--repo', 'a/b', '--json', 'title,body'], {});
+  assert.equal(res.code, 0);
+  assert.equal(res.stderr, '');
+  const issue = JSON.parse(res.stdout);
+  assert.equal(issue.title, 'Fake issue #3');
+  assert.equal(issue.body, 'Fake body of a/b#3');
+});
+
+test('验收: FAKE_GH_ISSUE_FILE 指向的文件内容被原样输出', async (t) => {
+  const dir = makeTempHome(t);
+  const issueFile = path.join(dir, 'issue.json');
+  fs.writeFileSync(issueFile, '{"title":"文件标题","body":"无尾换行"}'); // 故意不带换行
+  const res = runFakeGh(t, ['issue', 'view', '5', '--repo', 'a/b', '--json', 'title,body'], {
+    env: { FAKE_GH_ISSUE_FILE: issueFile },
+    cwd: dir,
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '{"title":"文件标题","body":"无尾换行"}', '内容原样（不补换行）');
+});
+
+test('FAKE_GH_ISSUE_JSON 覆盖输出；优先级低于 FAKE_GH_ISSUE_FILE', async (t) => {
+  const viaJson = runFakeGh(t, ['issue', 'view', '1', '--repo', 'a/b', '--json', 'title,body'], {
+    env: { FAKE_GH_ISSUE_JSON: '{"title":"自定义","body":"正文"}' },
+  });
+  assert.equal(viaJson.code, 0);
+  assert.deepEqual(JSON.parse(viaJson.stdout), { title: '自定义', body: '正文' });
+
+  const dir = makeTempHome(t);
+  const issueFile = path.join(dir, 'issue.json');
+  fs.writeFileSync(issueFile, '{"title":"文件版"}');
+  const viaFile = runFakeGh(t, ['issue', 'view', '1', '--repo', 'a/b', '--json', 'title,body'], {
+    env: { FAKE_GH_ISSUE_FILE: issueFile, FAKE_GH_ISSUE_JSON: '{"title":"字符串版"}' },
+    cwd: dir,
+  });
+  assert.equal(JSON.parse(viaFile.stdout).title, '文件版');
+});
+
+test('FAKE_GH_ISSUE_FAIL=1：stderr 含 Could not resolve，退出 1', async (t) => {
+  const res = runFakeGh(t, ['issue', 'view', '42', '--repo', 'a/b', '--json', 'title,body'], {
+    env: { FAKE_GH_ISSUE_FAIL: '1' },
+  });
+  assert.equal(res.code, 1);
+  assert.equal(res.stdout, '');
+  assert.ok(res.stderr.includes('Could not resolve to an issue or pull request with the number of 42.'), res.stderr);
+});

@@ -20,6 +20,7 @@ import {
 } from '../src/cli/task-commands.js';
 import { depsCommand } from '../src/cli/deps-command.js';
 import { configCommand } from '../src/cli/config-command.js';
+import { templatesCommand } from '../src/cli/template-commands.js';
 
 // 通过 import.meta.url 相对路径读 package.json，任意 cwd / npm link 下都能找到。
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -46,6 +47,7 @@ const COMMANDS = {
   retry: retryCommand,
   deps: depsCommand,
   config: configCommand,
+  templates: templatesCommand,
   help: {
     summary: '显示帮助',
     usage: 'night-shift help',
