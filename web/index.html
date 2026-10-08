@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GLM 夜班 · 看板</title>
+  <title>GLM 夜班 · 队列</title>
+  <link rel="icon" href="data:,"><!-- 空 data 图标：避免浏览器请求 /favicon.ico 打出 404 -->
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -11,13 +12,90 @@
     <h1>GLM 夜班</h1>
   </header>
   <div id="nav"></div>
-  <main id="app">
-    <p class="placeholder">看板建设中</p>
+  <main>
+    <!-- 操作（取消/重试）失败的错误条 -->
+    <div id="page-error" class="error" hidden></div>
+
+    <!-- 状态条：高峰/非高峰 · 5 小时额度百分比 · 运行中数量（queue.js 渲染） -->
+    <div id="statusbar" class="statusbar"></div>
+
+    <!-- 三个标签（含数量）与当前标签的任务表 -->
+    <div id="tabs" class="tabs" role="tablist"></div>
+    <div id="task-table"></div>
+
+    <!-- 新增任务表单：模板下拉与变量输入、依赖多选由 queue.js 动态填充；
+         轮询刷新只重绘上面的区域，不重建表单，正在填写的内容不受影响。 -->
+    <form id="add-form" class="card">
+      <h2>新增任务</h2>
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">仓库 <b class="req">*</b></span>
+          <input name="repo" id="f-repo" required placeholder="owner/name">
+          <div class="field-error" data-error-for="repo" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">模板</span>
+          <select name="template" id="f-template">
+            <option value="">不用模板</option>
+          </select>
+          <div class="field-error" data-error-for="template" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">标题</span>
+          <input name="title" id="f-title" placeholder="缺省取提示词开头（模板可生成）">
+          <div class="field-error" data-error-for="title" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">难度</span>
+          <select name="difficulty" id="f-difficulty">
+            <option value="easy">easy</option>
+            <option value="medium" selected>medium</option>
+            <option value="hard">hard</option>
+          </select>
+          <div class="field-error" data-error-for="difficulty" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">优先级</span>
+          <input type="number" step="1" name="priority" id="f-priority" placeholder="0（越大越先领取）">
+          <div class="field-error" data-error-for="priority" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">测试命令</span>
+          <input name="testCommand" id="f-test" placeholder="如 npm test（可空）">
+          <div class="field-error" data-error-for="testCommand" hidden></div>
+        </label>
+        <label class="field">
+          <span class="field-label">最大尝试次数</span>
+          <input type="number" min="1" step="1" name="maxAttempts" id="f-max-attempts" placeholder="缺省取配置">
+          <div class="field-error" data-error-for="maxAttempts" hidden></div>
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="allowPeak" id="f-allow-peak">
+          <span>允许高峰时段运行</span>
+        </label>
+        <label class="field field-wide" id="prompt-row">
+          <span class="field-label">提示词 <b class="req">*</b></span>
+          <textarea name="prompt" id="f-prompt" rows="4" required
+            placeholder="要做什么（选模板时由模板生成，不用填）"></textarea>
+          <div class="field-error" data-error-for="prompt" hidden></div>
+        </label>
+        <div class="field field-wide" id="template-vars-field" hidden>
+          <span class="field-label">模板变量</span>
+          <div id="template-vars" class="vars-box"></div>
+          <div class="field-error" data-error-for="vars" hidden></div>
+        </div>
+        <label class="field field-wide">
+          <span class="field-label">依赖（可多选：这些排队中/运行中的任务全部成功后才会运行）</span>
+          <select name="dependsOn" id="f-depends" multiple size="5"></select>
+          <div class="field-error" data-error-for="dependsOn" hidden></div>
+        </label>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="primary">新增任务</button>
+        <div id="form-error" class="error" hidden></div>
+      </div>
+    </form>
   </main>
-  <script type="module">
-    // 占位页只做两件事：渲染公共导航、显示「看板建设中」。队列页 issue 会替换本文件。
-    import { navHtml } from '/common.js';
-    document.getElementById('nav').innerHTML = navHtml('/');
-  </script>
+  <script type="module" src="/queue.js"></script>
 </body>
 </html>

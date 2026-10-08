@@ -570,8 +570,8 @@ test('验收: GET / 返回 web/index.html（text/html），/style.css 为 text/c
   assert.equal(home.status, 200);
   assert.ok(home.headers.get('content-type').startsWith('text/html'));
   const html = await home.text();
-  assert.ok(html.includes('看板建设中'));
-  assert.ok(html.includes('/style.css') && html.includes('/common.js'), '引用公共骨架文件');
+  assert.ok(html.includes('/queue.js'), '队列页（#15）加载 queue.js');
+  assert.ok(html.includes('/style.css'), '引用公共样式');
 
   const css = await fetch(`${base}/style.css`);
   assert.equal(css.status, 200);
