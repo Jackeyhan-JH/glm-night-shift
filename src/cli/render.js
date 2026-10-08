@@ -35,8 +35,9 @@ function cleanPrompt(text) {
 /**
  * list 的对齐表格：表头「ID 状态 难度 优先级 仓库 标题 创建时间」，
  * 每列宽取该列（含表头）的最大显示宽度，列间两个空格，行尾不去补空格。
- * 等依赖的排队任务状态显示为 `queued（等 #1）`（多个：`等 #1,#2`）——状态列随之
- * 变宽，同表其余行按显示宽度自动对齐。
+ * 等依赖的排队任务状态显示为 `queued（等 #1）`（多个：`等 #1,#2`）；succeeded 且
+ * PR 已有结论时标 `succeeded（已合并）` / `succeeded（已关闭）`——状态列随之变宽，
+ * 同表其余行按显示宽度自动对齐。
  */
 export function renderTasksTable(tasks) {
   const header = ['ID', '状态', '难度', '优先级', '仓库', '标题', '创建时间'];
@@ -52,10 +53,19 @@ export function renderTasksTable(tasks) {
   return `${renderTable(header, rows)}\n`;
 }
 
-/** 状态列：queued 且有未满足依赖时标注在等谁（blockedBy 升序 id）。 */
+/**
+ * 状态列：queued 且有未满足依赖时标注在等谁（blockedBy 升序 id）——先判这条，
+ * 排队等依赖的任务永远不吃下面的 PR 结果标注（还没跑到开 PR 那步）。
+ * succeeded 且 PR 已有结论（#75）时在状态后注明：merged →「（已合并）」、
+ * closed →「（已关闭）」；open / 空 / 其他值不加字，仍是光秃秃的 succeeded。
+ */
 function statusCell(task) {
   if (task.status === 'queued' && task.blockedBy?.length > 0) {
     return `queued（等 #${task.blockedBy.join(',#')}）`;
+  }
+  if (task.status === 'succeeded') {
+    if (task.prOutcome === 'merged') return 'succeeded（已合并）';
+    if (task.prOutcome === 'closed') return 'succeeded（已关闭）';
   }
   return task.status;
 }
@@ -87,6 +97,16 @@ export function renderTaskDetail(task, runs, deps = []) {
     ['测试命令', task.testCommand ?? '（未设置）'],
     ['分支', task.branch ?? '（无）'],
     ['PR', task.prUrl ?? '（无）'],
+  );
+  // #75：PR 之后按「有值才出」补三行，顺序固定。空值整行不出现（不写「（无）」、
+  // 也不留空行）；gitRef / notBefore 只判 null / undefined / ''（不 trim，值原样输出），
+  // prOutcome 全等 merged / closed 才出——open 等其他值（PR 还开着或结论未知）不出。
+  if (filled(task.gitRef)) fields.push(['指定分支', task.gitRef]);
+  if (task.prOutcome === 'merged' || task.prOutcome === 'closed') {
+    fields.push(['PR 结果', task.prOutcome === 'merged' ? '已合并' : '已关闭']);
+  }
+  if (filled(task.notBefore)) fields.push(['暂不开始', formatLocalMinute(task.notBefore)]);
+  fields.push(
     ['最近错误', task.lastError ?? '（无）'],
     ['创建时间', formatLocalMinute(task.createdAt)],
     ['更新时间', formatLocalMinute(task.updatedAt)],
@@ -124,6 +144,11 @@ export function renderTaskDetail(task, runs, deps = []) {
     }
   }
   return `${lines.join('\n')}\n`;
+}
+
+/** 字段行「有值才出」的判空：null / undefined / '' 都算没有（值原样输出，不 trim）。 */
+function filled(value) {
+  return value !== null && value !== undefined && value !== '';
 }
 
 /** 多行文本的第一行（\r\n / \r 也归一按换行切）；没有内容返回 ''。 */
