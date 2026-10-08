@@ -87,6 +87,8 @@ export class InvalidTransitionError extends Error {
  * @property {?string} branch
  * @property {?string} prUrl
  * @property {?string} lastError
+ * @property {?string} notBefore UTC ISO，限流退避的最早重试时刻（claimNextTask 在
+ *   not_before > now 时跳过该任务）；null = 立刻可领
  * @property {string} createdAt UTC ISO
  * @property {string} updatedAt UTC ISO
  * @property {?string} startedAt UTC ISO，最近一次领取时间（重试再领会覆盖）
@@ -210,29 +212,61 @@ export function listTasks(db, { status, limit = 100 } = {}) {
  * 原子领取下一个排队任务：单条 UPDATE（子查询选 id + `AND status = 'queued'` 双保险，
  * SQLite 写语句串行执行），两个连接 / 进程绝不会领到同一个任务。改为 running、
  * attempts + 1、写 started_at / updated_at。
+ *
+ * not_before（限流退避，#9）：`not_before > now` 的任务跳过。now 接受 Date 或 ISO
+ * 字符串（比较前规范化成 UTC ISO，与写入方 finishTask 的格式一致，字典序即时间序），
+ * 缺省为当前时间；它**只**用于 not_before 过滤，started_at / updated_at 仍取真实
+ * 当前时间（不跟着测试时钟走）。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {object} [options]
  * @param {boolean} [options.allowPeakOnly=false] true 时只领 allow_peak = 1 的任务
+ * @param {Date|string} [options.now] 判断 not_before 的基准时刻，缺省当前时间
  * @returns {?TaskRow} 被领取的任务；没有可领的返回 null。
  *   started_at 语义：最近一次领取时间（重试后再领会覆盖，配合 attempts 递增读）
- * @throws {ValidationError} allowPeakOnly 非布尔
+ * @throws {ValidationError} allowPeakOnly 非布尔，或 now 不是合法时间（field='now'）
  */
-export function claimNextTask(db, { allowPeakOnly = false } = {}) {
+export function claimNextTask(db, { allowPeakOnly = false, now } = {}) {
   if (typeof allowPeakOnly !== 'boolean') {
     throw new ValidationError('allowPeakOnly', `必须是布尔值（当前值：${allowPeakOnly}）`);
   }
-  const now = nowIso();
+  const readyIso = now === undefined ? null : toIso(now, 'now');
+  const currentIso = nowIso();
   const row = db.prepare(`
     UPDATE tasks
     SET status = 'running', attempts = attempts + 1, started_at = ?, updated_at = ?
     WHERE id = (
       SELECT id FROM tasks
       WHERE status = 'queued' ${allowPeakOnly ? 'AND allow_peak = 1' : ''}
+        AND (not_before IS NULL OR not_before <= ?)
       ORDER BY priority DESC, created_at ASC, id ASC
       LIMIT 1
     ) AND status = 'queued'
     RETURNING *
-  `).get(now, now);
+  `).get(currentIso, currentIso, readyIso ?? currentIso);
+  return rowToTask(row);
+}
+
+/**
+ * 按 id 领取任务（#9 的 runNow 用）：只领 queued，语义同 claimNextTask（原子 UPDATE
+ * 带状态守卫、attempts + 1、覆盖 started_at）。与 claimNextTask 不同：不排序、不看
+ * not_before / allow_peak——runNow 是用户点名「现在就跑」，无视一切退避与高峰限制。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @returns {TaskRow} 被领取的任务
+ * @throws {ValidationError} id 非正整数
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 任务当前不是 queued（err.from 是库里实际的当前状态）
+ */
+export function claimTaskById(db, id) {
+  assertPositiveInt(id, 'id');
+  const now = nowIso();
+  const row = db.prepare(`
+    UPDATE tasks
+    SET status = 'running', attempts = attempts + 1, started_at = ?, updated_at = ?
+    WHERE id = ? AND status = 'queued'
+    RETURNING *
+  `).get(now, now, id);
+  if (row === undefined) throw staleTransitionError(db, id, 'running');
   return rowToTask(row);
 }
 
@@ -243,6 +277,13 @@ const FINISH_TASK_STATUSES = ['succeeded', 'failed', 'queued'];
 /**
  * 结束一个 running 任务。原子：UPDATE 带 `status = 'running'` 守卫，未命中（任务不存在，
  * 或状态已被别的连接改掉）时重读库里的当前状态抛错，不会静默覆盖并发操作的结果。
+ *
+ * queued 分支额外支持（#9 调度器）：
+ * - `refundAttempt: true` —— 退还这次尝试（attempts − 1，钳到 0）。限流、停机中断、
+ *   闸门二次确认未通过这类「不算任务自身失败」的放回用它；普通失败重试不用。
+ * - `notBefore`（Date 或 ISO 字符串，null = 清空）—— 限流退避的最早重试时刻，
+ *   claimNextTask 会跳过 not_before > now 的任务；retryTask 重置任务时清空。
+ * 两者都只允许配 queued（终态没有重试语义）。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @param {object} fields
@@ -250,14 +291,19 @@ const FINISH_TASK_STATUSES = ['succeeded', 'failed', 'queued'];
  * @param {?string} [fields.lastError] undefined = 保持原值；给了则覆盖（null = 清空）
  * @param {?string} [fields.prUrl] 同上
  * @param {?string} [fields.branch] 同上
+ * @param {Date|string|null} [fields.notBefore] 仅 queued：最早重试时刻（写入前规范化
+ *   成 UTC ISO）；undefined = 保持原值，null = 清空
+ * @param {boolean} [fields.refundAttempt=false] 仅 queued：true 时 attempts − 1（不低于 0）
  * @returns {TaskRow} 更新后的任务。终态写 finished_at，重试（queued）清空它；
- *   started_at 不动，仍是最近一次领取时间；attempts 不变（只有 retryTask 归零）
- * @throws {ValidationError} id 非正整数、status 不在允许集合（field='status'），
- *   或 lastError/prUrl/branch 给了却不是字符串或 null
+ *   started_at 不动，仍是最近一次领取时间；attempts 除 refundAttempt 外不变
+ * @throws {ValidationError} id 非正整数、status 不在允许集合（field='status'）、
+ *   lastError/prUrl/branch 给了却不是字符串或 null、refundAttempt 非布尔、
+ *   notBefore 不是合法时间（field='notBefore'），或 notBefore/refundAttempt
+ *   配了非 queued 的目标状态
  * @throws {NotFoundError} 任务不存在
  * @throws {InvalidTransitionError} 当前状态不是 running（err.from 是库里实际的当前状态）
  */
-export function finishTask(db, id, { status, lastError, prUrl, branch } = {}) {
+export function finishTask(db, id, { status, lastError, prUrl, branch, notBefore, refundAttempt = false } = {}) {
   assertPositiveInt(id, 'id');
   if (!FINISH_TASK_STATUSES.includes(status)) {
     throw new ValidationError(
@@ -268,12 +314,27 @@ export function finishTask(db, id, { status, lastError, prUrl, branch } = {}) {
   assertOptionalString(lastError, 'lastError');
   assertOptionalString(prUrl, 'prUrl');
   assertOptionalString(branch, 'branch');
+  if (typeof refundAttempt !== 'boolean') {
+    throw new ValidationError('refundAttempt', `必须是布尔值（当前值：${refundAttempt}）`);
+  }
+  let notBeforeIso; // undefined = 不更新
+  if (notBefore !== undefined) {
+    notBeforeIso = notBefore === null ? null : toIso(notBefore, 'notBefore');
+  }
+  if ((refundAttempt || notBeforeIso !== undefined) && status !== 'queued') {
+    throw new ValidationError(
+      refundAttempt ? 'refundAttempt' : 'notBefore',
+      `只在重试（queued）时可用，当前 status 是 ${status}`,
+    );
+  }
   const now = nowIso();
   const sets = ['status = ?', 'updated_at = ?', 'finished_at = ?'];
   const params = [status, now, status === 'queued' ? null : now];
+  if (refundAttempt) sets.push('attempts = MAX(0, attempts - 1)');
   appendOptionalColumn(sets, params, ['last_error', lastError]);
   appendOptionalColumn(sets, params, ['pr_url', prUrl]);
   appendOptionalColumn(sets, params, ['branch', branch]);
+  appendOptionalColumn(sets, params, ['not_before', notBeforeIso]);
   params.push(id);
   const row = db.prepare(
     `UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'running' RETURNING *`,
@@ -306,9 +367,9 @@ export function cancelTask(db, id) {
 }
 
 /**
- * 重新排队：failed | canceled → queued；attempts 归零、last_error / finished_at 清空；
- * started_at 保留（下次领取时覆盖），branch / pr_url 也保留（接着上次的开 PR 结果）。
- * 原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
+ * 重新排队：failed | canceled → queued；attempts 归零、last_error / finished_at /
+ * not_before 清空；started_at 保留（下次领取时覆盖），branch / pr_url 也保留
+ * （接着上次的开 PR 结果）。原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @returns {TaskRow} 更新后的任务
@@ -321,7 +382,8 @@ export function retryTask(db, id) {
   const now = nowIso();
   const row = db.prepare(`
     UPDATE tasks
-    SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL, updated_at = ?
+    SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL,
+        not_before = NULL, updated_at = ?
     WHERE id = ? AND status IN ('failed', 'canceled')
     RETURNING *
   `).get(now, id);
@@ -604,6 +666,7 @@ function rowToTask(row) {
     branch: row.branch,
     prUrl: row.pr_url,
     lastError: row.last_error,
+    notBefore: row.not_before,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     startedAt: row.started_at,

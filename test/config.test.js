@@ -29,6 +29,8 @@ const EXPECTED_DEFAULTS = {
   gitAuthorName: null,
   gitAuthorEmail: null,
   testTimeoutMinutes: 15,
+  rateLimitBackoffMinutes: 15,
+  keepFailedWorktrees: false,
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {

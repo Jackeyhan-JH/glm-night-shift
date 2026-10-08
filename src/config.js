@@ -27,6 +27,9 @@ export const DEFAULT_CONFIG = deepFreeze({
   gitAuthorName: null,
   gitAuthorEmail: null,
   testTimeoutMinutes: 15,
+  // —— issue #9 新增（调度器：限流退避与失败现场保留），按约定追加在对象末尾 ——
+  rateLimitBackoffMinutes: 15,
+  keepFailedWorktrees: false,
 });
 
 /**
