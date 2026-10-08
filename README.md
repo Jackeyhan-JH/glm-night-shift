@@ -185,7 +185,7 @@ CHANGES_REQUESTED 评审在原 night-shift 分支上入队跟进任务：gitRef 
 `gh`）：调度器只在**非高峰**、且距上次扫描至少 `followPollMinutes` 分钟（默认 30）时
 做一次与 `follow --all` 完全相同的扫描，夜里自己把跟进任务排进队列。
 
-- 只跟 `CHANGES_REQUESTED`，不跟 `APPROVED` / `COMMENTED`，也不会合并 PR；没有网页按钮
+- 只跟 `CHANGES_REQUESTED`，不跟 `APPROVED` / `COMMENTED`，也不会合并 PR；详情页对已成功、PR 还开着的任务有「跟进」按钮，判定与 follow 相同
   ——开了自动跟进，任务自己出现在队列里；没开就手动跑 `follow`。
 - 查到的跟进任务照旧排队等领取：扫描只入队、不执行，领取仍走高峰 / 额度 / 暂停的原有
   规则（手动 `pause` 或限流退避期间只入队、不领取）。
