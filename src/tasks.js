@@ -1094,6 +1094,11 @@ function rowToRun(row) {
     finishedAt: row.finished_at,
     durationMs: row.duration_ms,
     error: row.error,
+    // kind / diagnosis 是 #12 给 runs 加的列（task |diagnosis）。本分支的库还没有
+    // 这两列时 row.kind / row.diagnosis 是 undefined，JSON 序列化自然省略该字段——
+    // 看板详情页（#16）按「字段存在才显示」处理，旧数据不受影响。
+    kind: row.kind,
+    diagnosis: row.diagnosis,
   };
 }
 

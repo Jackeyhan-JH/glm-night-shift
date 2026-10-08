@@ -487,3 +487,144 @@ pre.log {
 }
 .form-actions .error { flex: 1; }
 
+
+/* ==================================================================
+   任务详情页（issue #16 追加；只新增类，不改上面的公共规则）
+   ================================================================== */
+
+/* 超时的运行徽章（runs 多一个 timeout 状态，配色沿用失败） */
+.badge-timeout { background: var(--badge-failed-bg); color: var(--badge-failed-fg); }
+
+/* 标题行：标题 + 状态徽章 + 操作按钮 */
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.task-head h2 {
+  margin: 0;
+  font-size: 18px;
+  overflow-wrap: anywhere;
+}
+.task-head .actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.action-msg {
+  color: var(--badge-failed-fg);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+/* 字段清单（dt/dd 两列网格） */
+.fields {
+  display: grid;
+  grid-template-columns: 8em 1fr;
+  column-gap: 16px;
+  row-gap: 6px;
+  margin: 0;
+  font-size: 14px;
+}
+.fields dt {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.fields dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.fields dd.last-error {
+  color: var(--badge-failed-fg);
+  white-space: pre-wrap; /* 多行错误原样显示 */
+}
+.fields dd.dep-links {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.fields a { color: var(--accent); }
+
+/* 可折叠区块（提示词全文 / 诊断全文） */
+details.fold {
+  margin-top: 12px;
+}
+details.fold > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 14px;
+  user-select: none;
+}
+pre.prompt-body,
+pre.diag-body {
+  white-space: pre-wrap; /* 保留换行，按文本显示 */
+  word-break: break-word;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 8px 0 0;
+  font-size: 13px;
+}
+
+/* 运行列表 */
+.runs-table tr.run-row { cursor: pointer; }
+.runs-table tr.run-row.selected { background: var(--badge-queued-bg); }
+.runs-table tr.diag-row:hover { background: transparent; }
+.runs-table td.error-col {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 日志区工具条与滚动窗 */
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.log-toolbar .log-label {
+  font-size: 14px;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.log-toolbar .grow { flex: 1; }
+.log-toolbar a { color: var(--accent); font-size: 14px; }
+.log-view {
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow: auto;
+  max-height: 70vh;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line.log-stdout { color: #e2e8f0; }
+.log-line.log-stderr { color: #fca5a5; } /* [stderr] 红 */
+.log-line.log-meta   { color: #94a3b8; } /* [meta] 灰 */
+.log-line.log-plain  { color: #cbd5e1; } /* 认不出流前缀的行 */
+
+/* 任务不存在 / 加载失败 */
+.notfound {
+  text-align: center;
+  padding: 64px 0;
+  font-size: 16px;
+}
+.notfound a {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--accent);
+}
