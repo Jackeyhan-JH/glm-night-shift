@@ -5,7 +5,8 @@
 // ⚠️ 与 task-commands.js 同理：本文件（及其静态依赖）绝不能 import src/db.js——它是
 // 唯一加载 node:sqlite 的模块，静态引入会让入口来不及先装 SQLite 警告过滤（时机说明
 // 见 src/warnings.js）。openDb / createScheduler / runEvents 一律走动态 import；
-// tasks.js / config.js / clock.js / format.js / peak.js / quota.js 不碰 node:sqlite。
+// tasks.js / config.js / clock.js / format.js / peak.js / quota.js / scheduler-lock.js
+// 不碰 node:sqlite。
 //
 // 时间约定（#1 / #9）：所有「现在」都取 systemClock(env)（测试用 NIGHT_SHIFT_NOW 固定），
 // 显示按进程本地时区到分钟（测试设 TZ=Asia/Shanghai 保证输出稳定）。
@@ -17,6 +18,8 @@ import { ensureHome, loadConfig, resolveHome } from '../config.js';
 import { formatLocalMinute } from '../format.js';
 import { RULES, getStatus } from '../peak.js';
 import { MODEL_MULTIPLIERS, usage as quotaUsage } from '../quota.js';
+import { acquireSchedulerLock } from '../scheduler-lock.js';
+import { attachSchedulerLog } from './scheduler-log.js';
 import {
   DependencyBlockedError,
   InvalidTransitionError,
@@ -28,24 +31,12 @@ import {
 
 /** 北京时间的星期标签（getDay 取值：周日为 0）。 */
 const WEEKDAY_LABELS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-/** blocked 事件的 reason → 中文原因（与 src/scheduler.js 的四种拦截原因一一对应）。 */
-const BLOCK_REASONS = {
-  peak: '高峰期',
-  'five-hour': '5 小时额度已满',
-  weekly: '每周额度已满',
-  'rate-limit': '被限流',
-};
 /** logs --follow 轮询新日志 / 查运行是否结束的间隔。 */
 const FOLLOW_POLL_MS = 100;
 /** 多行用法里续行的缩进：对齐到「用法：night-shift 」之后的命令名（与其他 cli 模块一致）。 */
 const USAGE_CONT = ' '.repeat(15);
 
 const p2 = (n) => String(n).padStart(2, '0');
-
-/** 本地时区 HH:MM（事件行的 [HH:MM] 前缀）。 */
-function localHourMinute(date) {
-  return `${p2(date.getHours())}:${p2(date.getMinutes())}`;
-}
 
 /** 北京日历时刻（固定 UTC+8，无夏令时）：周几 + HH:MM。 */
 function beijingWeekdayHM(date) {
@@ -95,77 +86,66 @@ export const startCommand = {
     const config = loadConfig({ home, env: ctx.env }); // NIGHT_SHIFT_NOW 非法时 systemClock 抛错 → 退出 1
     const clock = systemClock(ctx.env);
     ensureHome(home); // logs/ / repos/ / worktrees/ 子目录（幂等）
-    const db = await openDbAt(ctx);
-    const { createScheduler } = await import('../scheduler.js');
-    const scheduler = createScheduler({ db, config, home, clock, env: ctx.env });
-
+    // 一个数据目录同一时刻只允许一个调度器进程（#18 产品评论）：被别的 serve / start
+    // 持有时 acquireSchedulerLock 抛错 → 退出 1，不领任务。
+    const lock = acquireSchedulerLock(home);
     const say = (line) => ctx.stdout.write(`${line}\n`);
-    const at = () => `[${localHourMinute(clock())}]`;
+    let db = null;
+    try {
+      db = await openDbAt(ctx);
+      const { createScheduler } = await import('../scheduler.js');
+      const scheduler = createScheduler({ db, config, home, clock, env: ctx.env });
+      // 调度器事件 → 一行一条（与 serve 完全相同的格式，见 scheduler-log.js）
+      attachSchedulerLog(scheduler, { db, clock, write: (line) => ctx.stdout.write(line) });
 
-    // 调度器事件 → 一行一条（issue 规定的格式）；监听器自身绝不抛错打断调度。
-    scheduler.events.on('claim', ({ taskId }) => {
-      let title = '';
-      try {
-        title = getTask(db, taskId)?.title ?? '';
-      } catch {
-        // 读库失败就只报 id，别拦着任务执行
-      }
-      say(`${at()} 领取 #${taskId}${title === '' ? '' : ` ${title}`}`);
-    });
-    scheduler.events.on('done', ({ taskId, status, prUrl, error }) => {
-      if (status === 'succeeded') say(`${at()} #${taskId} 成功：${prUrl}`);
-      else if (status === 'queued') say(`${at()} #${taskId} 放回队列：${error}`);
-      else if (status === 'canceled') say(`${at()} #${taskId} 已取消${error === null ? '' : `：${error}`}`);
-      else say(`${at()} #${taskId} 失败：${error}`);
-    });
-    scheduler.events.on('blocked', ({ reason, retryAt }) => {
-      // 同一 (原因, 恢复时刻) 调度器只发一次，这里每条都如实打印
-      const when = retryAt === null || retryAt === undefined
-        ? '恢复时间未知'
-        : `${formatLocalMinute(new Date(retryAt).toISOString())} 后恢复`;
-      say(`${at()} 暂停领取：${BLOCK_REASONS[reason] ?? reason}，${when}`);
-    });
+      // 信号协议（issue 规定）：第一次 SIGINT / SIGTERM 优雅停止（没有运行中任务就直接
+      // 退出）；第二次（再按 Ctrl-C）强制停止。两种都等收尾完成后以退出码 0 结束。
+      // 处理器必须先于启动行安装：管道写一旦落进内核，读端立刻可见，紧跟着的 SIGINT
+      // 可能赶在 process.on 之前到达（默认行为直接把进程打死——启动行与安装在同一段
+      // 同步代码里也不够，顺序得是先装再打印）。
+      const code = await new Promise((resolve) => {
+        let stopRequested = false;
+        let settled = false;
+        const finish = (exitCode) => {
+          if (settled) return;
+          settled = true;
+          process.removeListener('SIGINT', onSignal);
+          process.removeListener('SIGTERM', onSignal);
+          resolve(exitCode);
+        };
+        const requestStop = (force) => {
+          // stop() 的 Promise 在全部任务收尾后 resolve；拒绝按 0 处理（收尾异常已各自
+          // 记录进任务，别让调度器的实现失误变成非零退出码）。
+          scheduler.stop({ force }).then(() => finish(0), () => finish(0));
+        };
+        const onSignal = () => {
+          if (stopRequested) {
+            say('强制停止…');
+            requestStop(true);
+            return;
+          }
+          stopRequested = true;
+          const running = scheduler.status().running;
+          if (running.length === 0) {
+            requestStop(false); // 没有运行中的任务：直接退出
+            return;
+          }
+          say(`正在停止：不再领取新任务，等待 ${running.length} 个运行中的任务结束（再按 Ctrl-C 强制停止）`);
+          requestStop(false);
+        };
+        process.on('SIGINT', onSignal);
+        process.on('SIGTERM', onSignal);
 
-    say(`GLM 夜班已启动：并发 ${config.concurrency}，每 ${config.pollSeconds} 秒检查一次，数据目录 ${home}`);
-    scheduler.start();
-
-    // 信号协议（issue 规定）：第一次 SIGINT / SIGTERM 优雅停止（没有运行中任务就直接
-    // 退出）；第二次（再按 Ctrl-C）强制停止。两种都等收尾完成后以退出码 0 结束。
-    const code = await new Promise((resolve) => {
-      let stopRequested = false;
-      let settled = false;
-      const finish = (exitCode) => {
-        if (settled) return;
-        settled = true;
-        process.removeListener('SIGINT', onSignal);
-        process.removeListener('SIGTERM', onSignal);
-        resolve(exitCode);
-      };
-      const requestStop = (force) => {
-        // stop() 的 Promise 在全部任务收尾后 resolve；拒绝按 0 处理（收尾异常已各自
-        // 记录进任务，别让调度器的实现失误变成非零退出码）。
-        scheduler.stop({ force }).then(() => finish(0), () => finish(0));
-      };
-      const onSignal = () => {
-        if (stopRequested) {
-          say('强制停止…');
-          requestStop(true);
-          return;
-        }
-        stopRequested = true;
-        const running = scheduler.status().running;
-        if (running.length === 0) {
-          requestStop(false); // 没有运行中的任务：直接退出
-          return;
-        }
-        say(`正在停止：不再领取新任务，等待 ${running.length} 个运行中的任务结束（再按 Ctrl-C 强制停止）`);
-        requestStop(false);
-      };
-      process.on('SIGINT', onSignal);
-      process.on('SIGTERM', onSignal);
-    });
-    db.close();
-    return code;
+        say(`GLM 夜班已启动：并发 ${config.concurrency}，每 ${config.pollSeconds} 秒检查一次，数据目录 ${home}`);
+        scheduler.start();
+      });
+      db.close();
+      db = null;
+      return code;
+    } finally {
+      lock.release(); // 正常退出与异常路径都删自己的锁（内容已被后继者换掉时不动）
+      if (db !== null) db.close();
+    }
   },
 };
 

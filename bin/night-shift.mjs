@@ -22,6 +22,8 @@ import { depsCommand } from '../src/cli/deps-command.js';
 import { configCommand } from '../src/cli/config-command.js';
 import { templatesCommand } from '../src/cli/template-commands.js';
 import { serveCommand } from '../src/cli/serve-command.js';
+import { serveRunCommand } from '../src/cli/serve-run.js';
+import { installServiceCommand, uninstallServiceCommand } from '../src/cli/service-command.js';
 import {
   logsCommand,
   peakCommand,
@@ -62,6 +64,9 @@ const COMMANDS = {
   config: configCommand,
   templates: templatesCommand,
   'serve-api': serveCommand,
+  serve: serveRunCommand,
+  'install-service': installServiceCommand,
+  'uninstall-service': uninstallServiceCommand,
   help: {
     summary: '显示帮助',
     usage: 'night-shift help',
@@ -81,7 +86,8 @@ function withTrailingNewline(text) {
 }
 
 function usageText() {
-  const commandLines = Object.entries(COMMANDS).map(([name, cmd]) => `  ${name.padEnd(10)}${cmd.summary}`);
+  // 命令名列宽按最长的命令名（uninstall-service）放宽到 18，保证摘要列对齐。
+  const commandLines = Object.entries(COMMANDS).map(([name, cmd]) => `  ${name.padEnd(18)}${cmd.summary}`);
   // 各命令的 usage 单一来源：帮助里原样列出（help 自身显而易见，不重复）。
   const details = Object.entries(COMMANDS)
     .filter(([name]) => name !== 'help')
@@ -104,8 +110,8 @@ function usageText() {
     'deps --set 的 id 列表逗号分隔、容忍空格，空串表示无依赖（--set "" 即清空）。',
     '数据目录：$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
     '',
-    'serve（调度器与看板一键启动）等命令将在后续版本加入；',
-    '看板服务见 serve-api。',
+    '日常一条命令：serve 同时跑调度器与看板；install-service 把它装成 systemd 用户',
+    '服务（开机自启，uninstall-service 卸载）。只看数据不调度时用 serve-api。',
     '',
   ].join('\n');
 }

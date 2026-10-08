@@ -35,6 +35,7 @@ const EXPECTED_DEFAULTS = {
   autoDiagnose: true,
   diagnoseModel: 'glm-5.3-flash',
   diagnoseTimeoutMinutes: 5,
+  systemctlBin: 'systemctl',
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {
@@ -88,11 +89,20 @@ test('环境变量覆盖 claudeBin/ghBin/port，port 是数字，且优先于 co
 test('空字符串的环境变量被忽略', (t) => {
   const cfg = loadConfig({
     home: makeTempHome(t),
-    env: { NIGHT_SHIFT_CLAUDE_BIN: '', NIGHT_SHIFT_GH_BIN: '', NIGHT_SHIFT_PORT: '' },
+    env: { NIGHT_SHIFT_CLAUDE_BIN: '', NIGHT_SHIFT_GH_BIN: '', NIGHT_SHIFT_PORT: '', NIGHT_SHIFT_SYSTEMCTL_BIN: '' },
   });
   assert.equal(cfg.claudeBin, 'claude');
   assert.equal(cfg.ghBin, 'gh');
   assert.equal(cfg.port, 7788);
+  assert.equal(cfg.systemctlBin, 'systemctl');
+});
+
+test('环境变量 NIGHT_SHIFT_SYSTEMCTL_BIN 覆盖 systemctlBin，且优先于 config.json', (t) => {
+  const home = makeTempHome(t);
+  fs.writeFileSync(configPath(home), JSON.stringify({ systemctlBin: 'from-file' }));
+  assert.equal(loadConfig({ home, env: { NIGHT_SHIFT_SYSTEMCTL_BIN: '/tmp/fake-systemctl' } }).systemctlBin,
+    '/tmp/fake-systemctl');
+  assert.equal(loadConfig({ home, env: {} }).systemctlBin, 'from-file');
 });
 
 test('NIGHT_SHIFT_PORT 非法时抛错并点名该变量', (t) => {
