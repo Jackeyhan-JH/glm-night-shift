@@ -197,6 +197,74 @@ function ddOf(page, label) {
   assert.fail(`页面上没有「${label}」行，实际：${labels(page).join(' | ')}`);
 }
 
+// ---------- #66「还没领」：路由版 fetch 桩 + 可控定时器 ----------
+
+/** 定时器桩（拷自 test/web-task.test.js 的最小面）：不真等 5 秒，测试手动 tick。 */
+function fakeTimers() {
+  const intervals = new Map();
+  let next = 1;
+  return {
+    setInterval(fn) {
+      const id = next++;
+      intervals.set(id, fn);
+      return id;
+    },
+    clearInterval(id) { intervals.delete(id); },
+    setTimeout(fn) {
+      const id = next++;
+      return id;
+    },
+    clearTimeout() {},
+    tickIntervals() { for (const fn of [...intervals.values()]) fn(); },
+    get intervalCount() { return intervals.size; },
+  };
+}
+
+/** /api/status 响应体的最小形状（这行只读顶层 userPaused 与 scheduler.blocked）。 */
+function statusPayload(overrides = {}) {
+  return {
+    userPaused: false,
+    scheduler: { blocked: null, userPaused: false },
+    ...overrides,
+  };
+}
+
+/**
+ * 路由版 makePage（#66 用）：GET /api/tasks/:id 与 GET /api/status 各回各的——现有
+ * makePage 对所有 URL 返回同一份任务 JSON，分不出两份数据。task 传可变对象：改它再
+ * tick 就是「下一轮刷新返回了新状态」。status 传对象或 () => 响应 / 抛错（测失败路径）。
+ */
+function makeRoutedPage(t, { task, status, search = '?id=1', timers }) {
+  const doc = makeStubDoc();
+  const real = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = (input) => {
+    const url = String(input);
+    calls.push(url);
+    if (url === '/api/status') {
+      return typeof status === 'function' ? status() : Promise.resolve({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve(JSON.stringify(status)),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify(task)),
+    });
+  };
+  const options = timers === undefined
+    ? { doc, location: { search } }
+    : { doc, location: { search }, timers };
+  const page = createPage(options).init();
+  t.after(() => {
+    page.destroy();
+    globalThis.fetch = real;
+  });
+  return { page, doc, calls };
+}
+
 // ---------- 验收 ----------
 
 test('验收: 四个字段都有值：「来源」「指定分支」「还在等」「暂不开始」依次出现在「依赖」后、「最近错误」前；#3 链到 /task.html?id=3', async (t) => {
@@ -311,4 +379,160 @@ test('验收: blockedBy 混非正整数：[3, "nope", -1, 0, 1.5, "3"] 只有 3 
   const hrefs = findAll(app, (n) => n.attributes.has('href'))
     .map((n) => n.attributes.get('href'));
   assert.deepEqual(hrefs, ['/task.html?id=3']);
+});
+
+// ---------- #66「还没领」验收 ----------
+
+test('验收: 排队中 scheduler === null：画出「还没领：调度器没在跑」；「还在等」「暂不开始」仍在，全页仍只有导航用 innerHTML', async (t) => {
+  const { page, doc } = makeRoutedPage(t, {
+    task: taskPayload({
+      blockedBy: [3],
+      notBefore: '2026-10-09T01:23:00.000Z',
+      lastError: '上次失败',
+    }),
+    status: statusPayload({ scheduler: null }),
+  });
+  await page.busy;
+  const app = doc.getElementById('app');
+
+  // 任务信息照常画：仓库、状态徽章（排队中）、提示词
+  assert.equal(ddOf(page, '仓库').textContent, 'a/b');
+  assert.equal(page.refs.headBadge.textContent, '排队中');
+  assert.ok(app.textContent.includes('做点事'), '提示词仍在');
+  // 「还没领」这行：dt/dd 都是 textContent
+  assert.equal(ddOf(page, '还没领').textContent, '调度器没在跑');
+  assert.equal(ddOf(page, '还没领').children.length, 0, '不产生子元素');
+  // 「还在等」「暂不开始」没被取代：三行同时在，顺序在「暂不开始」后、「最近错误」前
+  const order = labels(page);
+  assert.ok(order.includes('还在等'));
+  assert.ok(order.includes('暂不开始'));
+  assert.ok(order.indexOf('暂不开始') < order.indexOf('还没领'), '「还没领」在「暂不开始」之后');
+  assert.ok(order.indexOf('还没领') < order.indexOf('最近错误'), '「还没领」在「最近错误」之前');
+  // 全页只有导航（navHtml 静态串）用过 innerHTML
+  const htmlUsers = [...findAll(doc.getElementById('nav'), (n) => n._innerHTML !== ''),
+    ...findAll(app, (n) => n._innerHTML !== '')];
+  assert.equal(htmlUsers.length, 1);
+  assert.equal(htmlUsers[0], doc.getElementById('nav'));
+});
+
+test('验收: 顶层 userPaused === true 且 blocked five-hour：只有「已暂停领任务」，不出现「5 小时额度」', async (t) => {
+  const { page, doc } = makeRoutedPage(t, {
+    task: taskPayload(),
+    status: statusPayload({
+      userPaused: true,
+      scheduler: { blocked: { reason: 'five-hour', retryAt: '2026-10-08T09:00:00.000Z' }, userPaused: false },
+    }),
+  });
+  await page.busy;
+  assert.equal(ddOf(page, '还没领').textContent, '已暂停领任务');
+  assert.ok(!doc.getElementById('app').textContent.includes('5 小时额度'), '不显示上一轮留下的 blocked');
+});
+
+test('验收: 未暂停、five-hour 带 retryAt：看得到「5 小时额度已达安全阈值」和 fmtTime 的恢复时间', async (t) => {
+  const retryAt = '2026-10-08T09:05:00.000Z';
+  const { page } = makeRoutedPage(t, {
+    task: taskPayload(),
+    status: statusPayload({
+      scheduler: { blocked: { reason: 'five-hour', retryAt }, userPaused: false },
+    }),
+  });
+  await page.busy;
+  assert.equal(ddOf(page, '还没领').textContent, `5 小时额度已达安全阈值；预计 ${fmtTime(retryAt)} 恢复`);
+});
+
+test('验收: peak 且任务 allowPeak false：看得到「高峰期，暂不领新任务」', async (t) => {
+  const { page } = makeRoutedPage(t, {
+    task: taskPayload({ allowPeak: false }),
+    status: statusPayload({
+      scheduler: { blocked: { reason: 'peak', retryAt: '2026-10-08T13:00:00.000Z' }, userPaused: false },
+    }),
+  });
+  await page.busy;
+  assert.equal(
+    ddOf(page, '还没领').textContent,
+    `高峰期，暂不领新任务；预计 ${fmtTime('2026-10-08T13:00:00.000Z')} 恢复`,
+  );
+});
+
+test('验收: peak 且 allowPeak true：labels 里没有「还没领」（这条允许高峰，整行不出现）', async (t) => {
+  const { page, doc } = makeRoutedPage(t, {
+    task: taskPayload({ allowPeak: true }),
+    status: statusPayload({
+      scheduler: { blocked: { reason: 'peak' }, userPaused: false },
+    }),
+  });
+  await page.busy;
+  assert.ok(!labels(page).includes('还没领'));
+  assert.ok(!doc.getElementById('app').textContent.includes('高峰期'));
+});
+
+test('验收: scheduler 是对象、blocked null、未暂停：没有「还没领」', async (t) => {
+  const { page, doc } = makeRoutedPage(t, {
+    task: taskPayload(),
+    status: statusPayload(),
+  });
+  await page.busy;
+  assert.ok(!labels(page).includes('还没领'));
+  assert.ok(!doc.getElementById('app').textContent.includes('还没领'));
+});
+
+test('验收: running 的任务：没有「还没领」，fetch 记录里没有 /api/status', async (t) => {
+  const { page, doc, calls } = makeRoutedPage(t, {
+    task: taskPayload({ status: 'running', startedAt: '2026-10-08T07:00:00.000Z' }),
+    status: statusPayload({ scheduler: null }),
+  });
+  await page.busy;
+  assert.ok(!labels(page).includes('还没领'));
+  assert.ok(!doc.getElementById('app').textContent.includes('调度器没在跑'));
+  assert.ok(!calls.includes('/api/status'), `running 不打 /api/status，实际：${calls.join(', ')}`);
+});
+
+test('验收: /api/status 失败（非 2xx / 网络错误）：仓库、状态徽章、提示词仍在，没有「还没领」，页面不是「加载任务失败」', async (t) => {
+  const notOk = () => Promise.resolve({
+    ok: false,
+    status: 503,
+    text: () => Promise.resolve(JSON.stringify({ error: 'unavailable' })),
+  });
+  const rejected = () => Promise.reject(new Error('network down'));
+  for (const failing of [notOk, rejected]) {
+    const { page, doc } = makeRoutedPage(t, { task: taskPayload(), status: failing });
+    await page.busy;
+    const app = doc.getElementById('app');
+    assert.equal(ddOf(page, '仓库').textContent, 'a/b');
+    assert.equal(page.refs.headBadge.textContent, '排队中');
+    assert.ok(app.textContent.includes('做点事'), '提示词仍在');
+    assert.ok(!labels(page).includes('还没领'), '没有可依据的 status，不画这行');
+    assert.ok(!app.textContent.includes('加载任务失败'), '状态请求失败不拖垮任务信息');
+  }
+});
+
+test('验收: queued 复用 running 的同一个刷新定时器（intervalCount === 1）；tick 再拉 /api/status；变成 succeeded 后停表且不再拉', async (t) => {
+  const timers = fakeTimers();
+  const task = taskPayload(); // 可变对象：第二轮刷新改成 succeeded
+  const { page, calls } = makeRoutedPage(t, {
+    task,
+    status: statusPayload({ scheduler: null }),
+    timers,
+  });
+  await page.busy;
+
+  assert.equal(timers.intervalCount, 1, 'queued 装上与 running 同一个定时器（不是两个）');
+  assert.equal(calls.filter((c) => c === '/api/status').length, 1, '首屏就拉过一次 /api/status');
+
+  timers.tickIntervals();
+  await page.busy;
+  assert.equal(calls.filter((c) => c === '/api/status').length, 2, 'tick 后仍是 queued：再拉 /api/status');
+  assert.equal(ddOf(page, '还没领').textContent, '调度器没在跑');
+
+  // 下一轮刷新任务变成 succeeded：定时器停掉、不再碰 /api/status，上一轮原因清掉
+  task.status = 'succeeded';
+  timers.tickIntervals();
+  await page.busy;
+  assert.equal(page.refs.headBadge.textContent, '成功');
+  assert.equal(timers.intervalCount, 0, '离开 queued：刷新定时器已停');
+  assert.ok(!labels(page).includes('还没领'), '非 queued 的页面上没有上一轮的原因');
+  const after = calls.filter((c) => c === '/api/status').length;
+  timers.tickIntervals(); // 定时器已停：不会再触发任何请求
+  await page.busy;
+  assert.equal(calls.filter((c) => c === '/api/status').length, after, '停表后不再请求 /api/status');
 });
