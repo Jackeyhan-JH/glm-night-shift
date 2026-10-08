@@ -118,6 +118,41 @@ export function whyNotClaimed(statusBody, task) {
 }
 
 /**
+ * 排队任务「等这个仓库」的显示判定（#88）：oneTaskPerRepo 开着（GET /api/config）且
+ * 同仓库另有一条任务在跑（GET /api/tasks?status=running）时，详情页点名这条排队卡住
+ * 的原因。配置是磁盘上的值，正在跑的进程可能还是旧的，允许这句和真实领取短暂不一致
+ * ——这里只说明现状，不改领取规则。同时满足才返回 '等这个仓库'：
+ * 1. config 是对象且 oneTaskPerRepo === true（严格布尔；false / 缺字段 / 字符串 "true" /
+ *    数字 1 / config 为 null（请求失败）都不算，不假设磁盘默认值是开的）；
+ * 2. task.status === 'queued'（running / 终态 / 缺 status 都不算）；
+ * 3. running 是数组（请求失败得 null、响应体是对象都不算）；
+ * 4. 列表里有另一条：id !== 当前任务 id（用 !==，数字和字符串不算同一个），两边 repo
+ *    都是字符串且 === 全等（不 trim、不大小写折叠）；当前任务 repo 不是字符串则不算；
+ * 5. 那一条的 status === 'running'（同仓库另一条只是 queued 的不算；不根据 dependsOn /
+ *    blockedBy / not_before 去猜）。
+ * 纯函数：不改入参、不碰 DOM、不发请求。
+ * @param {object|null} config /api/config 的响应体（请求失败时调用方传 null）
+ * @param {{ id?: number, status?: string, repo?: string }} task 当前任务（页面的 state.task）
+ * @param {Array|null} running /api/tasks?status=running 的响应体（失败 / 非数组时调用方原样传入）
+ * @returns {string} '等这个仓库' 或 ''（'' = 整行不画）
+ */
+export function waitingOnRepo(config, task, running) {
+  if (config === null || typeof config !== 'object') return '';
+  if (config.oneTaskPerRepo !== true) return '';
+  if (task?.status !== 'queued') return '';
+  if (typeof task.repo !== 'string') return '';
+  if (!Array.isArray(running)) return '';
+  for (const other of running) {
+    if (other?.id === task.id) continue; // 只有自己不算（!== 全等，"1" 与 1 是两条）
+    if (other?.status !== 'running') continue;
+    if (typeof other?.repo !== 'string') continue;
+    if (other.repo !== task.repo) continue; // 全等比较：大小写 / 首尾空格都算不同仓库
+    return '等这个仓库';
+  }
+  return '';
+}
+
+/**
  * 「跟进」按钮（#68）的显示判定：详情页对已成功、PR 还开着的任务显示按钮，点了走
  * POST /api/tasks/:id/follow（判定在服务端的 followTask，这里只决定要不要露出入口）。
  * 同时满足才显示：
@@ -169,6 +204,8 @@ export function createPage(options = {}) {
     retryTimer: null,
     refreshTimer: null,
     statusBody: null, // 最近一次 /api/status 的响应（只在任务排队时拉；非 queued / 失败为 null）
+    configBody: null, // 最近一次 /api/config 的响应（同上；#88「等这个仓库」的开关依据）
+    runningBody: null, // 最近一次 /api/tasks?status=running 的响应（同上；非数组时按不显示处理）
   };
   let loadSeq = 0; // 已结束运行日志的加载序号：切换运行后丢弃过期的响应
 
@@ -326,12 +363,19 @@ export function createPage(options = {}) {
     state.task = payload;
     state.runs = Array.isArray(payload.runs) ? payload.runs : [];
     // #66：排队中顺带拉 /api/status 判定「还没领」的原因（首屏与每次 tick 都在这里，
-    // 不另起定时器）；非 queued 不为这行发请求，并把上一轮的原因清掉——别把旧理由
-    // 留在别的状态的页面上。
+    // 不另起定时器）；#88 再加 /api/config 与 /api/tasks?status=running 判定「等这个
+    // 仓库」，三个附属请求并行、失败各自吞掉。非 queued 不为这些行发请求，并把上一轮
+    // 的数据清掉——别把旧理由留在别的状态的页面上。
     if (state.task.status === 'queued') {
-      state.statusBody = await fetchStatusBody();
+      [state.statusBody, state.configBody, state.runningBody] = await Promise.all([
+        fetchStatusBody(),
+        fetchConfigBody(),
+        fetchRunningBody(),
+      ]);
     } else {
       state.statusBody = null;
+      state.configBody = null;
+      state.runningBody = null;
     }
     renderInfo();
     renderRuns();
@@ -350,6 +394,31 @@ export function createPage(options = {}) {
   async function fetchStatusBody() {
     try {
       return await api('/api/status');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 拉 /api/config（「等这个仓库」的开关依据，#88）。失败按 null 返回：同 fetchStatusBody，
+   * 各自吞掉——不能因为它或下面那个把任务详情拖成「加载失败」，也不能清掉已算好的
+   * 「还没领」句子。
+   */
+  async function fetchConfigBody() {
+    try {
+      return await api('/api/config');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 拉 /api/tasks?status=running（「等这个仓库」的占用依据，#88）。失败按 null 返回，
+   * 同上；响应体不是数组时由 waitingOnRepo 自己按不显示处理。
+   */
+  async function fetchRunningBody() {
+    try {
+      return await api('/api/tasks?status=running');
     } catch {
       return null;
     }
@@ -722,6 +791,14 @@ export function createPage(options = {}) {
     const whyQueued = whyNotClaimed(state.statusBody, task);
     if (whyQueued !== '') {
       addText('还没领', whyQueued);
+    }
+    // 等这个仓库（#88）：oneTaskPerRepo 开着且同仓库另有一条 running 时，点名这条排队
+    // 卡住的原因。判定在纯函数 waitingOnRepo；不满足整行不画（也不画 -），dt 用返回的
+    // 四个字占标签、dd 留空串——不占用「还没领」这个标签，两行可以同时在（有「还没领」
+    // 时紧挨其后，与「还没领」同一个位置：在「暂不开始」后、「最近错误」前）。
+    const waitingRepo = waitingOnRepo(state.configBody, task, state.runningBody);
+    if (waitingRepo !== '') {
+      addText(waitingRepo, '');
     }
     if (typeof task.lastError === 'string' && task.lastError !== '') {
       const dt = doc.createElement('dt');

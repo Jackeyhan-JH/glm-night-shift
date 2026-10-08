@@ -32,6 +32,7 @@ import {
   kindLabel,
   parseTaskId,
   runStatusLabel,
+  waitingOnRepo,
   whyNotClaimed,
 } from '../web/task.js';
 import { fmtTime } from '../web/common.js';
@@ -518,6 +519,102 @@ test('验收: whyNotClaimed：不改入参（深拷贝对照）', () => {
   whyNotClaimed(body, task);
   assert.deepEqual(body, bodyCopy);
   assert.deepEqual(task, taskCopy);
+});
+
+// ---------- waitingOnRepo（#88：排队任务在等同仓库的 running） ----------
+
+/** waitingOnRepo 的最小输入面：config 只读 oneTaskPerRepo，task 只读 id/status/repo。 */
+function repoConfig(overrides = {}) {
+  return { oneTaskPerRepo: true, ...overrides };
+}
+
+/** 排队中的当前任务（id 1、仓库 a/b）。 */
+const REPO_TASK = { id: 1, status: 'queued', repo: 'a/b' };
+
+/** running 列表里的一条（缺省：另一条任务、同仓库、在跑）。 */
+function runningTask(overrides = {}) {
+  return { id: 2, status: 'running', repo: 'a/b', ...overrides };
+}
+
+test('验收: waitingOnRepo：queued + oneTaskPerRepo true + 另一条 id 不同、status running、repo 全等 → \'等这个仓库\'', () => {
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask()]), '等这个仓库');
+  // 列表里混着别的仓库 / 别的状态：只要有一条命中就算
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [
+    { id: 3, status: 'running', repo: 'c/d' },
+    runningTask(),
+    { id: 4, status: 'queued', repo: 'a/b' },
+  ]), '等这个仓库');
+  // id 用 !== 全等：另一条 id 是字符串 '1'（与数字 1 不同）也算另一条
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask({ id: '1' })]), '等这个仓库');
+});
+
+test('验收: waitingOnRepo：不改入参（深拷贝对照）', () => {
+  const config = repoConfig();
+  const task = structuredClone(REPO_TASK);
+  const running = [runningTask(), { id: 3, status: 'queued', repo: 'c/d' }];
+  const configCopy = structuredClone(config);
+  const taskCopy = structuredClone(task);
+  const runningCopy = structuredClone(running);
+  waitingOnRepo(config, task, running);
+  assert.deepEqual(config, configCopy);
+  assert.deepEqual(task, taskCopy);
+  assert.deepEqual(running, runningCopy);
+});
+
+test('验收: waitingOnRepo：oneTaskPerRepo 为 false / 缺字段 / "true" / 1 / config null / undefined → \'\'', () => {
+  const running = [runningTask()];
+  assert.equal(waitingOnRepo(repoConfig({ oneTaskPerRepo: false }), REPO_TASK, running), '');
+  const missing = repoConfig();
+  delete missing.oneTaskPerRepo;
+  assert.equal(waitingOnRepo(missing, REPO_TASK, running), '', '缺字段');
+  assert.equal(waitingOnRepo(repoConfig({ oneTaskPerRepo: 'true' }), REPO_TASK, running), '', '字符串 "true" 不算');
+  assert.equal(waitingOnRepo(repoConfig({ oneTaskPerRepo: 1 }), REPO_TASK, running), '', '数字 1 不算');
+  assert.equal(waitingOnRepo(null, REPO_TASK, running), '', 'config null（请求失败）');
+  assert.equal(waitingOnRepo(undefined, REPO_TASK, running), '', 'config undefined');
+});
+
+test('验收: waitingOnRepo：running 列表不是数组（null / 对象 / 缺字段）、空数组 → \'\'', () => {
+  const config = repoConfig();
+  assert.equal(waitingOnRepo(config, REPO_TASK, null), '', '请求失败得 null');
+  assert.equal(waitingOnRepo(config, REPO_TASK, { tasks: [runningTask()] }), '', '响应体是对象');
+  assert.equal(waitingOnRepo(config, REPO_TASK, undefined), '', '缺字段');
+  assert.equal(waitingOnRepo(config, REPO_TASK, []), '', '空数组：没有另一条');
+});
+
+test('验收: waitingOnRepo：只有别的仓库、repo 只差大小写、repo 只差首尾空格、当前任务 repo 非字符串 → \'\'', () => {
+  const config = repoConfig();
+  assert.equal(waitingOnRepo(config, REPO_TASK, [runningTask({ repo: 'c/d' })]), '', '别的仓库');
+  assert.equal(waitingOnRepo(config, REPO_TASK, [runningTask({ repo: 'A/B' })]), '', '大小写不同不算同一个仓库');
+  assert.equal(waitingOnRepo(config, REPO_TASK, [runningTask({ repo: 'a/b ' })]), '', '末尾多空格不算');
+  assert.equal(waitingOnRepo(config, REPO_TASK, [runningTask({ repo: ' a/b' })]), '', '开头多空格不算');
+  assert.equal(waitingOnRepo(config, { id: 1, status: 'queued', repo: null }, [runningTask()]), '', '当前任务 repo 不是字符串');
+  assert.equal(waitingOnRepo(config, { id: 1, status: 'queued' }, [runningTask()]), '', '当前任务缺 repo 字段');
+});
+
+test('验收: waitingOnRepo：同仓库另一条 status 是 queued（不是 running）→ \'\'', () => {
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask({ status: 'queued' })]), '');
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask({ status: 'succeeded' })]), '');
+  const noStatus = runningTask();
+  delete noStatus.status;
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [noStatus]), '', '缺 status 字段');
+});
+
+test('验收: waitingOnRepo：列表里只有自己的 id → \'\'', () => {
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask({ id: 1 })]), '');
+  // 自己在跑、又排了一条：当前这条才是 running，另一条（自己视角的「另一条」）不存在
+  assert.equal(waitingOnRepo(repoConfig(), REPO_TASK, [runningTask({ id: 1 }), runningTask({ id: 3, repo: 'c/d' })]), '');
+});
+
+test('验收: waitingOnRepo：task.status 不是 queued（running / 终态 / 缺）→ \'\'', () => {
+  const config = repoConfig();
+  const running = [runningTask()];
+  for (const status of ['running', 'succeeded', 'failed', 'canceled']) {
+    assert.equal(waitingOnRepo(config, { ...REPO_TASK, status }, running), '', status);
+  }
+  const noStatus = { ...REPO_TASK };
+  delete noStatus.status;
+  assert.equal(waitingOnRepo(config, noStatus, running), '', '缺 status');
+  assert.equal(waitingOnRepo(config, null, running), '', 'task null 也不炸');
 });
 
 // ---------- 页面 ----------

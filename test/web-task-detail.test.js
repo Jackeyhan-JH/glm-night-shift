@@ -233,20 +233,30 @@ function statusPayload(overrides = {}) {
  * 路由版 makePage（#66 用）：GET /api/tasks/:id 与 GET /api/status 各回各的——现有
  * makePage 对所有 URL 返回同一份任务 JSON，分不出两份数据。task 传可变对象：改它再
  * tick 就是「下一轮刷新返回了新状态」。status 传对象或 () => 响应 / 抛错（测失败路径）。
+ * #88 增加可选的 config / running（GET /api/config、GET /api/tasks?status=running）：
+ * 写法与 status 相同；不传时这两个 URL 走默认分支回任务 JSON（oneTaskPerRepo 不是
+ * 严格 true、也不是数组 → 不显示），旧用例的行为一点不变。
  */
-function makeRoutedPage(t, { task, status, search = '?id=1', timers }) {
+function makeRoutedPage(t, { task, status, config, running, search = '?id=1', timers }) {
   const doc = makeStubDoc();
   const real = globalThis.fetch;
   const calls = [];
+  const respondWith = (body) => () => Promise.resolve({
+    ok: true,
+    status: 200,
+    text: () => Promise.resolve(JSON.stringify(body)),
+  });
   globalThis.fetch = (input) => {
     const url = String(input);
     calls.push(url);
     if (url === '/api/status') {
-      return typeof status === 'function' ? status() : Promise.resolve({
-        ok: true,
-        status: 200,
-        text: () => Promise.resolve(JSON.stringify(status)),
-      });
+      return typeof status === 'function' ? status() : respondWith(status)();
+    }
+    if (config !== undefined && url === '/api/config') {
+      return typeof config === 'function' ? config() : respondWith(config)();
+    }
+    if (running !== undefined && url === '/api/tasks?status=running') {
+      return typeof running === 'function' ? running() : respondWith(running)();
     }
     return Promise.resolve({
       ok: true,
@@ -535,6 +545,180 @@ test('验收: queued 复用 running 的同一个刷新定时器（intervalCount 
   timers.tickIntervals(); // 定时器已停：不会再触发任何请求
   await page.busy;
   assert.equal(calls.filter((c) => c === '/api/status').length, after, '停表后不再请求 /api/status');
+});
+
+// ---------- #88「等这个仓库」验收 ----------
+
+/** /api/config 响应体的最小形状（这行只读 oneTaskPerRepo）。 */
+function repoConfig(overrides = {}) {
+  return { oneTaskPerRepo: true, ...overrides };
+}
+
+/** running 列表里的另一条任务（缺省：id 2、同仓库 a/b、在跑）。 */
+function otherRunning(overrides = {}) {
+  return { id: 2, status: 'running', repo: 'a/b', ...overrides };
+}
+
+test('验收: 排队、oneTaskPerRepo true、同仓库另有一条 running：出现「等这个仓库」，dd 是空串且无子元素；状态徽章、仓库、提示词仍在；innerHTML 仍只有导航', async (t) => {
+  const { page, doc, calls } = makeRoutedPage(t, {
+    task: taskPayload({ notBefore: '2026-10-09T01:23:00.000Z', lastError: '上次失败' }),
+    status: statusPayload(),
+    config: repoConfig(),
+    running: [otherRunning()],
+  });
+  await page.busy;
+  const app = doc.getElementById('app');
+
+  // dt 精确是这四个字、dd 是空串（不画 -、不包别的字、没有子元素）
+  assert.equal(ddOf(page, '等这个仓库').textContent, '');
+  assert.equal(ddOf(page, '等这个仓库').children.length, 0);
+  assert.ok(app.textContent.includes('等这个仓库'), '四个字出现在页面上');
+  // 任务信息照常画：仓库、状态徽章（排队中）、提示词
+  assert.equal(ddOf(page, '仓库').textContent, 'a/b');
+  assert.equal(page.refs.headBadge.textContent, '排队中');
+  assert.ok(app.textContent.includes('做点事'), '提示词仍在');
+  // 位置：与「还没领」同一处——「暂不开始」后、「最近错误」前（这条没有「还没领」）
+  const order = labels(page);
+  assert.ok(order.indexOf('暂不开始') < order.indexOf('等这个仓库'), '在「暂不开始」之后');
+  assert.ok(order.indexOf('等这个仓库') < order.indexOf('最近错误'), '在「最近错误」之前');
+  // 两个新请求确实发出去了
+  assert.ok(calls.includes('/api/config'), '排队时拉了 /api/config');
+  assert.ok(calls.includes('/api/tasks?status=running'), '排队时拉了 running 列表');
+  // 全页只有导航（navHtml 静态串）用过 innerHTML
+  const htmlUsers = [...findAll(doc.getElementById('nav'), (n) => n._innerHTML !== ''),
+    ...findAll(app, (n) => n._innerHTML !== '')];
+  assert.equal(htmlUsers.length, 1);
+  assert.equal(htmlUsers[0], doc.getElementById('nav'));
+});
+
+test('验收: 同时 userPaused true：ddOf「还没领」仍是「已暂停领任务」，「等这个仓库」也在（两行同时在，新行紧随其后）', async (t) => {
+  const { page } = makeRoutedPage(t, {
+    task: taskPayload(),
+    status: statusPayload({
+      userPaused: true,
+      scheduler: { blocked: { reason: 'five-hour', retryAt: '2026-10-08T09:00:00.000Z' }, userPaused: false },
+    }),
+    config: repoConfig(),
+    running: [otherRunning()],
+  });
+  await page.busy;
+  assert.equal(ddOf(page, '还没领').textContent, '已暂停领任务', '「还没领」没被替换');
+  assert.equal(ddOf(page, '等这个仓库').textContent, '');
+  const order = labels(page);
+  assert.ok(order.includes('还没领') && order.includes('等这个仓库'));
+  assert.ok(order.indexOf('还没领') < order.indexOf('等这个仓库'), '新行紧挨在「还没领」后面');
+});
+
+test('验收: GET /api/config 失败、或 GET /api/tasks?status=running 失败：不出现「等这个仓库」；「还没领」原句还在；页面不是「加载任务失败」', async (t) => {
+  const notOk = () => Promise.resolve({
+    ok: false,
+    status: 503,
+    text: () => Promise.resolve(JSON.stringify({ error: 'unavailable' })),
+  });
+  const rejected = () => Promise.reject(new Error('network down'));
+  for (const failing of [notOk, rejected]) {
+    // /api/status 正常（scheduler null → 调度器没在跑）：这句不能被新请求的失败清掉
+    const configDown = makeRoutedPage(t, {
+      task: taskPayload(),
+      status: statusPayload({ scheduler: null }),
+      config: failing,
+      running: [otherRunning()],
+    });
+    await configDown.page.busy;
+    assert.ok(!labels(configDown.page).includes('等这个仓库'), 'config 失败：不显示');
+    assert.equal(ddOf(configDown.page, '还没领').textContent, '调度器没在跑', '「还没领」句子还在');
+    assert.ok(!configDown.doc.getElementById('app').textContent.includes('加载任务失败'));
+
+    const runningDown = makeRoutedPage(t, {
+      task: taskPayload(),
+      status: statusPayload({ scheduler: null }),
+      config: repoConfig(),
+      running: failing,
+    });
+    await runningDown.page.busy;
+    assert.ok(!labels(runningDown.page).includes('等这个仓库'), 'running 列表失败：不显示');
+    assert.equal(ddOf(runningDown.page, '还没领').textContent, '调度器没在跑', '「还没领」句子还在');
+    assert.ok(!runningDown.doc.getElementById('app').textContent.includes('加载任务失败'));
+  }
+});
+
+test('验收: oneTaskPerRepo 不是 true（false / 字段缺失）：不出现这四个字', async (t) => {
+  for (const config of [repoConfig({ oneTaskPerRepo: false }), {}]) {
+    const { page, doc } = makeRoutedPage(t, {
+      task: taskPayload(),
+      status: statusPayload(),
+      config,
+      running: [otherRunning()],
+    });
+    await page.busy;
+    assert.ok(!labels(page).includes('等这个仓库'),
+      `oneTaskPerRepo=${JSON.stringify(config.oneTaskPerRepo)} 不该显示`);
+    assert.ok(!doc.getElementById('app').textContent.includes('等这个仓库'));
+  }
+});
+
+test('验收: 同仓库没有 running（列表空 / 只有别的仓库 / 同仓库只有 queued）：不出现', async (t) => {
+  const lists = [
+    [],
+    [otherRunning({ repo: 'c/d' })],
+    [otherRunning({ status: 'queued' })],
+  ];
+  for (const running of lists) {
+    const { page } = makeRoutedPage(t, {
+      task: taskPayload(),
+      status: statusPayload(),
+      config: repoConfig(),
+      running,
+    });
+    await page.busy;
+    assert.ok(!labels(page).includes('等这个仓库'), `running=${JSON.stringify(running)} 不该显示`);
+  }
+});
+
+test('验收: 任务不是 queued（running）：不出现这四个字，fetch 记录里没有 /api/config 也没有 /api/tasks?status=running', async (t) => {
+  const { page, doc, calls } = makeRoutedPage(t, {
+    task: taskPayload({ status: 'running', startedAt: '2026-10-08T07:00:00.000Z' }),
+    status: statusPayload({ scheduler: null }),
+    config: repoConfig(),
+    running: [otherRunning()],
+  });
+  await page.busy;
+  assert.ok(!labels(page).includes('等这个仓库'));
+  assert.ok(!doc.getElementById('app').textContent.includes('等这个仓库'));
+  assert.ok(!calls.includes('/api/config'), `running 不打 /api/config，实际：${calls.join(', ')}`);
+  assert.ok(!calls.includes('/api/tasks?status=running'), `running 不打 running 列表，实际：${calls.join(', ')}`);
+  assert.ok(!calls.includes('/api/status'), 'running 不打 /api/status（原有行为不变）');
+});
+
+test('验收: 排队时 tick 再拉这两个请求；变成 running 后这行清掉、不再发', async (t) => {
+  const timers = fakeTimers();
+  const task = taskPayload(); // 可变对象：第二轮刷新改成 running
+  const { page, calls } = makeRoutedPage(t, {
+    task,
+    status: statusPayload(),
+    config: repoConfig(),
+    running: [otherRunning()],
+    timers,
+  });
+  await page.busy;
+  assert.ok(labels(page).includes('等这个仓库'), '排队时显示');
+  assert.equal(calls.filter((c) => c === '/api/config').length, 1, '首屏拉过一次 /api/config');
+  assert.equal(calls.filter((c) => c === '/api/tasks?status=running').length, 1, '首屏拉过一次 running 列表');
+
+  timers.tickIntervals();
+  await page.busy;
+  assert.equal(calls.filter((c) => c === '/api/config').length, 2, 'tick 后仍是 queued：再拉');
+  assert.equal(calls.filter((c) => c === '/api/tasks?status=running').length, 2, 'tick 后仍是 queued：再拉');
+  assert.ok(labels(page).includes('等这个仓库'));
+
+  task.status = 'running';
+  task.startedAt = '2026-10-08T07:30:00.000Z';
+  timers.tickIntervals();
+  await page.busy;
+  assert.equal(page.refs.headBadge.textContent, '执行中');
+  assert.ok(!labels(page).includes('等这个仓库'), '非 queued：上一轮为这行存的数据清掉了');
+  assert.equal(calls.filter((c) => c === '/api/config').length, 2, '非 queued 不再发 /api/config');
+  assert.equal(calls.filter((c) => c === '/api/tasks?status=running').length, 2, '非 queued 不再发 running 列表');
 });
 
 // ---------- #68「跟进」按钮：按 URL / 方法分支的 fetch 桩 ----------
