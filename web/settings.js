@@ -1,4 +1,4 @@
-// 设置页（#61）：打开先 GET /api/config 把当前值填进表单，保存时 PATCH 这七个键。
+// 设置页（#61）：打开先 GET /api/config 把当前值填进表单，保存时 PATCH 这十个键。
 // 后端写盘后只在页面上提醒「重启后才生效」——不重启进程、不请求任何重启接口、
 // 也不 import 调度器（配置只在进程启动时读一次，这是约定，不是热更新）。
 // 纯函数与常量在 /settings-lib.js（node:test 可直接 import）；本文件只做 DOM 与请求。
@@ -7,7 +7,7 @@ import { SAVE_OK_TEXT, buildPatch } from '/settings-lib.js';
 
 const $ = (selector) => document.querySelector(selector);
 
-/** 从表单控件收七个键的当前值（布尔取 checked，数字取输入文本，交给 buildPatch 转数字）。 */
+/** 从表单控件收十个键的当前值（布尔取 checked，数字取输入文本，交给 buildPatch 转数字）。 */
 function readForm() {
   return {
     allowPeak: $('#s-allow-peak').checked,
@@ -17,10 +17,13 @@ function readForm() {
     followPollMinutes: $('#s-follow-poll').value,
     prStatus: $('#s-pr-status').checked,
     prStatusPollMinutes: $('#s-pr-poll').value,
+    keepFailedWorktrees: $('#s-keep-failed').checked,
+    timeoutMinutes: $('#s-timeout').value,
+    autoDiagnose: $('#s-auto-diagnose').checked,
   };
 }
 
-/** GET /api/config 的七个键填进表单（数字键转回文本）。 */
+/** GET /api/config 的十个键填进表单（数字键转回文本）。 */
 function fillForm(config) {
   $('#s-allow-peak').checked = config.allowPeak === true;
   $('#s-concurrency').value = String(config.concurrency);
@@ -29,6 +32,9 @@ function fillForm(config) {
   $('#s-follow-poll').value = String(config.followPollMinutes);
   $('#s-pr-status').checked = config.prStatus === true;
   $('#s-pr-poll').value = String(config.prStatusPollMinutes);
+  $('#s-keep-failed').checked = config.keepFailedWorktrees === true;
+  $('#s-timeout').value = String(config.timeoutMinutes);
+  $('#s-auto-diagnose').checked = config.autoDiagnose === true;
 }
 
 function showError(err) {

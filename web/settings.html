@@ -18,7 +18,7 @@
 
     <form id="settings-form" class="card">
       <h2>常用开关</h2>
-      <p class="muted">只改下面这七个开关；写入数据目录的 config.json，正在运行的看板要重启后才按新值运行。端口、模型等其余配置改配置文件后重启。</p>
+      <p class="muted">只改下面这十个开关；写入数据目录的 config.json，正在运行的看板要重启后才按新值运行。端口、模型等其余配置改配置文件后重启。</p>
       <div class="form-grid">
         <label class="field field-check">
           <input type="checkbox" name="allowPeak" id="s-allow-peak">
@@ -47,6 +47,18 @@
         <label class="field">
           <span class="field-label">PR 状态查询间隔（prStatusPollMinutes，分钟）</span>
           <input type="number" min="0.5" step="0.5" name="prStatusPollMinutes" id="s-pr-poll">
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="keepFailedWorktrees" id="s-keep-failed">
+          <span>失败时保留工作目录（keepFailedWorktrees）</span>
+        </label>
+        <label class="field">
+          <span class="field-label">单次超时（分钟）（timeoutMinutes）</span>
+          <input type="number" min="1" step="1" name="timeoutMinutes" id="s-timeout">
+        </label>
+        <label class="field field-check">
+          <input type="checkbox" name="autoDiagnose" id="s-auto-diagnose">
+          <span>失败时先诊断（autoDiagnose）</span>
         </label>
       </div>
       <div class="form-actions">

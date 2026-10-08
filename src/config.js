@@ -105,8 +105,9 @@ export function loadConfig({ home, env } = {}) {
 }
 
 /**
- * 看板设置页可改的七个键（issue #61）。顺序即 GET /api/config 的字段顺序与未知键报错里
- * 的「允许」清单；启动时生效的其余配置（端口、路径、模型表等）不在这份清单里。
+ * 看板设置页可改的十个键（issue #61 的七个 + issue #90 追加的三个）。顺序即 GET
+ * /api/config 的字段顺序与未知键报错里的「允许」清单；启动时生效的其余配置（端口、
+ * 路径、模型表等）不在这份清单里。
  */
 export const SETTINGS_KEYS = Object.freeze([
   'allowPeak',
@@ -116,10 +117,13 @@ export const SETTINGS_KEYS = Object.freeze([
   'followPollMinutes',
   'prStatus',
   'prStatusPollMinutes',
+  'keepFailedWorktrees',
+  'timeoutMinutes',
+  'autoDiagnose',
 ]);
 
 /**
- * 从生效配置里只挑出七个设置键，按 SETTINGS_KEYS 的顺序组装（GET /api/config 与
+ * 从生效配置里只挑出十个设置键，按 SETTINGS_KEYS 的顺序组装（GET /api/config 与
  * PATCH 成功响应的形状）。port / 路径 / 令牌环境 / 模型表等绝不外漏。
  */
 export function pickSettings(config) {

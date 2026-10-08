@@ -1,4 +1,4 @@
-// issue #81 验收：`night-shift config set <键=值> …` 写看板设置页那七个设置键。
+// issue #81 + #90 验收：`night-shift config set <键=值> …` 写看板设置页那十个设置键。
 // 端到端子进程跑 bin（与 test/cli.test.js 的 spawnCli 同款）：fakeEnv 隔离环境，
 // NIGHT_SHIFT_HOME 指到临时目录，绝不碰真实 ~/.glm-night-shift，也不调真实 claude/gh。
 import test from 'node:test';
@@ -39,7 +39,7 @@ function seedConfig(home, obj = { port: 7999, timeoutMinutes: 15, concurrency: 1
   return bytes;
 }
 
-/** 成功写入后的整段 stdout：首行提示 + 七个键按 SETTINGS_KEYS 顺序。 */
+/** 成功写入后的整段 stdout：首行提示 + 十个键按 SETTINGS_KEYS 顺序。 */
 function expectedSetOutput(overrides = {}) {
   const effective = {
     allowPeak: false,
@@ -49,6 +49,9 @@ function expectedSetOutput(overrides = {}) {
     followPollMinutes: 30,
     prStatus: false,
     prStatusPollMinutes: 30,
+    keepFailedWorktrees: false,
+    timeoutMinutes: 60,
+    autoDiagnose: true,
     ...overrides,
   };
   return [
@@ -93,7 +96,8 @@ test('验收: config set 一次写多个键：原键与自定义键保留，不�
   const res = await spawnCli(t, ['config', 'set', 'concurrency=2', 'allowPeak=false'], { home });
   assert.equal(res.code, 0);
   assert.equal(res.stderr, '');
-  assert.equal(res.stdout, expectedSetOutput({ concurrency: 2, allowPeak: false }));
+  // 预置文件里 timeoutMinutes=15：成功输出的十个键来自写完后的 loadConfig，不是默认 60。
+  assert.equal(res.stdout, expectedSetOutput({ concurrency: 2, allowPeak: false, timeoutMinutes: 15 }));
 
   const onDisk = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
   assert.equal(onDisk.concurrency, 2);
@@ -104,6 +108,24 @@ test('验收: config set 一次写多个键：原键与自定义键保留，不�
   // 文件里只有原来的键 + 本次写入的键，不该凭空多出默认配置的键。
   assert.ok(!('claudeBin' in onDisk), '不应把整份 DEFAULT_CONFIG 写进 config.json');
   assert.deepEqual(Object.keys(onDisk), ['port', 'timeoutMinutes', 'concurrency', 'custom', 'allowPeak']);
+});
+
+test('验收: config set timeoutMinutes=30 keepFailedWorktrees=true：文件里是数字与布尔，stdout 十行含生效值', async (t) => {
+  const home = makeTempHome(t);
+  seedConfig(home);
+  const res = await spawnCli(t, ['config', 'set', 'timeoutMinutes=30', 'keepFailedWorktrees=true'], { home });
+  assert.equal(res.code, 0);
+  assert.equal(res.stderr, '');
+  // 首行重启提示 + 十个键：timeoutMinutes/keepFailedWorktrees 是新值，其余来自 loadConfig。
+  assert.equal(res.stdout, expectedSetOutput({ timeoutMinutes: 30, keepFailedWorktrees: true }));
+
+  const onDisk = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  assert.ok(typeof onDisk.timeoutMinutes === 'number', 'timeoutMinutes 写成 JSON 数字');
+  assert.equal(onDisk.timeoutMinutes, 30);
+  assert.equal(onDisk.keepFailedWorktrees, true);
+  assert.equal(onDisk.port, 7999, '原有 port 还在');
+  assert.equal(onDisk.custom, 'keep', '原有自定义键还在');
+  assert.deepEqual(Object.keys(onDisk), ['port', 'timeoutMinutes', 'concurrency', 'custom', 'keepFailedWorktrees']);
 });
 
 test('验收: 数据目录不存在时 config set 建目录、只写本次的键、不建数据库', async (t) => {
@@ -138,6 +160,15 @@ test('验收: 有一个键不合法就整单拒绝：非 0 退出、stdout 空�
     [['--json', 'concurrency=2'], 2, '不能与 --json 一起用'],
     [['concurrency=2', '--json'], 2, '不能与 --json 一起用'],
     [['concurrency'], 2, '键=值'],
+    // timeoutMinutes 与 concurrency 同一套（#90）：拒绝 0 / 1.0 / 1e1 / 01 / +1
+    [['timeoutMinutes=0'], 1, 'timeoutMinutes'],
+    [['timeoutMinutes=1.0'], 1, 'timeoutMinutes'],
+    [['timeoutMinutes=1e1'], 1, 'timeoutMinutes'],
+    [['timeoutMinutes=01'], 1, 'timeoutMinutes'],
+    [['timeoutMinutes=+1'], 1, 'timeoutMinutes'],
+    // 新布尔键只收单词 true / false（区分大小写）
+    [['keepFailedWorktrees=yes'], 1, 'keepFailedWorktrees'],
+    [['autoDiagnose=True'], 1, 'autoDiagnose'],
   ];
   for (const [setArgs, code, needle] of cases) {
     const args = ['config', 'set', ...setArgs];
