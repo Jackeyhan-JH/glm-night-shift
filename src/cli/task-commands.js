@@ -117,7 +117,7 @@ function parseIdPositional(ctx, positionals, usage) {
  * 名字是否真的存在于模板，由 renderTemplate 校验（运行时错误，退出码 1）。
  */
 function parseTemplateVars(ctx, items) {
-  const vars = {};
+  const vars = Object.create(null); // 变量名叫 __proto__ 也不走原型链
   for (const item of items ?? []) {
     const eq = item.indexOf('=');
     const name = eq === -1 ? '' : item.slice(0, eq).trim();

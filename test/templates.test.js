@@ -103,6 +103,14 @@ test('loadTemplate：找不到抛 NotFoundError，名字不合法（目录穿越
   }
 });
 
+test('非 ASCII 模板名（如中文）能列出也能加载，与列表所见一致', (t) => {
+  const { home } = writeUserTemplate(t, '我的模板', '---\nvars: topic\n---\n内容 {{topic}}');
+  const listed = listTemplates({ home }).find((x) => x.name === '我的模板');
+  assert.equal(listed.source, 'user');
+  const loaded = loadTemplate('我的模板', { home });
+  assert.equal(loaded.body, '内容 {{topic}}');
+});
+
 test('验收: front-matter 缺结束 ---：ValidationError 且信息带文件路径', (t) => {
   const { home, file } = writeUserTemplate(t, 'noclose', '---\ndescription: x\nvars: topic\n');
   assert.throws(

@@ -94,11 +94,11 @@ function flagValue(args, name) {
 // --repo 参数，兜底 FAKE_GH_REPO / fake-owner/fake-repo）。FAKE_GH_ISSUE_FAIL=1
 // 时 stderr 输出 GraphQL 解析错误并退出 1。
 function issueView(args) {
-  // 编号是 view 后第一个不以 - 开头的参数；--repo/-R 的值跳过，支持 flag 在前在后。
+  // 编号是 view 后第一个不以 - 开头的参数；--repo/-R/--json 的值跳过，支持 flag 在前在后。
   let number = '1';
   for (let i = 2; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--repo' || arg === '-R') {
+    if (arg === '--repo' || arg === '-R' || arg === '--json') {
       i += 1;
       continue;
     }

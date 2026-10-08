@@ -23,8 +23,11 @@ const RESERVED_VARS = ['issue_title', 'issue_body'];
 /** 变量名：字母或下划线开头，后接字母/数字/下划线。 */
 const VAR_NAME_PATTERN = /^[A-Za-z_]\w*$/;
 
-/** 模板名（即文件名去掉 .md）：不含路径分隔符等，杜绝 --template ../x 之类的穿越。 */
-const TEMPLATE_NAME_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+/** 模板名（即文件名去掉 .md）：非空、不以点开头、不含路径分隔符——杜绝
+ *  --template ../x 之类的目录穿越，同时不限制字符集（中文等名字与列表所见一致）。 */
+function isValidTemplateName(name) {
+  return typeof name === 'string' && name !== '' && !name.startsWith('.') && !/[\\/]/.test(name);
+}
 
 /** {{ 变量 }} 占位符：内侧允许任意空白；名字按 \w 匹配，其余花括号组合原样保留。 */
 const PLACEHOLDER_PATTERN = /\{\{\s*(\w+)\s*\}\}/g;
@@ -80,8 +83,8 @@ export function listTemplates({ home } = {}) {
  * @throws {NotFoundError} 模板不存在
  */
 export function loadTemplate(name, { home } = {}) {
-  if (typeof name !== 'string' || !TEMPLATE_NAME_PATTERN.test(name)) {
-    throw new ValidationError('template', `模板名只能由字母/数字/下划线/点/横线组成（当前值：${name}）`);
+  if (!isValidTemplateName(name)) {
+    throw new ValidationError('template', `模板名不合法（非空、不以点开头、不含路径分隔符；当前值：${name}）`);
   }
   const candidates = [];
   const userDir = userTemplatesDir(home);
@@ -119,23 +122,27 @@ export function loadTemplate(name, { home } = {}) {
  * @throws {Error} gh 执行失败（信息带 gh 的 stderr）或输出不是合法 JSON
  */
 export async function renderTemplate(template, providedVars = {}, { repo, config, env = process.env } = {}) {
+  const declaredVars = template.vars ?? [];
   const declared = new Map();
-  for (const v of template.vars ?? []) declared.set(v.name, v);
+  for (const v of declaredVars) declared.set(v.name, v);
 
   const unknown = Object.keys(providedVars).filter((key) => !declared.has(key));
   if (unknown.length > 0) {
     throw new ValidationError('vars', `传了模板未声明的变量（防止拼错）：${unknown.join('、')}`);
   }
-  const missing = template.vars
-    .filter((v) => v.required && !(v.name in providedVars))
+  const missing = declaredVars
+    .filter((v) => v.required && !Object.hasOwn(providedVars, v.name))
     .map((v) => v.name);
   if (missing.length > 0) {
     throw new ValidationError('vars', `缺少必填变量：${missing.join('、')}`);
   }
 
-  const values = {};
-  for (const v of template.vars) {
-    values[v.name] = v.name in providedVars ? String(providedVars[v.name]) : (v.default ?? '');
+  // null 原型：变量名叫 __proto__ 时也按普通键处理（不会被原型链吃掉）。
+  const values = Object.create(null);
+  for (const v of declaredVars) {
+    values[v.name] = Object.hasOwn(providedVars, v.name)
+      ? String(providedVars[v.name])
+      : (v.default ?? '');
   }
 
   if (template.fetchIssue !== undefined) {
