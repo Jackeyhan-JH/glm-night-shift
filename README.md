@@ -139,6 +139,7 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `cancel` | `<id>` | 取消排队/执行中的任务 |
 | `retry` | `<id>` | 把失败/已取消的任务重新排队 |
 | `follow` | `<id>` 或 `--all [--json]` | 按 PR 的 CHANGES_REQUESTED 评审在**原 night-shift 分支**上入队跟进任务：gitRef 指向父任务分支、提交推回原分支并复用已有 PR（不新开）。结论不是 CHANGES_REQUESTED 时输出「没有待处理的修改请求」退出 0；不会自动轮询 PR，要手动跑 |
+| `edit` | `<id>` ＋至少一个修改项：`--title`、`--prompt <文字>`/`--prompt-file <路径>`、`--difficulty easy\|medium\|hard`、`--priority <整数>`、`--test "<命令>"`/`--no-test`（清掉）、`--allow-peak`/`--no-allow-peak`、`--max-attempts <次数>`、`--depends-on <id,id,…>`/`--no-depends`（清空），可选 `--json` | 修改**排队中**的任务（出现才改，不给的保持原值；`repo`/`source` 等不能改）。不是排队中退出 1；依赖成环整体回滚。看板队列页排队中的行也有「修改」 |
 | `start` | 无 | 前台运行调度器（只调度，不起看板） |
 | `peak` | `[--json]` | 查看当前是否高峰、下次切换时刻与各模型倍率 |
 | `usage` | `[--json]` | 查看额度用量（5 小时 / 每周，本地估算） |

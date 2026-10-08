@@ -1,6 +1,7 @@
 // 队列与操作页（issue #15）：状态条（含 #38 的手动暂停/恢复按钮）、三个标签（排队中 /
 // 运行中 / 历史）、每行取消/重试、新增任务表单（模板下拉 + 按模板动态生成变量输入 +
-// 依赖多选）。DOM 与网络都在这里，纯函数（分组、提示文本、表单转请求体……）在 queue-lib.js。
+// 依赖多选）。#46：排队中的行多了「修改」，复用新增表单装进任务值、提交改走 PATCH。
+// DOM 与网络都在这里，纯函数（分组、提示文本、表单转请求体……）在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
 // 刷新只重绘状态条 / 标签 / 表格 / 依赖下拉的选项，不重建表单其余输入——正在填写的
@@ -8,12 +9,16 @@
 import { api, fmtTime, navHtml, statusLabel } from '/common.js';
 import {
   depHint,
+  editBody,
   escapeHtml,
   firstLine,
+  formModeView,
   formToBody,
   groupTasks,
   pauseToggleView,
   statusBarText,
+  taskRowActions,
+  taskToForm,
 } from '/queue-lib.js';
 
 /** 轮询间隔（issue 规格：5 秒）。 */
@@ -37,7 +42,11 @@ const els = {
   tabs: document.getElementById('tabs'),
   table: document.getElementById('task-table'),
   form: document.getElementById('add-form'),
+  heading: document.getElementById('form-heading'),
+  submitBtn: document.getElementById('form-submit'),
+  cancelEdit: document.getElementById('cancel-edit'),
   formError: document.getElementById('form-error'),
+  repo: document.getElementById('f-repo'),
   templateSelect: document.getElementById('f-template'),
   templateVarsField: document.getElementById('template-vars-field'),
   templateVars: document.getElementById('template-vars'),
@@ -58,6 +67,10 @@ els.statusbar.append(statusText, pauseToggle);
 
 /** 页面状态：最近一次拉到的任务 / 模板 / 状态与当前标签。 */
 const state = { tasks: [], templates: [], status: null, activeTab: 'queued' };
+
+/** 正在编辑的任务 id（#46）；null = 表单是「新增任务」模式。轮询刷新不重绘表单，
+ * 填到一半的编辑不会被冲掉（与新增一致）。 */
+let editingId = null;
 
 // ---------------------------------------------------------------- 数据与渲染
 
@@ -107,9 +120,7 @@ function renderTable() {
 
 /** 一行任务：ID、状态徽章、难度、优先级、仓库、标题（进详情页）、创建时间、操作。 */
 function rowHtml(task) {
-  const action = task.status === 'queued' || task.status === 'running'
-    ? `<button type="button" class="row-action" data-action="cancel" data-id="${task.id}">取消</button>`
-    : `<button type="button" class="row-action" data-action="retry" data-id="${task.id}">重试</button>`;
+  const action = taskRowActions(task); // 排队中：取消+修改；运行中：取消；历史：重试
   return `<tr>` +
     `<td>#${task.id}</td>` +
     `<td><span class="badge badge-${escapeHtml(task.status)}">${statusLabel(task.status)}</span></td>` +
@@ -152,11 +163,15 @@ function renderDependOptions() {
 
 // ---------------------------------------------------------------- 行内操作
 
-/** 表格里的取消/重试（事件委托；表格每 5 秒重绘，不能把监听挂在按钮上）。 */
+/** 表格里的取消/重试/修改（事件委托；表格每 5 秒重绘，不能把监听挂在按钮上）。 */
 async function onTableClick(event) {
   const button = event.target.closest('button[data-action]');
   if (button === null) return;
   const id = Number(button.dataset.id);
+  if (button.dataset.action === 'edit') {
+    enterEdit(id); // 修改不发请求：把任务值装进下面的表单，提交时才 PATCH
+    return;
+  }
   if (button.dataset.action === 'cancel'
       && !window.confirm(`确定取消任务 #${id}？运行中的任务会被中止。`)) {
     return;
@@ -172,6 +187,64 @@ async function onTableClick(event) {
   } finally {
     button.disabled = false; // refresh 已重绘时这句落在旧节点上，无害
   }
+}
+
+// ---------------------------------------------------------------- 编辑排队中的任务（#46）
+
+/**
+ * 点排队中行的「修改」：把该任务的值装进现有新增表单（不另做第二个表单），表单切到
+ * 编辑模式（标题/按钮文案由 renderFormMode 统一切换）。任务已不在排队中（轮询间隙
+ * 被领取/取消）时不进编辑，页面错误条提示。
+ */
+function enterEdit(id) {
+  const task = state.tasks.find((t) => t.id === id);
+  if (task === undefined || task.status !== 'queued') {
+    showPageError(`任务 #${id} 已不在排队中，不能修改`);
+    return;
+  }
+  editingId = id;
+  fillForm(taskToForm(task));
+  renderFormMode();
+  clearFormErrors();
+}
+
+/** 任务值 → 现有表单各输入（进入编辑模式）。先切回「不用模板」布局再填，否则
+ * onTemplateChange 会用模板默认值覆盖难度。 */
+function fillForm(form) {
+  els.templateSelect.value = form.template;
+  onTemplateChange();
+  els.repo.value = form.repo;
+  els.form.elements.title.value = form.title;
+  els.prompt.value = form.prompt;
+  els.difficulty.value = form.difficulty;
+  els.form.elements.priority.value = form.priority;
+  els.form.elements.testCommand.value = form.testCommand;
+  els.allowPeak.checked = form.allowPeak;
+  els.form.elements.maxAttempts.value = form.maxAttempts;
+  // 依赖下拉先按最新列表重建选项，再选中该任务当前的依赖（已经 succeeded 的依赖
+  // 不在选项里选不中，正好编辑提交也不发 dependsOn，见 queue-lib 的 editBody）。
+  renderDependOptions();
+  const selected = new Set(form.dependsOn);
+  for (const option of els.depends.options) option.selected = selected.has(option.value);
+}
+
+/** 按编辑/新增模式切换表单文案：标题、提交按钮、「取消编辑」的显隐。编辑时仓库与
+ * 模板锁住（都是创建后不能改的字段，只读展示，editBody 也不会把它们发出去）。 */
+function renderFormMode() {
+  const view = formModeView(editingId === null ? null : { id: editingId });
+  els.heading.textContent = view.heading;
+  els.submitBtn.textContent = view.submitLabel;
+  els.cancelEdit.hidden = !view.cancelEditVisible;
+  els.repo.readOnly = view.editing;
+  els.templateSelect.disabled = view.editing;
+}
+
+/** 回到新增模式：清表单、恢复文案与可编辑性（保存成功或点「取消编辑」都会走到）。 */
+function exitEdit() {
+  editingId = null;
+  resetForm();
+  renderFormMode();
+  clearFormErrors();
 }
 
 function showPageError(message) {
@@ -271,8 +344,13 @@ async function onSubmit(event) {
     return;
   }
   try {
-    await api('/api/tasks', { method: 'POST', body: formToBody(collectForm()) });
-    resetForm();
+    if (editingId === null) {
+      await api('/api/tasks', { method: 'POST', body: formToBody(collectForm()) });
+    } else {
+      // 编辑：PATCH 到该任务；editBody 不带 repo 等禁改字段（见 queue-lib.js）。
+      await api(`/api/tasks/${editingId}`, { method: 'PATCH', body: editBody(collectForm()) });
+    }
+    exitEdit(); // 保存成功：表单回到「新增任务」（下次提交又是 POST）
     hideFormError();
     hidePageError();
     await refresh();
@@ -324,6 +402,7 @@ function hideFormError() {
 els.nav.innerHTML = navHtml('/');
 els.templateSelect.addEventListener('change', onTemplateChange);
 els.form.addEventListener('submit', onSubmit);
+els.cancelEdit.addEventListener('click', exitEdit); // 放弃编辑：表单回到新增模式，不发请求
 els.tabs.addEventListener('click', (event) => {
   const button = event.target.closest('button[data-tab]');
   if (button === null) return;

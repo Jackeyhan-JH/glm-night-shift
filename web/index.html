@@ -24,9 +24,10 @@
     <div id="task-table"></div>
 
     <!-- 新增任务表单：模板下拉与变量输入、依赖多选由 queue.js 动态填充；
-         轮询刷新只重绘上面的区域，不重建表单，正在填写的内容不受影响。 -->
+         轮询刷新只重绘上面的区域，不重建表单，正在填写的内容不受影响。
+         编辑排队中的任务（#46）也复用这张表单：queue.js 切标题/按钮文案并提交 PATCH。 -->
     <form id="add-form" class="card">
-      <h2>新增任务</h2>
+      <h2 id="form-heading">新增任务</h2>
       <div class="form-grid">
         <label class="field">
           <span class="field-label">仓库 <b class="req">*</b></span>
@@ -91,7 +92,8 @@
         </label>
       </div>
       <div class="form-actions">
-        <button type="submit" class="primary">新增任务</button>
+        <button type="submit" class="primary" id="form-submit">新增任务</button>
+        <button type="button" id="cancel-edit" hidden>取消编辑</button>
         <div id="form-error" class="error" hidden></div>
       </div>
     </form>
