@@ -226,7 +226,7 @@ test('add --depends-on "" 等于无依赖；--depends-on 1,1 重复 id 去重', 
 
 // ---------------------------------------------------------------- retry 与依赖（CLI 层）
 
-test('retry 经 CLI：依赖仍失败时退出 1 并提示先重试上游；上游重试后成功', async (t) => {
+test('retry 经 CLI：依赖仍失败时退出 1 并提示先重试上游；重试上游连带拉回下游', async (t) => {
   const home = makeTempHome(t);
   // 本进程造数据（bin 已在别处 import；这里动态 import db.js，装好警告过滤的顺序不受影响）
   const { openDb } = await import('../src/db.js');
@@ -246,9 +246,9 @@ test('retry 经 CLI：依赖仍失败时退出 1 并提示先重试上游；上�
 
   const upstream = await spawnCli(t, ['retry', '1'], { cwd: home });
   assert.equal(upstream.code, 0, upstream.stderr);
+  assert.equal(upstream.stdout, '#1 已重新排队（queued），连带 #2\n');
   const downstream = await spawnCli(t, ['retry', '2'], { cwd: home });
-  assert.equal(downstream.code, 0, downstream.stderr);
-  assert.equal(downstream.stdout, '#2 已重新排队（queued）\n');
+  assert.equal(downstream.code, 1, '已被连带重新排队（queued），再 retry 是非法流转');
 });
 
 // ---------------------------------------------------------------- help
