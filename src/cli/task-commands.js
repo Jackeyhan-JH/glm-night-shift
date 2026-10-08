@@ -1,6 +1,6 @@
 // add / list / show / cancel / retry 五个子命令（issue #5）；add 的 --template 渲染
-// （issue #13）也在本文件。命令对象形状见 bin/night-shift.mjs 的 COMMANDS 表：
-// { summary, usage, run(args, ctx) }。
+// （issue #13）也在本文件；import 按 GitHub issue 批量入队（issue #39）。
+// 命令对象形状见 bin/night-shift.mjs 的 COMMANDS 表：{ summary, usage, run(args, ctx) }。
 //
 // ⚠️ 本文件（及其静态依赖）绝不能 import src/db.js：db.js 是唯一加载 node:sqlite
 // 的模块，静态引入会让入口来不及先装 SQLite 警告过滤（时机说明见 src/warnings.js，
@@ -8,6 +8,7 @@
 // tasks.js / config.js / render.js / templates.js 不碰 node:sqlite，静态引入没问题。
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { loadConfig, resolveHome } from '../config.js';
 import {
@@ -16,6 +17,7 @@ import {
   NotFoundError,
   cancelTask,
   createTask,
+  findTaskBySource,
   getTask,
   listDependencies,
   listRuns,
@@ -253,6 +255,177 @@ export const addCommand = {
       dependsOn,
     }));
     writeOut(ctx, values.json, task, `已加入队列：#${task.id} ${task.title}`);
+    return 0;
+  },
+};
+
+/** import 用的 --repo 格式（与 store 层同一约定；CLI 层先拦下用法错误，退出码 2）。 */
+const IMPORT_REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+/** --state 允许的值（透传给 gh issue list）。 */
+const IMPORT_STATES = ['open', 'closed', 'all'];
+/** import 生成的标题按 Unicode 码点截断到 80（不加省略号）。 */
+const IMPORT_TITLE_CODE_POINTS = 80;
+
+/** spawn 并收集 stdout/stderr/退出码（参数走数组不经 shell）；启动失败 reject。 */
+function spawnCapture(bin, args, env) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(bin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      reject(new Error(`无法启动 ${bin}：${err.message}`));
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (err) => {
+      reject(new Error(`无法执行 ${bin}：${err.message}`));
+    });
+    child.on('close', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+  });
+}
+
+/**
+ * 解析并校验 gh issue list 的输出：必须是 JSON 数组，且每项 number 是正整数、
+ * title 是字符串（body 缺省 / null 当空串，调用方处理）。不合法抛中文错误
+ * （运行时错误，退出码 1），一个任务都不会写。
+ */
+function parseIssueList(stdout) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (err) {
+    throw new Error(`gh issue list 的输出不是合法 JSON：${err.message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`gh issue list 的输出不是 JSON 数组：${stdout.slice(0, 400) || '（空）'}`);
+  }
+  for (const [index, issue] of parsed.entries()) {
+    if (!Number.isSafeInteger(issue?.number) || issue.number < 1) {
+      throw new Error(`gh issue list 第 ${index + 1} 项的 number 不是正整数：${JSON.stringify(issue)}`);
+    }
+    if (typeof issue?.title !== 'string') {
+      throw new Error(`gh issue list 第 ${index + 1} 项的 title 不是字符串：${JSON.stringify(issue)}`);
+    }
+  }
+  return parsed;
+}
+
+export const importCommand = {
+  summary: '按 GitHub issue 批量入队',
+  usage: [
+    '用法：night-shift import --repo <owner/name> [--label <名字>]',
+    `${USAGE_CONT}[--state open|closed|all] [--limit <条数>]`,
+    `${USAGE_CONT}[--difficulty easy|medium|hard] [--dry-run] [--json]`,
+  ].join('\n'),
+  async run(args, ctx) {
+    const { values } = parseArgs({
+      args: normalizeNumericOptions(args),
+      options: {
+        repo: { type: 'string' },
+        label: { type: 'string' },
+        state: { type: 'string' },
+        limit: { type: 'string' },
+        difficulty: { type: 'string' },
+        'dry-run': { type: 'boolean' },
+        json: { type: 'boolean' },
+      },
+    });
+    if (values.repo === undefined) {
+      throw new ctx.UsageError('缺少必填参数：--repo <owner/name>', { usage: importCommand.usage });
+    }
+    const repo = values.repo.trim();
+    if (!IMPORT_REPO_PATTERN.test(repo)) {
+      throw new ctx.UsageError(
+        `--repo 必须形如 owner/name（当前值：${values.repo}）`,
+        { usage: importCommand.usage },
+      );
+    }
+    const state = values.state ?? 'open';
+    if (!IMPORT_STATES.includes(state)) {
+      throw new ctx.UsageError(
+        `--state 必须是 ${IMPORT_STATES.join(' | ')} 之一（当前值：${values.state}）`,
+        { usage: importCommand.usage },
+      );
+    }
+    const limit = values.limit === undefined
+      ? 50
+      : parseIntStrict(ctx, values.limit, '--limit', importCommand.usage, { min: 1 });
+    const difficulty = values.difficulty ?? 'medium';
+    if (!DIFFICULTIES.includes(difficulty)) {
+      throw new ctx.UsageError(
+        `--difficulty 必须是 ${DIFFICULTIES.join(' | ')} 之一（当前值：${values.difficulty}）`,
+        { usage: importCommand.usage },
+      );
+    }
+    const dryRun = values['dry-run'] === true;
+
+    // gh 参数走数组不经 shell；--label 缺省时不传。二进制与环境取生效配置。
+    const ghArgs = ['issue', 'list', '--repo', repo, '--state', state];
+    if (values.label !== undefined) ghArgs.push('--label', values.label);
+    ghArgs.push('--json', 'number,title,body', '--limit', String(limit));
+    const config = effectiveConfig(ctx);
+    const res = await spawnCapture(config.ghBin, ghArgs, ctx.env);
+    if (res.code !== 0) {
+      throw new Error(`gh issue list 失败（退出码 ${res.code}）：${res.stderr.trim()}`);
+    }
+    const issues = parseIssueList(res.stdout);
+
+    const tailLine = `在仓库 ${repo} 完成这个 issue。不要 push，不要切分支。`;
+    const added = [];
+    const skipped = [];
+    const lines = [];
+    const previewed = new Set(); // dry-run 里本批将新增的 source（还没落库，重复时单独提示）
+    await withDb(ctx, (db) => {
+      for (const issue of issues) {
+        const source = `github:${repo}#${issue.number}`;
+        const title = [...`修复 #${issue.number}：${issue.title}`]
+          .slice(0, IMPORT_TITLE_CODE_POINTS).join('');
+        const body = typeof issue.body === 'string' ? issue.body.trim() : '';
+        const prompt = body === '' ? tailLine : `${body}\n${tailLine}`;
+        // 已有同 source 的任务（任意状态）就跳过，不重复入队。
+        const existing = findTaskBySource(db, source);
+        if (existing !== null) {
+          skipped.push({ issue: issue.number, taskId: existing.id, status: existing.status });
+          lines.push(`跳过 #${issue.number}：已有任务 #${existing.id}（${existing.status}）`);
+          continue;
+        }
+        if (dryRun) {
+          if (previewed.has(source)) {
+            skipped.push({ issue: issue.number, taskId: null, status: null });
+            lines.push(`将跳过 #${issue.number}：本批重复`);
+            continue;
+          }
+          previewed.add(source);
+          added.push({ issue: issue.number, title, source, prompt, repo, difficulty });
+          lines.push(`将新增 ${title}`);
+          continue;
+        }
+        // 正式运行里本批重复走上面的 findTaskBySource（刚插入的行就能查到）。
+        const task = createTask(db, {
+          repo,
+          title,
+          prompt,
+          source,
+          difficulty,
+          priority: 0,
+          allowPeak: false,
+          maxAttempts: config.maxAttempts, // 与 add 的缺省一致
+        });
+        added.push(task);
+        lines.push(`新增 #${task.id} ${task.title}`);
+      }
+    });
+    if (values.json) {
+      ctx.stdout.write(`${JSON.stringify({ added, skipped }, null, 2)}\n`);
+      return 0;
+    }
+    lines.push(`新增 ${added.length} 个，跳过 ${skipped.length} 个`);
+    ctx.stdout.write(`${lines.join('\n')}\n`);
     return 0;
   },
 };

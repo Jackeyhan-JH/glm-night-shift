@@ -209,3 +209,68 @@ test('FAKE_GH_ISSUE_FAIL=1：stderr 含 Could not resolve，退出 1', async (t)
   assert.equal(res.stdout, '');
   assert.ok(res.stderr.includes('Could not resolve to an issue or pull request with the number of 42.'), res.stderr);
 });
+
+// —— issue list（issue #39 的 import 用） ——
+
+test('验收: 不设 list 变量时 issue list 输出 []，退出 0', async (t) => {
+  const res = runFakeGh(t, ['issue', 'list', '--repo', 'a/b', '--state', 'open', '--json', 'number,title,body', '--limit', '50'], {});
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '[]\n');
+  assert.equal(res.stderr, '');
+});
+
+test('验收: FAKE_GH_ISSUE_LIST_JSON 原样输出（没有末尾换行也不补）', async (t) => {
+  const payload = '[{"number":12,"title":"登录失败","body":"x"}]'; // 故意不带换行
+  const res = runFakeGh(t, ['issue', 'list', '--repo', 'a/b', '--state', 'open', '--json', 'number,title,body', '--limit', '50'], {
+    env: { FAKE_GH_ISSUE_LIST_JSON: payload },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, payload);
+  assert.equal(res.stderr, '');
+});
+
+test('验收: FAKE_GH_ISSUE_LIST_FILE 文件内容原样输出；优先级低于 FAIL', async (t) => {
+  const dir = makeTempHome(t);
+  const file = path.join(dir, 'issues.json');
+  fs.writeFileSync(file, '[]'); // 故意不带换行
+  const res = runFakeGh(t, ['issue', 'list', '--repo', 'a/b', '--json', 'number,title,body'], {
+    env: { FAKE_GH_ISSUE_LIST_FILE: file },
+    cwd: dir,
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '[]');
+
+  const failed = runFakeGh(t, ['issue', 'list', '--repo', 'a/b'], {
+    env: { FAKE_GH_ISSUE_LIST_FILE: file, FAKE_GH_ISSUE_LIST_FAIL: '1' },
+    cwd: dir,
+  });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.stdout, '');
+  assert.ok(failed.stderr.trim() !== '');
+});
+
+test('验收: FAKE_GH_ISSUE_LIST_FAIL=1 报错退出 1：stderr 恰好一行，stdout 为空', async (t) => {
+  const res = runFakeGh(t, ['issue', 'list', '--repo', 'a/b', '--state', 'open', '--json', 'number,title,body', '--limit', '50'], {
+    env: { FAKE_GH_ISSUE_LIST_FAIL: '1' },
+  });
+  assert.equal(res.code, 1);
+  assert.equal(res.stdout, '');
+  assert.ok(res.stderr.endsWith('\n'), 'stderr 应以换行结尾');
+  assert.equal(res.stderr.trim().split('\n').length, 1, 'stderr 恰好一行');
+});
+
+test('list 变量不影响 issue view：设 FAKE_GH_ISSUE_LIST_JSON 时 view 仍是默认输出', async (t) => {
+  const res = runFakeGh(t, ['issue', 'view', '1', '--json', 'title,body'], {
+    env: { FAKE_GH_ISSUE_LIST_JSON: '[{"number":1,"title":"x","body":"y"}]' },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '{"title":"Fake issue #1","body":"Fake body of fake-owner/fake-repo#1"}\n');
+});
+
+test('view 变量不影响 issue list：设 FAKE_GH_ISSUE_JSON 时 list 仍是 []', async (t) => {
+  const res = runFakeGh(t, ['issue', 'list', '--repo', 'a/b', '--state', 'open', '--json', 'number,title,body', '--limit', '50'], {
+    env: { FAKE_GH_ISSUE_JSON: '{"title":"自定义","body":"正文"}' },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(res.stdout, '[]\n');
+});

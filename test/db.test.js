@@ -161,3 +161,27 @@ test('4 个 worker 同时首次打开同一文件库：迁移只跑一次，人�
   assert.equal(userVersion(db), SCHEMA_VERSION);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 4);
 });
+
+test('版本 5 的迁移（MIGRATIONS 最后一步）：tasks.source 可空列 + 非唯一索引 idx_tasks_source', () => {
+  const db = openDb(':memory:');
+  try {
+    const columns = db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name);
+    assert.ok(columns.includes('source'), '应有 source 列');
+    const sourceColumn = db.prepare('PRAGMA table_info(tasks)').all().find((row) => row.name === 'source');
+    assert.equal(sourceColumn.notnull, 0, 'source 列可空');
+    // 非唯一索引：同 source 的多行都能进库（import 重复是跳过，不是报错）
+    const now = '2026-01-01T00:00:00.000Z';
+    const insert = db.prepare(`
+      INSERT INTO tasks (repo, title, prompt, max_attempts, source, created_at, updated_at)
+      VALUES ('a/b', 't', 'p', 2, ?, ?, ?)
+    `);
+    insert.run('github:a/b#12', now, now);
+    insert.run('github:a/b#12', now, now);
+    const indexes = db.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND name = 'idx_tasks_source'")
+      .all();
+    assert.equal(indexes.length, 1, '应有索引 idx_tasks_source');
+    assert.ok(!/unique/i.test(indexes[0].sql), 'idx_tasks_source 不是 UNIQUE');
+  } finally {
+    db.close();
+  }
+});
