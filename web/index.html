@@ -47,6 +47,15 @@
             <option value="hard">hard</option>
           </select>
         </label>
+        <!-- #76：导入哪一状态的 issue。缺省第一项「未关闭」（open），与命令行缺省一致。 -->
+        <label class="field">
+          <span class="field-label">状态</span>
+          <select name="state" id="i-state">
+            <option value="open" selected>未关闭</option>
+            <option value="closed">已关闭</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
       </div>
       <div class="form-actions">
         <button type="submit" class="primary" id="i-preview">预览</button>

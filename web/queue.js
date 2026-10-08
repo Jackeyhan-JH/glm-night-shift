@@ -5,8 +5,10 @@
 // 上方的仓库筛选（浏览器内过滤，不发 repo 参数）。#62：成功任务的状态徽章旁边补一个
 // PR 结果标签（已合并 / 已关闭，用 DOM textContent 画，不进 innerHTML）。#74：状态条
 // 在暂停段前再补一句「为什么还没领」（5 小时额度 / 每周额度 / 限流退避），排队行的
-// 徽章旁补「等这个仓库」（oneTaskPerRepo 开着且同仓库有 running）。DOM 与网络
-// 都在这里，纯函数（分组、提示文本、表单转请求体、筛选、预览文案……）在 queue-lib.js。
+// 徽章旁补「等这个仓库」（oneTaskPerRepo 开着且同仓库有 running）。#76：导入面板
+// 多一个「状态」下拉（未关闭 / 已关闭 / 全部），随 repo/label/difficulty 一起进请求体。
+// DOM 与网络都在这里，纯函数（分组、提示文本、表单转请求体、筛选、预览文案……）
+// 在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
 // 刷新只重绘状态条 / 标签 / 仓库筛选 / 表格 / 依赖下拉的选项，不重建表单其余输入、
@@ -80,6 +82,7 @@ const els = {
   importRepo: document.getElementById('i-repo'),
   importLabel: document.getElementById('i-label'),
   importDifficulty: document.getElementById('i-difficulty'),
+  importState: document.getElementById('i-state'),
   importPreview: document.getElementById('i-preview'),
   importConfirm: document.getElementById('i-confirm'),
   importCancel: document.getElementById('i-cancel'),
@@ -522,12 +525,14 @@ function hideFormError() {
 
 // ---------------------------------------------------------------- 从 GitHub 导入（#50）
 
-/** 导入面板的原始输入（值多为字符串；转请求体交给 queue-lib 的 importBody）。 */
+/** 导入面板的原始输入（值多为字符串；转请求体交给 queue-lib 的 importBody）。
+ * #76：多收一个「状态」下拉的值——select 永远有值（缺省 open），预览与确认共用。 */
 function importFormValues() {
   return {
     repo: els.importRepo.value,
     label: els.importLabel.value,
     difficulty: els.importDifficulty.value,
+    state: els.importState.value,
   };
 }
 
