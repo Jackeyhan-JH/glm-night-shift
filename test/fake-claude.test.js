@@ -244,6 +244,16 @@ test('FAKE_CLAUDE_SEQUENCE 优先于 FAKE_CLAUDE_SCENARIO；缺 STATE_FILE 或�
   assert.ok(bogus.stderr.includes('wat'));
 });
 
+test('FAKE_CLAUDE_RESULT_TEXT：success 场景 result 文本用它（缺省仍是 done）', async (t) => {
+  const res = await runFakeClaude(
+    t,
+    ['-p', 'hi'],
+    { env: { FAKE_CLAUDE_RESULT_TEXT: '原因：缺少依赖\n建议：先安装依赖' } },
+  );
+  assert.equal(res.code, 0);
+  assert.equal(stdoutLines(res)[2].result, '原因：缺少依赖\n建议：先安装依赖');
+});
+
 test('noop：输出与 success 相同但不写任何文件', async (t) => {
   const dir = makeTempHome(t);
   const res = await runFakeClaude(t, ['-p', 'quiet'], { env: { FAKE_CLAUDE_SCENARIO: 'noop' }, cwd: dir });
