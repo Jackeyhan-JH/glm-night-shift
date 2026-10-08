@@ -6,7 +6,7 @@ import { usage } from '../src/quota.js';
 // 空记录的 usage：两项都是 0，任何正常的 nextCost 都放行
 const okUsage = () => usage([], '2026-10-08T12:00:00Z');
 
-test('高峰 + 任务与配置都不允许 → reason peak，retryAt 为本次高峰结束时刻', () => {
+test('验收: startDecision 周四北京 15:00、allowPeak 与 configAllowPeak 均为 false → reason:"peak"、retryAt=2026-10-08T10:00Z', () => {
   const d = startDecision({
     now: '2026-10-08T07:00:00Z', // 周四北京 15:00
     model: 'glm-5.3',
@@ -23,7 +23,7 @@ test('高峰 + 任务与配置都不允许 → reason peak，retryAt 为本次�
   });
 });
 
-test('任务 allowPeak: true → 不因高峰拦截，nextCost 仍按高峰倍率', () => {
+test('验收: startDecision 任务 allowPeak:true → 不因高峰拦截，nextCost=3', () => {
   const d = startDecision({
     now: '2026-10-08T07:00:00Z',
     model: 'glm-5.3',

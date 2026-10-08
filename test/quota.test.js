@@ -7,6 +7,7 @@ import {
   runCost,
   usage,
   canStart,
+  toDate,
 } from '../src/quota.js';
 
 const NOW = '2026-10-08T12:00:00Z'; // 周四北京 20:00，非高峰
@@ -46,7 +47,7 @@ test('MODEL_MULTIPLIERS / PLAN_LIMITS 与规格一致且深层冻结', () => {
 
 // ---------- multiplierFor ----------
 
-test('multiplierFor 验收用例（时间均为 UTC）', () => {
+test('验收: multiplierFor 五个取值（周四 15:00→3、周四 20:00→1、Flash 高峰 1.2、周六 0.4、未知 3）', () => {
   assert.equal(multiplierFor('glm-5.3', '2026-10-08T07:00:00Z'), 3); // 周四北京 15:00
   assert.equal(multiplierFor('glm-5.3', '2026-10-08T12:00:00Z'), 1); // 北京 20:00
   assert.equal(multiplierFor('GLM-5.3-Flash', '2026-10-08T07:00:00Z'), 1.2);
@@ -58,6 +59,13 @@ test('multiplierFor 模型名去空白、不区分大小写；缺失模型也按
   assert.equal(multiplierFor('  glm-5.3  ', '2026-10-08T07:00:00Z'), 3);
   assert.equal(multiplierFor(' GLM-5.3-FLASH ', '2026-10-08T07:00:00Z'), 1.2);
   assert.equal(multiplierFor(undefined, '2026-10-08T12:00:00Z'), 1);
+});
+
+test('模型名 null / undefined / 非字符串都按 glm-5.3 计（multiplierFor 与 runCost）', () => {
+  assert.equal(multiplierFor(null, '2026-10-08T07:00:00Z'), 3); // 高峰
+  assert.equal(multiplierFor(null, '2026-10-08T12:00:00Z'), 1); // 非高峰
+  assert.equal(runCost({ model: null, startedAt: '2026-10-08T12:00:00Z' }), 1);
+  assert.equal(runCost({ model: 42, startedAt: '2026-10-08T07:00:00Z' }), 3);
 });
 
 test('multiplierFor 的 at 接受 Date / ISO 字符串 / epoch 毫秒，结果一致', () => {
@@ -97,7 +105,7 @@ test('runCost：startedAt 缺失或非法时抛 TypeError', () => {
 
 // ---------- usage：验收用例 ----------
 
-test('usage 验收用例：5 小时窗口与滚动周窗口', () => {
+test('验收: usage 示例（now=2026-10-08T12:00Z：fiveHour.used=5.2、limit=1600、resetsAt=2026-10-08T12:30Z；weekly.used=8.2）', () => {
   const u = usage(RUNS, NOW);
   assert.equal(u.fiveHour.used, 5.2); // 3 + 1.2 + 1，06:30 那条在窗口外
   assert.equal(u.fiveHour.limit, 1600);
@@ -110,24 +118,38 @@ test('usage 验收用例：5 小时窗口与滚动周窗口', () => {
   assert.equal(u.weekly.resetsAt, null); // 滚动窗口没有 resetsAt
 });
 
-test('quotaUnits 直接采用，不重新计算（可为 0；null 视为未提供）', () => {
+test('验收: 带 quotaUnits: 10 的运行按 10 计，不重新计算', () => {
+  const u = usage(
+    [{ model: 'glm-5.3', startedAt: '2026-10-08T07:30:00Z', quotaUnits: 10 }],
+    NOW,
+  );
+  assert.equal(u.fiveHour.used, 10); // 若重算应为 3（高峰倍率）
+  assert.equal(u.weekly.used, 10);
+});
+
+test('quotaUnits 为 0 计 0；null 视为未提供；与 prompts 同时给时以 quotaUnits 为准', () => {
   const u = usage(
     [
-      { model: 'glm-5.3', startedAt: '2026-10-08T07:30:00Z', quotaUnits: 10 }, // 否则应记 3
-      { model: 'glm-5.3', startedAt: '2026-10-08T08:00:00Z', quotaUnits: 0 },
+      { model: 'glm-5.3', startedAt: '2026-10-08T07:30:00Z', quotaUnits: 0 },
       { model: 'glm-5.3-flash', startedAt: '2026-10-08T11:00:00Z', quotaUnits: null }, // 回落到 runCost → 0.4
     ],
     NOW,
   );
-  assert.equal(u.fiveHour.used, 10.4);
+  assert.equal(u.fiveHour.used, 0.4);
   const u2 = usage(
     [{ model: 'glm-5.3', startedAt: '2026-10-08T08:00:00Z', prompts: 100, quotaUnits: 10 }],
     NOW,
   );
-  assert.equal(u2.fiveHour.used, 10); // quotaUnits 与 prompts 同时给时以 quotaUnits 为准
+  assert.equal(u2.fiveHour.used, 10);
 });
 
-test('weekStart 周期窗口：cycleStart 含边界，resetsAt 为周期结束', () => {
+test('验收: weekStart=2026-10-01T00:00Z、now=2026-10-08T12:00Z → 只统计 10-08 00:00 之后的运行，weekly.resetsAt=2026-10-15T00:00Z', () => {
+  const u = usage(RUNS, NOW, { weekStart: '2026-10-01T00:00:00Z' });
+  assert.equal(u.weekly.used, 8.2); // 四条都在 10-08 00:00 之后，全部计入
+  assert.equal(u.weekly.resetsAt.toISOString(), '2026-10-15T00:00:00.000Z');
+});
+
+test('周期窗口边界：run 恰在 cycleStart 计入，早 1 毫秒属于上一周期', () => {
   const u = usage(
     [
       ...RUNS,
@@ -142,6 +164,16 @@ test('weekStart 周期窗口：cycleStart 含边界，resetsAt 为周期结束',
   assert.equal(u.weekly.resetsAt.toISOString(), '2026-10-15T00:00:00.000Z');
   // 五小时窗口不受 weekStart 影响
   assert.equal(u.fiveHour.used, 5.2);
+});
+
+test('weekStart 恰等于 now：当前周期从 now 开始，只有 startedAt === now 的运行计入', () => {
+  const runs = [
+    { model: 'glm-5.3', startedAt: NOW }, // 恰为 cycleStart = now，计入（×1）
+    { model: 'glm-5.3', startedAt: '2026-10-08T11:59:59.999Z' }, // 属于上一周期，不计入
+  ];
+  const u = usage(runs, NOW, { weekStart: NOW });
+  assert.equal(u.weekly.used, 1);
+  assert.equal(u.weekly.resetsAt.toISOString(), '2026-10-15T12:00:00.000Z'); // now + 7d
 });
 
 // ---------- usage：窗口边界 ----------
@@ -235,6 +267,21 @@ test('时间入参缺失或非法时抛 TypeError', () => {
   assert.throws(() => usage([], NOW, { weekStart: 'oops' }), TypeError);
   assert.throws(() => multiplierFor('glm-5.3', 'oops'), TypeError);
   assert.throws(() => multiplierFor('glm-5.3'), TypeError);
+  assert.throws(() => usage([], NOW, null), TypeError); // options 显式为 null
+});
+
+test('toDate（导出的时间归一化助手）：三种编码同一时刻，非法抛 TypeError，返回新 Date', () => {
+  const d = toDate('2026-10-08T07:00:00Z', 'at');
+  assert.ok(d instanceof Date);
+  assert.equal(d.toISOString(), '2026-10-08T07:00:00.000Z');
+  assert.equal(toDate(1760000000000).getTime(), 1760000000000);
+  const orig = new Date('2026-10-08T07:00:00Z');
+  const copy = toDate(orig, 'now');
+  assert.notEqual(copy, orig); // 返回新对象
+  assert.equal(copy.getTime(), orig.getTime());
+  assert.throws(() => toDate('oops', 'x'), TypeError);
+  assert.throws(() => toDate(new Date('oops'), 'x'), TypeError);
+  assert.throws(() => toDate(), TypeError);
 });
 
 test('runs 不是数组或元素不是对象时抛 TypeError', () => {
@@ -265,11 +312,12 @@ test('usage 不修改任何入参', () => {
 
 // ---------- canStart ----------
 
-test('canStart 验收用例：1600 × 0.9 = 1440', () => {
-  assert.deepEqual(canStart(usageResult(1430, 0), { nextCost: 3 }), { ok: true });
-  const blocked = canStart(usageResult(1439, 0), { nextCost: 3 }); // 1442 > 1440
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.reason, 'five-hour');
+test('验收: canStart used=1430、nextCost=3、safetyRatio=0.9 → ok；used=1439 → { ok:false, reason:"five-hour" }', () => {
+  assert.deepEqual(canStart(usageResult(1430, 0), { nextCost: 3, safetyRatio: 0.9 }), { ok: true });
+  assert.deepEqual(
+    canStart(usageResult(1439, 0), { nextCost: 3, safetyRatio: 0.9 }), // 1442 > 1600 × 0.9 = 1440
+    { ok: false, reason: 'five-hour', resetsAt: null },
+  );
 });
 
 test('canStart：恰好等于 limit × safetyRatio 也放行（浮点容差 1e-9）', () => {
@@ -315,6 +363,14 @@ test('canStart：safetyRatio 缺省 0.9，显式给值生效，非法值抛 Type
   }
 });
 
+test('canStart：safetyRatio = 1 时恰好用到 limit 也放行，超出即拦', () => {
+  assert.deepEqual(canStart(usageResult(1597, 0), { nextCost: 3, safetyRatio: 1 }), { ok: true }); // 1600 = 1600
+  assert.equal(
+    canStart(usageResult(1598, 0), { nextCost: 3, safetyRatio: 1 }).reason, // 1601 > 1600
+    'five-hour',
+  );
+});
+
 test('canStart：nextCost 缺失或非法时抛 TypeError', () => {
   for (const bad of [-1, NaN, Infinity, '3', null, undefined]) {
     assert.throws(
@@ -324,6 +380,7 @@ test('canStart：nextCost 缺失或非法时抛 TypeError', () => {
     );
   }
   assert.throws(() => canStart(usageResult(0, 0)), TypeError); // 整个 options 缺失
+  assert.throws(() => canStart(usageResult(0, 0), null), TypeError); // options 显式为 null
 });
 
 test('canStart：usageResult 形状非法时抛 TypeError', () => {

@@ -11,7 +11,7 @@ const peakSrc = fs.readFileSync(fileURLToPath(new URL('../src/peak.js', import.m
 
 // ---------- 复制来源与零依赖 ----------
 
-test('src/peak.js 文件头注明复制来源（glm-peak-clock @ 6b2b937）', () => {
+test('验收: src/peak.js 文件头注明复制来源（glm-peak-clock @ 6b2b937）', () => {
   assert.ok(peakSrc.startsWith('/*'), '文件头应是注释块');
   assert.match(peakSrc, /glm-peak-clock/);
   assert.match(peakSrc, /6b2b937/);
@@ -19,7 +19,7 @@ test('src/peak.js 文件头注明复制来源（glm-peak-clock @ 6b2b937）', ()
   assert.ok(peakSrc.includes('GLM Coding Plan 高峰期核心逻辑'));
 });
 
-test('src/peak.js 不引入任何依赖', () => {
+test('验收: src/peak.js 不引入任何依赖', () => {
   assert.doesNotMatch(peakSrc, /^\s*import\b/m); // 无静态 import 声明
   assert.doesNotMatch(peakSrc, /\bimport\s*\(/); // 无动态 import()
   assert.doesNotMatch(peakSrc, /\brequire\s*\(/); // 无 CommonJS require
