@@ -121,6 +121,25 @@ test('验收: /usage.html 与 /usage.js、/chart-lib.js 可访问且类型正确
   }
 });
 
+test('验收: 额度卡片写明本地估算口径：源文件与页面响应都带这句，且在「套餐」之后、5 小时进度条之前', async (t) => {
+  const note = '额度是本地估算，不是官方账单。一次运行算 1 次 prompt，再乘模型倍率。';
+  // 不经接口直接读源文件：服务没起来、/api 失败，这句话也得在初始 HTML 里
+  const source = fs.readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web/usage.html'),
+    'utf8',
+  );
+  assert.ok(source.includes(note), 'web/usage.html 源码应包含估算口径说明');
+
+  const { base } = await startServer(t);
+  const html = await (await fetch(`${base}/usage.html`)).text();
+  assert.ok(html.includes(note), '页面响应应包含估算口径说明');
+  const atPlan = html.indexOf('套餐');
+  const atNote = html.indexOf(note);
+  const atMeter = html.indexOf('5 小时窗口');
+  assert.ok(atPlan >= 0 && atNote > atPlan, '说明应在「套餐」之后');
+  assert.ok(atMeter > atNote, '说明应在 5 小时进度条之前');
+});
+
 test('验收: web/ 下没有任何第三方库文件或 CDN 引用', async () => {
   const webDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web');
   const forbidden = [
