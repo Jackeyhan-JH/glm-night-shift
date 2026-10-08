@@ -230,7 +230,7 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
 默认 `false` 时调度器不轮询：任何一轮 tick 都不会为这件事调用 `gh`，发现评审要求修改
 后手动跑 `follow`。
 
-- 只跟 `CHANGES_REQUESTED`；不跟 `APPROVED` / `COMMENTED`，不合并 PR，也没有网页按钮
+- 只跟 `CHANGES_REQUESTED`；不跟 `APPROVED` / `COMMENTED`，不合并 PR；详情页对已成功、PR 还开着的任务有「跟进」按钮，判定与 follow 相同
   （开了自动跟进之后，任务自己出现在队列里）。
 - 查到的跟进任务照旧排队等领取：扫描只入队、不执行，领取仍走高峰 / 额度 / 暂停的原有
   规则；手动 `pause` 或限流退避期间**仍然扫描**（可以入队），只是那几轮不领取。
