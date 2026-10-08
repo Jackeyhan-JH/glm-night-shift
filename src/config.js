@@ -39,6 +39,9 @@ export const DEFAULT_CONFIG = deepFreeze({
   systemctlBin: 'systemctl',   // install/uninstall-service 用的 systemctl 可执行文件
   // —— issue #47 新增（同一仓库同时最多跑一个任务），按约定追加在对象末尾 ——
   oneTaskPerRepo: true,        // true 时某仓库已有 running 任务就先不领它的其他排队任务
+  // —— issue #49 新增（调度器自动跟进 PR 评审），按约定追加在对象末尾 ——
+  autoFollowReviews: false,    // true 时调度器在非高峰自动扫描已成功任务的 PR 评审并入队跟进
+  followPollMinutes: 30,       // 两次自动扫描至少间隔的分钟数（正数）
 });
 
 /**

@@ -108,6 +108,8 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `diagnoseTimeoutMinutes` | `5` | 单次诊断的超时（分钟） | — |
 | `systemctlBin` | `"systemctl"` | install-service / uninstall-service 调用的 systemctl | `NIGHT_SHIFT_SYSTEMCTL_BIN` |
 | `oneTaskPerRepo` | `true` | 某仓库已有 running 任务时先不领它的其他排队任务（只在 concurrency > 1 时看得到；`false` 允许同一仓库并行，但它们都往同一默认分支开 PR，容易打架；不限制排队条数，同一仓库不分分支算同一把锁） | — |
+| `autoFollowReviews` | `false` | `true` 时调度器在非高峰自动扫描已成功任务的 PR 评审（`follow --all` 同一套判定），有 CHANGES_REQUESTED 就入队跟进；`false` 时调度器不轮询、任何一轮都不为此调用 `gh`，想跟进手动跑 `follow` | — |
+| `followPollMinutes` | `30` | 两次自动扫描至少间隔的分钟数（正数）；高峰期间不扫也不计时，高峰一结束的下一轮就能扫 | — |
 
 环境变量总览（详情见 [docs/configuration.md](docs/configuration.md)）：`NIGHT_SHIFT_HOME`
 （数据目录）、`NIGHT_SHIFT_CLAUDE_BIN`、`NIGHT_SHIFT_GH_BIN`、`NIGHT_SHIFT_SYSTEMCTL_BIN`、
@@ -138,7 +140,7 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `show` | `<id>` `[--json]` | 查看任务详情与运行记录 |
 | `cancel` | `<id>` | 取消排队/执行中的任务 |
 | `retry` | `<id>` | 把失败/已取消的任务重新排队 |
-| `follow` | `<id>` 或 `--all [--json]` | 按 PR 的 CHANGES_REQUESTED 评审在**原 night-shift 分支**上入队跟进任务：gitRef 指向父任务分支、提交推回原分支并复用已有 PR（不新开）。结论不是 CHANGES_REQUESTED 时输出「没有待处理的修改请求」退出 0；不会自动轮询 PR，要手动跑 |
+| `follow` | `<id>` 或 `--all [--json]` | 按 PR 的 CHANGES_REQUESTED 评审在**原 night-shift 分支**上入队跟进任务：gitRef 指向父任务分支、提交推回原分支并复用已有 PR（不新开）。结论不是 CHANGES_REQUESTED 时输出「没有待处理的修改请求」退出 0；默认不自动轮询（`autoFollowReviews` 开启后调度器自己扫，见下文） |
 | `edit` | `<id>` ＋至少一个修改项：`--title`、`--prompt <文字>`/`--prompt-file <路径>`、`--difficulty easy\|medium\|hard`、`--priority <整数>`、`--test "<命令>"`/`--no-test`（清掉）、`--allow-peak`/`--no-allow-peak`、`--max-attempts <次数>`、`--depends-on <id,id,…>`/`--no-depends`（清空），可选 `--json` | 修改**排队中**的任务（出现才改，不给的保持原值；`repo`/`source` 等不能改）。不是排队中退出 1；依赖成环整体回滚。看板队列页排队中的行也有「修改」 |
 | `start` | 无 | 前台运行调度器（只调度，不起看板） |
 | `peak` | `[--json]` | 查看当前是否高峰、下次切换时刻与各模型倍率 |
@@ -171,6 +173,24 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 - **依赖环只在 `deps --set` 时拒绝**（存储层 `setDependencies` 写入后查环）。`add` 和 HTTP
   创建任务都不会因为成环失败：新任务还没有任何入边，不可能靠它自己的 `dependsOn` 把图收成环。
   自己依赖自己在创建和修改时都会拒绝，那是「不能依赖自己」，不是环检测。
+
+### PR 评审跟进与自动跟进
+
+任务成功开出 PR 之后，`night-shift follow <id>`（或 `follow --all`）按 PR 的
+CHANGES_REQUESTED 评审在原 night-shift 分支上入队跟进任务：gitRef 指向父任务成功时
+推送的分支，提交推回原分支并复用原来那个 PR，不新开第二个。不想人守着看评审，把配置
+`autoFollowReviews` 设为 `true`（默认 `false`：调度器不轮询，任何一轮都不为此调用
+`gh`）：调度器只在**非高峰**、且距上次扫描至少 `followPollMinutes` 分钟（默认 30）时
+做一次与 `follow --all` 完全相同的扫描，夜里自己把跟进任务排进队列。
+
+- 只跟 `CHANGES_REQUESTED`，不跟 `APPROVED` / `COMMENTED`，也不会合并 PR；没有网页按钮
+  ——开了自动跟进，任务自己出现在队列里；没开就手动跑 `follow`。
+- 查到的跟进任务照旧排队等领取：扫描只入队、不执行，领取仍走高峰 / 额度 / 暂停的原有
+  规则（手动 `pause` 或限流退避期间只入队、不领取）。
+- 高峰期间不扫描、也不把「刚查过」记上——高峰一结束的下一轮就可以扫，不必再等满
+  `followPollMinutes`。
+- 扫描中 `gh` 失败：记一条日志，本轮不再扫其余父任务；这次仍算查过，至少隔
+  `followPollMinutes` 分钟才会再试。
 
 ## 看板
 
