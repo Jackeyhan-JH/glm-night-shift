@@ -32,6 +32,7 @@ import {
   importBody,
   importDoneText,
   importPreviewText,
+  parseCleanupDays,
   pauseToggleView,
   prOutcomeLabel,
   repoFilterOptions,
@@ -90,6 +91,9 @@ const els = {
   importResult: document.getElementById('import-result'),
   cleanupToggle: document.getElementById('cleanup-toggle'),
   cleanupPanel: document.getElementById('cleanup-panel'),
+  // #89：日志保留天数输入与面板内错误条（天数非法不发请求，不占页面顶部错误条）
+  cleanupDays: document.getElementById('c-logs-days'),
+  cleanupError: document.getElementById('cleanup-error'),
   cleanupPreview: document.getElementById('c-preview'),
   cleanupConfirm: document.getElementById('c-confirm'),
   cleanupCancel: document.getElementById('c-cancel'),
@@ -586,13 +590,32 @@ async function onImportConfirm() {
   }
 }
 
-// ---------------------------------------------------------------- 清理磁盘（#50）
+// ---------------------------------------------------------------- 清理磁盘（#50 / #89）
 
-/** 预览（dry-run）：列出将删除的路径；成功后才亮出「确认删除」。 */
+/** #89：天数非法时亮面板内错误条（不发请求，也不用页面顶部的错误条）。 */
+function showCleanupDaysError() {
+  els.cleanupError.textContent = '必须是不小于 0 的整数';
+  els.cleanupError.hidden = false;
+}
+
+/** #89：拿到合法天数后先清掉面板内错误条，再发请求。 */
+function hideCleanupDaysError() {
+  els.cleanupError.hidden = true;
+  els.cleanupError.textContent = '';
+}
+
+/** 预览（dry-run）：列出将删除的路径；成功后才亮出「确认删除」。
+ * #89：每次点击都重读「日志保留天数」的当前值；非法就不发请求，「确认删除」也不亮。 */
 async function onCleanupPreview() {
+  const days = parseCleanupDays(els.cleanupDays.value);
+  if (days === null) {
+    showCleanupDaysError();
+    return;
+  }
+  hideCleanupDaysError();
   els.cleanupPreview.disabled = true;
   try {
-    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(true) });
+    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(days, true) });
     els.cleanupResult.textContent = cleanupPreviewText(result);
     els.cleanupResult.hidden = false;
     els.cleanupConfirm.hidden = false;
@@ -603,11 +626,19 @@ async function onCleanupPreview() {
   }
 }
 
-/** 确认删除（dry-run=false）：failed 为 true 时其余已删、有的没删掉，走页面错误条。 */
+/** 确认删除（dry-run=false）：failed 为 true 时其余已删、有的没删掉，走页面错误条。
+ * #89：同样重读当前输入——预览之后改了天数，确认用的是改完的值；非法就不发请求，
+ * 已预览出来的「确认删除」保持原样（不藏掉）。 */
 async function onCleanupConfirm() {
+  const days = parseCleanupDays(els.cleanupDays.value);
+  if (days === null) {
+    showCleanupDaysError();
+    return;
+  }
+  hideCleanupDaysError();
   els.cleanupConfirm.disabled = true;
   try {
-    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(false) });
+    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(days, false) });
     if (result !== null && typeof result === 'object' && result.failed === true) {
       showPageError('有的没删掉，其余已经删了');
     } else {

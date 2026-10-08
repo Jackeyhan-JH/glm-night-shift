@@ -2,14 +2,17 @@
 // （模块不碰 DOM / fetch，只有 queue.js 才动浏览器环境）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   HISTORY_LIMIT,
   blockedHint,
+  cleanupBody,
   depHint,
   escapeHtml,
   firstLine,
   formToBody,
   groupTasks,
+  parseCleanupDays,
   pauseToggleView,
   prOutcomeLabel,
   repoWaitLabel,
@@ -457,4 +460,114 @@ test('验收: repoWaitLabel 不修改入参；task / tasks / config 残缺不抛
   assert.doesNotThrow(() => repoWaitLabel(task, null, config));
   assert.doesNotThrow(() => repoWaitLabel(task, undefined, config));
   assert.doesNotThrow(() => repoWaitLabel(null, null, null));
+});
+
+// ---------- 清理面板的日志保留天数（#89）----------
+
+test('验收: 缺省 14 的请求体：cleanupBody(14, true/false) 都带数字键 logsOlderThan: 14，dryRun 对应预览/确认', () => {
+  const preview = cleanupBody(14, true);
+  assert.ok('logsOlderThan' in preview);
+  assert.equal(preview.logsOlderThan, 14);
+  assert.equal(preview.dryRun, true);
+  const confirm = cleanupBody(14, false);
+  assert.ok('logsOlderThan' in confirm);
+  assert.equal(confirm.logsOlderThan, 14);
+  assert.equal(confirm.dryRun, false);
+  assert.equal(typeof preview.logsOlderThan, 'number');
+  assert.equal(typeof confirm.logsOlderThan, 'number');
+});
+
+test('验收: 0 不是省略字段：cleanupBody(0, true/false) 的 logsOlderThan 是数字 0、键存在', () => {
+  for (const dryRun of [true, false]) {
+    const body = cleanupBody(0, dryRun);
+    assert.ok('logsOlderThan' in body);
+    assert.equal(typeof body.logsOlderThan, 'number');
+    assert.equal(body.logsOlderThan, 0);
+    assert.equal(body.dryRun, dryRun);
+  }
+});
+
+test('验收: 预览后改输入：确认用改完的值——cleanupBody(3, false).logsOlderThan === 3（不是预览时的 14），dryRun === false', () => {
+  // 面板两次点击各自重新 parse：预览时输入是 14，之后改成 3
+  const previewDays = parseCleanupDays('14');
+  const confirmDays = parseCleanupDays('3');
+  assert.equal(cleanupBody(previewDays, true).logsOlderThan, 14);
+  const confirmBody = cleanupBody(confirmDays, false);
+  assert.equal(confirmBody.logsOlderThan, 3);
+  assert.equal(confirmBody.dryRun, false);
+});
+
+test('验收: parseCleanupDays 接受 "14"、带空白的 " 0 "（=0）、数字 0 与 14', () => {
+  assert.equal(parseCleanupDays('14'), 14);
+  assert.equal(parseCleanupDays(' 0 '), 0);
+  assert.equal(parseCleanupDays(0), 0);
+  assert.equal(parseCleanupDays(14), 14);
+});
+
+test('验收: 非法输入 parseCleanupDays 与 cleanupBody 都是 null（调用方不发请求）', () => {
+  // 空 / 空白 / 负数（含 -0）/ 小数 / 伪格式（+、科学计数、前导 0）/ 超安全整数 /
+  // 非数字非字符串 / 布尔——trim 后仍非法的都在这里。
+  const bad = [
+    '', ' ', '-1', '-0', '1.5', '14.0', '+14', '1e2', '014', '01',
+    '9007199254740992', '99999999999999999999', '1 4', 'x', '一四',
+    null, undefined, NaN, 1.5, true, false,
+  ];
+  for (const raw of bad) {
+    const label = JSON.stringify(String(raw));
+    assert.equal(parseCleanupDays(raw), null, `parseCleanupDays(${label})`);
+    assert.equal(cleanupBody(raw, true), null, `cleanupBody(${label}, true) 不发请求`);
+  }
+});
+
+test('验收: 字符串天数也能进 cleanupBody："14" / " 14 " 得到数字 14', () => {
+  assert.deepEqual(cleanupBody('14', false), { dryRun: false, logsOlderThan: 14 });
+  assert.deepEqual(cleanupBody(' 14 ', true), { dryRun: true, logsOlderThan: 14 });
+});
+
+test('验收: parseCleanupDays / cleanupBody 不改入参，多次调用结果稳定', () => {
+  const s = ' 14 ';
+  assert.equal(parseCleanupDays(s), 14);
+  assert.equal(parseCleanupDays(s), 14);
+  assert.equal(s, ' 14 ');
+  const first = cleanupBody(14, true);
+  assert.deepEqual(cleanupBody(14, true), first); // 14 没被改掉，结果稳定
+  const days = 3;
+  cleanupBody(days, false);
+  assert.equal(days, 3);
+});
+
+test('验收: 清理面板 HTML 有「日志保留天数」输入（id=c-logs-days、value="14"）与面板内错误条 id=cleanup-error；导入面板的状态选择还在', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const start = html.indexOf('id="cleanup-panel"');
+  const end = html.indexOf('<div id="tabs"');
+  assert.ok(start >= 0 && end > start, '#cleanup-panel 存在');
+  const panel = html.slice(start, end);
+  assert.ok(panel.includes('id="c-logs-days"'), '输入要有 id="c-logs-days"');
+  assert.ok(
+    /<input\b[^>]*\bid="c-logs-days"[^>]*\bvalue="14"/.test(panel),
+    '缺省值是 14（不能空、不能是别的数字）',
+  );
+  assert.ok(/<input\b[^>]*\bname="logsOlderThan"/.test(panel), 'name 与请求体键一致');
+  assert.ok(panel.includes('>日志保留天数</span>'), '可见标签文案是「日志保留天数」');
+  assert.ok(panel.includes('id="cleanup-error"'), '面板内有自己的错误条 id="cleanup-error"');
+  // #76 导入面板原样还在：状态选择与三个选项文案
+  const importPanel = html.match(/<form id="import-panel"[\s\S]*?<\/form>/)?.[0] ?? '';
+  assert.ok(importPanel !== '', '#import-panel 表单存在');
+  assert.ok(importPanel.includes('id="i-state"'), '状态选择 id="i-state" 还在');
+  for (const label of ['未关闭', '已关闭', '全部']) {
+    assert.ok(importPanel.includes(`>${label}</option>`), `选项「${label}」还在`);
+  }
+});
+
+test('验收: queue.js 的预览与确认都重读 els.cleanupDays（各自 parse），确认不能只用写死的 14', () => {
+  const src = fs.readFileSync(new URL('../web/queue.js', import.meta.url), 'utf8');
+  const previewBody = /async function onCleanupPreview\(\)([\s\S]*?)(?=\nasync function onCleanupConfirm)/.exec(src)?.[1] ?? '';
+  const confirmBody = /async function onCleanupConfirm\(\)([\s\S]*?)(?=\n\/\/\s*-)/.exec(src)?.[1] ?? '';
+  assert.ok(previewBody !== '', 'onCleanupPreview 存在');
+  assert.ok(confirmBody !== '', 'onCleanupConfirm 存在');
+  assert.ok(previewBody.includes('els.cleanupDays'), '预览每次点击重读输入');
+  assert.ok(confirmBody.includes('els.cleanupDays'), '确认每次点击重读输入（预览后改了天数用新值）');
+  assert.ok(previewBody.includes('parseCleanupDays'), '预览先 parse 再发请求');
+  assert.ok(confirmBody.includes('parseCleanupDays'), '确认先 parse 再发请求');
+  assert.ok(confirmBody.includes('cleanupBody(days,'), '确认把当前值传给 cleanupBody，不写死 14');
 });
