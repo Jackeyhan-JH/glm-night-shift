@@ -3,10 +3,11 @@
 写 README 与 docs/configuration.md 时（issue #20）发现的、Issue 描述（或截图）与代码实际
 行为不一致的地方。按约定**不改代码**，在这里列出，由产品决定改哪边。
 
-1. **package.json 没有 `npm run e2e` script。**
-   issue #20 的 README 开发节原本要求写 `npm run e2e`，但 `package.json` 目前只有
-   `npm test`（`node --test`）。e2e 套件在 issue #19 开发中、尚未合并为 script，所以 README
-   开发节只写了 `npm test`，并注明 e2e 尚未成为 script。#19 合并后应回来补上。
+1. **（已解决）`npm run e2e` 现在有了。**
+   原先这里写「package.json 没有 `npm run e2e`」。#19 已 squash 合入 main
+   （`6d0cad2`，父提交 `0308625`）。`package.json` 的 script 是
+   `node --test --test-concurrency=1 "e2e/*.e2e.mjs"`，不进 `npm test`。
+   README 开发节仍留着「e2e 套件在整理中，尚未做成 script」那句，本条目只更正这里的过时说法，不改那份 README 正文。
 
 2. **docs/images/task.png 截图来自看板的旧版本。**
    截图（取自 #16 的看板 PR）里任务分支显示为 `task/2-login-overflow`，而当前代码
