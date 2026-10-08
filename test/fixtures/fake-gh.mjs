@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-// 假 gh：模拟测试里用到的 `gh pr create` 和 `gh repo view`，绝不联网。
+// 假 gh：模拟测试里用到的 `gh pr create`、`gh pr list` 和 `gh repo view`，绝不联网。
 // 行为由环境变量控制：
 //   FAKE_GH_LOG            若设置，把 argv 作为一行 JSON 追加到该文件
 //   FAKE_GH_PR_NUMBER      pr create 输出的 PR 编号（默认 1）
 //   FAKE_GH_FAIL=1         pr create 报错退出 1（只作用于 pr create）
 //   FAKE_GH_REPO           未用 --repo 且不在 git 仓库里时的兜底 owner/name
 //   FAKE_GH_DEFAULT_BRANCH repo view 输出的默认分支名（默认 main）
+//   FAKE_GH_EXISTING_PR_URL pr list 输出里的 open PR 地址；未设置时输出空数组 []
+//   FAKE_GH_BODY_COPY      pr create 时把 --body-file 指向的文件内容复制到该路径
+//                          （临时正文文件用完就删，测试靠它检查 PR 正文；FAIL=1 时不复制）
 // 重要：不带任何参数被调用时（例如被 `node --test` 误当测试文件执行）静默退出 0，
 // 且 FAKE_GH_LOG 未设置时不写任何文件。
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -66,6 +69,22 @@ function prNumber() {
   return Number.isInteger(n) && n > 0 ? n : 1;
 }
 
+// --flag <value> / --flag=<value>（值以 - 开头时视为没有值）
+function flagValue(args, name) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === name) {
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith('-')) return next;
+    }
+    if (arg.startsWith(`${name}=`)) {
+      const value = arg.slice(name.length + 1);
+      if (value !== '') return value;
+    }
+  }
+  return null;
+}
+
 function main() {
   writeLog();
   const sub = argv[0];
@@ -77,10 +96,22 @@ function main() {
       process.exitCode = 1;
       return;
     }
+    const copyTo = process.env.FAKE_GH_BODY_COPY;
+    if (copyTo) {
+      const bodyFile = flagValue(argv, '--body-file');
+      if (bodyFile !== null) copyFileSync(bodyFile, copyTo);
+    }
     const repo = repoFromArgs(argv)
       ?? repoFromGit()
       ?? (process.env.FAKE_GH_REPO || 'fake-owner/fake-repo');
     process.stdout.write(`https://github.com/${repo}/pull/${prNumber()}\n`);
+    return;
+  }
+
+  if (sub === 'pr' && subSub === 'list') {
+    const url = process.env.FAKE_GH_EXISTING_PR_URL;
+    const rows = url ? [{ url }] : [];
+    process.stdout.write(`${JSON.stringify(rows)}\n`);
     return;
   }
 

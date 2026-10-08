@@ -25,6 +25,10 @@ const EXPECTED_DEFAULTS = {
     hard: { model: 'glm-5.3', effort: 'high' },
   },
   effortThinkingTokens: { low: 0, medium: 8000, high: 32000 },
+  remoteUrlTemplate: 'https://github.com/{repo}.git',
+  gitAuthorName: null,
+  gitAuthorEmail: null,
+  testTimeoutMinutes: 15,
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {
