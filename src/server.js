@@ -32,6 +32,12 @@ import { listTemplates, loadTemplate, renderTemplate } from './templates.js';
 
 /** web/ 静态文件根目录（src/server.js 的上一级里的 web/）。 */
 const WEB_ROOT = path.resolve(fileURLToPath(new URL('../web', import.meta.url)));
+/** src/ 里允许浏览器按路径只读取用的模块白名单（issue #17：额度页在浏览器里
+ *  import /src/peak.js 复用高峰纯函数算高峰带与未来时段，不把这些结果塞进 /api/status）。
+ *  只此一个路径——其余 src/** 一律不暴露。 */
+const SRC_FILES = new Map([
+  ['/src/peak.js', path.resolve(fileURLToPath(new URL('./peak.js', import.meta.url)))],
+]);
 /** POST 请求体上限（issue 规格：1MB）。 */
 const MAX_BODY_BYTES = 1024 * 1024;
 /** SSE：轮询兜底间隔（fs.watch 在网络盘 / 部分文件系统上不发事件，也是发现日志文件被创建、运行结束的手段）。 */
@@ -203,6 +209,8 @@ function buildRoutes(deps, bumpSse) {
         },
         usage: usage(runs, now, { plan: deps.config.plan, weekStart: deps.config.weekStart }),
         plan: deps.config.plan,
+        // 额度页判定「超过安全阈值标黄」用的阈值（issue #17；与配置里的 safetyRatio 同源）。
+        safetyRatio: deps.config.safetyRatio,
         runningCount: countTasks(deps.db, 'running'),
         queuedCount: countTasks(deps.db, 'queued'),
         scheduler: deps.scheduler === null || deps.scheduler === undefined
@@ -546,7 +554,8 @@ function resolveStaticPath(pathname) {
 }
 
 function serveStatic(req, res, pathname) {
-  const filePath = resolveStaticPath(pathname);
+  // 白名单里的 src/ 模块直接按绝对路径取；其余仍按 web/ 内的相对路径解析（越界 → 404）。
+  const filePath = SRC_FILES.get(pathname) ?? resolveStaticPath(pathname);
   let data = null;
   if (filePath !== null) {
     try {
