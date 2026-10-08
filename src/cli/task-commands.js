@@ -16,11 +16,13 @@ import {
   cancelTask,
   createTask,
   getTask,
+  listDependencies,
   listRuns,
   listTasks,
   retryTask,
 } from '../tasks.js';
 import { renderTaskDetail, renderTasksTable } from './render.js';
+import { parseIdListOption } from './deps-command.js';
 
 /** 多行用法里续行的缩进：对齐到「用法：night-shift 」之后的命令名。 */
 const USAGE_CONT = ' '.repeat(15);
@@ -114,7 +116,8 @@ export const addCommand = {
   usage: [
     '用法：night-shift add --repo <owner/name> (--prompt <文字> | --prompt-file <路径>)',
     `${USAGE_CONT}[--title <标题>] [--difficulty easy|medium|hard] [--priority <整数>]`,
-    `${USAGE_CONT}[--test "<测试命令>"] [--allow-peak] [--max-attempts <次数>] [--json]`,
+    `${USAGE_CONT}[--test "<测试命令>"] [--allow-peak] [--max-attempts <次数>]`,
+    `${USAGE_CONT}[--depends-on <id,id,…>] [--json]`,
   ].join('\n'),
   async run(args, ctx) {
     const { values } = parseArgs({
@@ -129,6 +132,7 @@ export const addCommand = {
         test: { type: 'string' },
         'allow-peak': { type: 'boolean' },
         'max-attempts': { type: 'string' },
+        'depends-on': { type: 'string' },
         json: { type: 'boolean' },
       },
     });
@@ -160,6 +164,11 @@ export const addCommand = {
     const maxAttempts = values['max-attempts'] === undefined
       ? undefined
       : parseIntStrict(ctx, values['max-attempts'], '--max-attempts', addCommand.usage, { min: 1 });
+    // 格式错误（abc、1,,x、0、负数）在这里就是用法错误（退出码 2）；
+    // id 不存在 / 已失败等留给存储层（退出码 1）。空串 = 无依赖。
+    const dependsOn = values['depends-on'] === undefined
+      ? undefined
+      : parseIdListOption(ctx, values['depends-on'], '--depends-on', addCommand.usage);
 
     // --prompt-file：文件内容原样作为提示词，只去掉末尾一个换行（\n 或 \r\n）；
     // 读取失败是运行时错误（文件不存在等），报错带路径。
@@ -185,6 +194,7 @@ export const addCommand = {
       testCommand: values.test,
       allowPeak: values['allow-peak'] ?? false,
       maxAttempts: maxAttempts ?? config.maxAttempts, // 缺省取配置 maxAttempts
+      dependsOn,
     }));
     writeOut(ctx, values.json, task, `已加入队列：#${task.id} ${task.title}`);
     return 0;
@@ -236,13 +246,17 @@ export const showCommand = {
       allowPositionals: true,
     });
     const id = parseIdPositional(ctx, positionals, showCommand.usage);
-    const { task, runs } = await withDb(ctx, (db) => {
+    const { task, runs, deps } = await withDb(ctx, (db) => {
       const found = getTask(db, id);
       if (found === null) throw new NotFoundError(id); // 运行时错误：中文原因，退出码 1
-      return { task: found, runs: listRuns(db, { taskId: id, limit: 1000 }) };
+      return {
+        task: found,
+        runs: listRuns(db, { taskId: id, limit: 1000 }),
+        deps: listDependencies(db, id), // 依赖行（id + 状态），给人类可读输出用
+      };
     });
-    // JSON 形状：任务字段全在顶层（含 status），runs 挂在 runs 键下。
-    writeOut(ctx, values.json, { ...task, runs }, renderTaskDetail(task, runs));
+    // JSON 形状：任务字段全在顶层（含 status / dependsOn / blockedBy），runs 挂在 runs 键下。
+    writeOut(ctx, values.json, { ...task, runs }, renderTaskDetail(task, runs, deps));
     return 0;
   },
 };

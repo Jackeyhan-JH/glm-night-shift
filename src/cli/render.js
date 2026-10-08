@@ -35,12 +35,14 @@ function cleanPrompt(text) {
 /**
  * list 的对齐表格：表头「ID 状态 难度 优先级 仓库 标题 创建时间」，
  * 每列宽取该列（含表头）的最大显示宽度，列间两个空格，行尾不去补空格。
+ * 等依赖的排队任务状态显示为 `queued（等 #1）`（多个：`等 #1,#2`）——状态列随之
+ * 变宽，同表其余行按显示宽度自动对齐。
  */
 export function renderTasksTable(tasks) {
   const header = ['ID', '状态', '难度', '优先级', '仓库', '标题', '创建时间'];
   const rows = tasks.map((t) => [
     String(t.id),
-    t.status,
+    statusCell(t),
     t.difficulty,
     String(t.priority),
     truncateDisplay(singleLine(t.repo), REPO_MAX_COLUMNS),
@@ -50,11 +52,25 @@ export function renderTasksTable(tasks) {
   return `${renderTable(header, rows)}\n`;
 }
 
+/** 状态列：queued 且有未满足依赖时标注在等谁（blockedBy 升序 id）。 */
+function statusCell(task) {
+  if (task.status === 'queued' && task.blockedBy?.length > 0) {
+    return `queued（等 #${task.blockedBy.join(',#')}）`;
+  }
+  return task.status;
+}
+
+/** 依赖清单展示串：`#1 succeeded，#2 queued`；没有依赖是「无」（issue #11 规格文案）。 */
+function depsLine(deps) {
+  return `依赖：${deps.length === 0 ? '无' : deps.map((d) => `#${d.id} ${d.status}`).join('，')}`;
+}
+
 /**
- * show 的任务详情：标题行 + 对齐的字段列表 + 缩进的提示词 + 运行记录表格
+ * show 的任务详情：标题行 + 对齐的字段列表 + 依赖行 + 缩进的提示词 + 运行记录表格
  * （列：尝试次数、模型、状态、耗时、额度、日志路径）。没有运行记录时明确说无。
+ * deps 是 listDependencies() 的结果（[{id, status}]，升序）；缺省视为无依赖。
  */
-export function renderTaskDetail(task, runs) {
+export function renderTaskDetail(task, runs, deps = []) {
   const fields = [
     ['状态', task.status],
     ['难度', task.difficulty],
@@ -75,6 +91,7 @@ export function renderTaskDetail(task, runs) {
   const lines = [
     `任务 #${task.id}：${singleLine(task.title)}`,
     ...fields.map(([label, value]) => `${padEndDisplay(label, labelWidth)}  ${value}`),
+    depsLine(deps),
     '',
     '提示词：',
     ...cleanPrompt(task.prompt).split('\n').map((line) => `  ${line}`),

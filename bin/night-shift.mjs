@@ -18,6 +18,7 @@ import {
   retryCommand,
   showCommand,
 } from '../src/cli/task-commands.js';
+import { depsCommand } from '../src/cli/deps-command.js';
 import { configCommand } from '../src/cli/config-command.js';
 
 // 通过 import.meta.url 相对路径读 package.json，任意 cwd / npm link 下都能找到。
@@ -43,6 +44,7 @@ const COMMANDS = {
   show: showCommand,
   cancel: cancelCommand,
   retry: retryCommand,
+  deps: depsCommand,
   config: configCommand,
   help: {
     summary: '显示帮助',
