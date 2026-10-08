@@ -360,7 +360,7 @@ export function cleanupDoneText(result) {
 
 /**
  * 队列行的 PR 结果标签（#62）：PR 在 GitHub 上已合并 / 已关闭时，在状态徽章旁边
- * 额外显示两个字（成功建出的 PR 后来被合并 / 关闭，任务状态本身仍是「成功」）。
+ * 额外显示两个字（已经成功的任务，后来 PR 被合并或关闭；任务状态本身仍是「成功」）。
  * 只认 task.prOutcome 全等 'merged' / 'closed'（与详情页 #56 的「PR 结果」同一判定）；
  * 'open'、null / undefined / 缺字段、空串、大小写不同（MERGED / CLOSED）及其他任何
  * 值都返回 ''——调用方（queue.js）收到空串一个节点都不建，行文本里不出现这两个词。

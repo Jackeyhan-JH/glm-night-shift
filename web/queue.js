@@ -185,17 +185,20 @@ function renderTable() {
  * PR 结果标签（#62）：表格用 innerHTML 画完后，按行把「已合并 / 已关闭」补到状态
  * 单元格里（徽章旁边，不是新列）。文案用 createElement + textContent 设置——不进
  * 任何 innerHTML / 模板字符串；prOutcomeLabel 返回空串（open / 没查过 / 值不认识）
- * 的一行一个节点都不建，行文本里不会出现这两个词。行序 = 传入 tasks 的顺序。
+ * 的一行一个节点都不建（连空格也不加），行文本里不会出现这两个词。行序 = tasks 序。
  */
 function appendPrOutcomeLabels(tasks) {
   const rows = els.table.querySelectorAll('tbody tr');
   tasks.forEach((task, i) => {
     const label = prOutcomeLabel(task);
-    if (label === '') return; // 不建空 span
+    if (label === '') return; // 不建空 span，也不加空格
+    const cell = rows[i]?.cells[1];
+    if (cell === undefined) return; // 行与任务对不上时宁可不显示（正常不会发生）
     const span = document.createElement('span');
     span.className = 'pr-outcome';
     span.textContent = label;
-    rows[i]?.cells[1]?.append(span);
+    // 徽章是 inline-block 的胶囊，直接接文本会粘成「成功已合并」：先补一个空格文本节点。
+    cell.append(document.createTextNode(' '), span);
   });
 }
 
