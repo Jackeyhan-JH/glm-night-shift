@@ -14,6 +14,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { systemClock } from './clock.js';
 import { SETTINGS_KEYS, loadConfig, patchConfigFile, pickSettings } from './config.js';
+// #68：详情页「跟进」按钮的判定走 followTask（与 follow 命令 / 调度器自动跟进同一份，
+// 不另抄一套）。follow.js 与 tasks.js 同侧，server 静态引入没有问题——只有 CLI 文件不行
+// （见 src/follow.js 头注）。
+import { followTask } from './follow.js';
 import { getStatus } from './peak.js';
 import { multiplierFor, toDate, usage } from './quota.js';
 import { HISTORY_DAYS_MAX, HISTORY_DAYS_MIN, hourlyUsage } from './stats.js';
@@ -214,6 +218,43 @@ function buildRoutes(deps, bumpSse) {
     } },
     { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/retry$/, handler: (ctx) => {
       sendJson(ctx.res, 200, retryTask(deps.db, parseId(ctx.params[0], '任务')));
+    } },
+    // 详情页「跟进」按钮的接口（#68）：判定全部交给 followTask（与命令行 follow <id>
+    // 同一份，不另写一套，也不在路由里先挑高峰 / autoFollowReviews / 状态——那是调度器
+    // 自动跟进扫描的事，手动操作照样调 gh）。请求体必须是空对象 {}：多出来的键 → 400
+    // 点名字段，一次 gh 都不调、不建任务。结果按 followTask 的返回 / 抛出映射：
+    // created → 201、skipped → 200（message 原样）、gh pr view 失败 → 502、其余 → 409。
+    { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/follow$/, handler: async (ctx) => {
+      for (const key of Object.keys(ctx.body)) {
+        throw new HttpError(400, `未知字段：${key}（请求体必须是空对象 {}）`, key);
+      }
+      const id = parseId(ctx.params[0], '任务');
+      const parent = getTask(deps.db, id);
+      if (parent === null) throw new NotFoundError(id); // 与 GET 详情同一条 404
+      let result;
+      try {
+        result = await followTask(deps.db, parent, {
+          ghBin: deps.config.ghBin,
+          env: deps.env, // createServer 收到的 env（缺省 process.env）：子进程才拿得到 FAKE_GH_*
+          config: deps.config, // 不传 throwOnError：默认 true，gh 失败 / 不能跟进会 throw
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new HttpError(followFailureStatus(message), message);
+      }
+      if (result.kind === 'created') {
+        sendJson(ctx.res, 201, {
+          kind: result.kind, id: result.id, parentId: result.parentId,
+          branch: result.branch, source: result.source,
+        });
+        return;
+      }
+      if (result.kind === 'skipped') {
+        sendJson(ctx.res, 200, { kind: result.kind, parentId: result.parentId, message: result.message });
+        return;
+      }
+      // throwOnError: true 时不会返回 failed（防御：万一返回了，按同一规则映射）。
+      throw new HttpError(followFailureStatus(result.message), result.message);
     } },
     // 从 GitHub issue 批量入队（#50）：与 import 命令同一套逻辑（src/import-issues.js），
     // 字段缺省也相同；多出来的键 / 形状不对 → 400 点名字段（不调 gh、不建任务）。
@@ -893,6 +934,12 @@ function parseId(raw, kind) {
   const id = Number(raw);
   if (!Number.isSafeInteger(id) || id < 1) throw new HttpError(404, `${kind} ${raw} 不存在`);
   return id;
+}
+
+/** followTask 的失败句子 → HTTP 状态码：gh pr view 本身的失败是上游问题 → 502；
+ * 其余（不能跟进、prUrl 解析不出 PR 编号、入队失败）→ 409。句子原样送出去，不改写。 */
+function followFailureStatus(message) {
+  return String(message).includes('gh pr view 失败') ? 502 : 409;
 }
 
 function requireRun(db, id) {

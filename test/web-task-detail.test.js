@@ -536,3 +536,173 @@ test('验收: queued 复用 running 的同一个刷新定时器（intervalCount 
   await page.busy;
   assert.equal(calls.filter((c) => c === '/api/status').length, after, '停表后不再请求 /api/status');
 });
+
+// ---------- #68「跟进」按钮：按 URL / 方法分支的 fetch 桩 ----------
+
+/**
+ * 「跟进」版页面装配：GET /api/tasks/1 永远回 task（刷新后仍是已成功、PR 开着），
+ * POST /api/tasks/1/follow 回 follow()（测试给 201 / 200 / 40x）。现有 makePage 的
+ * 「所有 URL 同一 payload」行为不动，新测试自己按 URL 分支。
+ */
+function makeFollowPage(t, { task, follow }) {
+  const doc = makeStubDoc();
+  const real = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    calls.push(`${method} ${url}`);
+    if (method === 'POST' && url === '/api/tasks/1/follow') {
+      const { ok, status, body } = follow();
+      return Promise.resolve({ ok, status, text: () => Promise.resolve(JSON.stringify(body)) });
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify(task)),
+    });
+  };
+  const page = createPage({ doc, location: { search: '?id=1' } }).init();
+  t.after(() => {
+    page.destroy();
+    globalThis.fetch = real;
+  });
+  return { page, doc, calls };
+}
+
+/** 已成功、PR 开着的任务载荷（canFollow 为 true 的典型形状）。 */
+function followablePayload(overrides = {}) {
+  return taskPayload({
+    status: 'succeeded',
+    prUrl: 'https://github.com/a/b/pull/9',
+    branch: 'night-shift/1-fix',
+    prOutcome: 'open',
+    finishedAt: '2026-10-08T08:00:00.000Z',
+    ...overrides,
+  });
+}
+
+const created = (overrides = {}) => ({
+  ok: true,
+  status: 201,
+  body: {
+    kind: 'created', id: 2, parentId: 1, branch: 'night-shift/1-fix',
+    source: 'pr-review:a/b#9:1', ...overrides,
+  },
+});
+
+test('验收: 已成功、prUrl 是 https、prOutcome 为 open：看得到「跟进」（display 不是 none），文字就是「跟进」', async (t) => {
+  const { page } = makeFollowPage(t, {
+    task: followablePayload(),
+    follow: () => created(),
+  });
+  await page.busy;
+  assert.equal(page.refs.followBtn.textContent, '跟进');
+  assert.equal(page.refs.followBtn.style.display, '');
+});
+
+test('验收: prOutcome 缺失（老数据）：同样有「跟进」', async (t) => {
+  const task = followablePayload();
+  delete task.prOutcome;
+  const { page } = makeFollowPage(t, { task, follow: () => created() });
+  await page.busy;
+  assert.equal(page.refs.followBtn.style.display, '');
+});
+
+test('验收: merged、closed、没有 prUrl、状态不是成功：没有「跟进」按钮（display none）', async (t) => {
+  const cases = [
+    followablePayload({ prOutcome: 'merged' }),
+    followablePayload({ prOutcome: 'closed' }),
+    followablePayload({ prUrl: null }),
+    followablePayload({ status: 'failed' }),
+    followablePayload({ status: 'running' }),
+  ];
+  for (const task of cases) {
+    const { page } = makeFollowPage(t, { task, follow: () => created() });
+    await page.busy;
+    assert.equal(page.refs.followBtn.style.display, 'none',
+      `${task.status} / prUrl=${task.prUrl} / prOutcome=${task.prOutcome} 不该有按钮`);
+  }
+});
+
+test('验收: 201 created：点击后 actionMsg 含「已入队 #2」「，在分支 night-shift/1-fix 上改」，#2 是 <a href="/task.html?id=2">，没有指向 github 的链接；按钮还在、文字仍是「跟进」', async (t) => {
+  const { page, doc, calls } = makeFollowPage(t, {
+    task: followablePayload(),
+    follow: () => created(),
+  });
+  await page.busy;
+  page.refs.followBtn.dispatch('click');
+  await page.busy;
+
+  const msg = page.refs.actionMsg;
+  assert.ok(msg.textContent.includes('已入队 #2'), msg.textContent);
+  assert.ok(msg.textContent.includes('，在分支 night-shift/1-fix 上改'), msg.textContent);
+  // #2 是站内详情页链接；不指向 github、不开 _blank 到 prUrl
+  const links = findByTag(msg, 'a');
+  assert.equal(links.length, 1);
+  assert.equal(links[0].textContent, '#2');
+  assert.equal(links[0].getAttribute('href'), '/task.html?id=2');
+  assert.equal(links[0].attributes.has('target'), false, '不 target=_blank 到 prUrl');
+  // 成功提示里不出现 github 外链（信息卡里那条 PR 链接是另一回事，不在此节点内）
+  const hrefs = links.map((n) => n.getAttribute('href'));
+  assert.ok(!hrefs.some((href) => href.startsWith('http')), `不该有外链：${hrefs.join(' | ')}`);
+  // 前后两段是单独元素的 textContent
+  assert.deepEqual(msg.children.map((c) => c.tagName), ['SPAN', 'A', 'SPAN']);
+  assert.equal(msg.children[0].textContent, '已入队 ');
+  assert.equal(msg.children[2].textContent, '，在分支 night-shift/1-fix 上改');
+  // 成功提示在 doRefresh 之后才写：GET 任务详情发生在 POST 之后
+  assert.ok(calls.indexOf('POST /api/tasks/1/follow') < calls.lastIndexOf('GET /api/tasks/1'),
+    `先刷新后写提示，实际顺序：${calls.join(' -> ')}`);
+  // 按钮没被拿掉也没隐藏
+  assert.equal(page.refs.followBtn.textContent, '跟进');
+  assert.equal(page.refs.followBtn.style.display, '');
+  assert.equal(page.refs.followBtn.disabled, false);
+});
+
+test('验收: 201 但 branch 含 <img：不产生 img 元素，除导航外没有新的 innerHTML', async (t) => {
+  const { page, doc } = makeFollowPage(t, {
+    task: followablePayload(),
+    follow: () => created({ branch: 'night-shift/1-<img src=x onerror=alert(1)>' }),
+  });
+  await page.busy;
+  page.refs.followBtn.dispatch('click');
+  await page.busy;
+  const app = doc.getElementById('app');
+
+  assert.equal(findByTag(app, 'img').length, 0, '不产生 img 元素');
+  assert.ok(page.refs.actionMsg.textContent.includes('<img'), '恶意串按文本原样显示');
+  const badHrefs = findAll(app, (n) => n.attributes.has('href') && n.attributes.get('href').includes('<'));
+  assert.equal(badHrefs.length, 0, '含 < 的串不得出现在任何 href 里');
+  const htmlUsers = [...findAll(doc.getElementById('nav'), (n) => n._innerHTML !== ''),
+    ...findAll(app, (n) => n._innerHTML !== '')];
+  assert.equal(htmlUsers.length, 1, '全页仍只有导航用 innerHTML');
+  assert.equal(htmlUsers[0], doc.getElementById('nav'));
+});
+
+test('验收: 200 skipped：按钮旁 textContent 就是 followTask 的 message 原文，不做链接、不再包一句', async (t) => {
+  const { page } = makeFollowPage(t, {
+    task: followablePayload(),
+    follow: () => ({ ok: true, status: 200, body: { kind: 'skipped', parentId: 1, message: '没有待处理的修改请求' } }),
+  });
+  await page.busy;
+  page.refs.followBtn.dispatch('click');
+  await page.busy;
+
+  assert.equal(page.refs.actionMsg.textContent, '没有待处理的修改请求');
+  assert.equal(findByTag(page.refs.actionMsg, 'a').length, 0, 'skipped 不做链接');
+  assert.equal(page.refs.followBtn.style.display, '', '按钮还在');
+});
+
+test('验收: 409：按钮旁显示后端的 error 原文，与取消 / 重试失败是同一节点（refs.actionMsg）', async (t) => {
+  const { page } = makeFollowPage(t, {
+    task: followablePayload(),
+    follow: () => ({ ok: false, status: 409, body: { error: '任务 #1 不能跟进：状态是 queued' } }),
+  });
+  await page.busy;
+  page.refs.followBtn.dispatch('click');
+  await page.busy;
+
+  assert.equal(page.refs.actionMsg.textContent, '任务 #1 不能跟进：状态是 queued');
+  assert.equal(page.refs.followBtn.textContent, '跟进');
+  assert.equal(page.refs.followBtn.disabled, false);
+});

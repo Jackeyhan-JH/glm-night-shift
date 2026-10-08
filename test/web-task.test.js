@@ -25,6 +25,7 @@ import {
   startRun,
 } from '../src/tasks.js';
 import {
+  canFollow,
   createPage,
   difficultyLabel,
   firstErrorLine,
@@ -961,4 +962,65 @@ test('验收: GET /task.html 返回页面并引用 /task.js、/style.css；/task
     assert.equal(res.status, 200, p);
     assert.ok(res.headers.get('content-type').startsWith('text/javascript'), p);
   }
+});
+
+// ---------------------------------------------------------------- #68「跟进」按钮的显示判定
+
+// canFollow 的最小输入面（只读这三个字段）。
+function followableTask(overrides = {}) {
+  return {
+    status: 'succeeded',
+    prUrl: 'https://github.com/a/b/pull/9',
+    prOutcome: 'open',
+    ...overrides,
+  };
+}
+
+test('验收: canFollow：succeeded + https prUrl + prOutcome open → true', () => {
+  assert.equal(canFollow(followableTask()), true);
+});
+
+test('验收: canFollow：succeeded + http（非 https 也算）prUrl + prOutcome null → true', () => {
+  assert.equal(canFollow(followableTask({ prUrl: 'http://github.com/a/b/pull/9', prOutcome: null })), true);
+});
+
+test('验收: canFollow：succeeded + https + 缺 prOutcome 字段（老数据）→ true', () => {
+  const task = followableTask();
+  delete task.prOutcome;
+  assert.equal(canFollow(task), true);
+  // 空串、大写 'MERGED' 都算还开着（只认全等的小写 merged / closed）
+  assert.equal(canFollow(followableTask({ prOutcome: '' })), true);
+  assert.equal(canFollow(followableTask({ prOutcome: 'MERGED' })), true);
+  assert.equal(canFollow(followableTask({ prOutcome: undefined })), true);
+});
+
+test('验收: canFollow：prOutcome 是 merged / closed → false', () => {
+  assert.equal(canFollow(followableTask({ prOutcome: 'merged' })), false);
+  assert.equal(canFollow(followableTask({ prOutcome: 'closed' })), false);
+});
+
+test('验收: canFollow：没有 prUrl、prUrl null、javascript: 伪协议 → false', () => {
+  const without = followableTask();
+  delete without.prUrl;
+  assert.equal(canFollow(without), false);
+  assert.equal(canFollow(followableTask({ prUrl: null })), false);
+  assert.equal(canFollow(followableTask({ prUrl: 'javascript:alert(1)' })), false);
+});
+
+test('验收: canFollow：status 不是 succeeded（queued / running / failed / canceled）→ false', () => {
+  for (const status of ['queued', 'running', 'failed', 'canceled']) {
+    assert.equal(canFollow(followableTask({ status })), false, status);
+  }
+});
+
+test('验收: canFollow 不修改入参（对象原样、键序不变）', () => {
+  const task = followableTask({ prOutcome: 'open' });
+  const snapshot = JSON.parse(JSON.stringify(task));
+  canFollow(task);
+  canFollow(followableTask({ prOutcome: 'merged' }));
+  assert.deepEqual(task, snapshot);
+  assert.deepEqual(Object.keys(task), Object.keys(snapshot));
+  // null / undefined 入参也不炸（按不可跟进处理）
+  assert.equal(canFollow(null), false);
+  assert.equal(canFollow(undefined), false);
 });

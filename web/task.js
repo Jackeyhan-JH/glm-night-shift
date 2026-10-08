@@ -117,6 +117,21 @@ export function whyNotClaimed(statusBody, task) {
   return at === '-' ? sentence : `${sentence}；预计 ${at} 恢复`;
 }
 
+/**
+ * 「跟进」按钮（#68）的显示判定：详情页对已成功、PR 还开着的任务显示按钮，点了走
+ * POST /api/tasks/:id/follow（判定在服务端的 followTask，这里只决定要不要露出入口）。
+ * 同时满足才显示：
+ * - status === 'succeeded'；
+ * - prUrl 是字符串且 http(s) 开头（与 PR 链接同一条件；javascript: 之类不算）；
+ * - prOutcome 不是 'merged' 也不是 'closed'（'open' / null / 缺字段 / 空串 / 大写都算还开着）。
+ * 纯函数：不碰 DOM、不发请求、不改入参。
+ */
+export function canFollow(task) {
+  if (task?.status !== 'succeeded') return false;
+  if (typeof task.prUrl !== 'string' || !/^https?:\/\//i.test(task.prUrl)) return false;
+  return task.prOutcome !== 'merged' && task.prOutcome !== 'closed';
+}
+
 // ---------------------------------------------------------------- 页面装配
 
 /**
@@ -175,10 +190,13 @@ export function createPage(options = {}) {
   cancelBtn.textContent = '取消';
   const retryBtn = doc.createElement('button');
   retryBtn.textContent = '重试';
+  const followBtn = doc.createElement('button');
+  followBtn.textContent = '跟进';
   const actionMsg = doc.createElement('span');
   actionMsg.className = 'action-msg';
   actions.appendChild(cancelBtn);
   actions.appendChild(retryBtn);
+  actions.appendChild(followBtn);
   actions.appendChild(actionMsg);
   taskHead.appendChild(headTitle);
   taskHead.appendChild(headBadge);
@@ -274,6 +292,9 @@ export function createPage(options = {}) {
   retryBtn.addEventListener('click', () => {
     page.busy = runAction(retryBtn, `/api/tasks/${state.id}/retry`);
   });
+  followBtn.addEventListener('click', () => {
+    page.busy = runFollow();
+  });
 
   // ---- 数据加载 ----
 
@@ -340,6 +361,59 @@ export function createPage(options = {}) {
     } finally {
       btn.disabled = false;
     }
+  }
+
+  /**
+   * 「跟进」（#68）：POST /api/tasks/:id/follow，body 为 {}（api() 自带 JSON
+   * Content-Type）。手动操作，与命令行 follow <id> 一样不挑高峰；判定全在服务端的
+   * followTask。按钮不因点击或成功而消失——doRefresh 重画后父任务仍成功、PR 仍开着
+   * 就继续在（renderInfo 按 canFollow 决定显示）。结果写在 actionMsg（与取消 / 重试
+   * 失败同一处）：
+   * - 201：先 doRefresh 再写「已入队 #<id>，在分支 <branch> 上改」——必须刷新后写，
+   *   免得句子被后续重画清掉；#<id> 链到站内详情页 /task.html?id=<id>（id 必须是安全
+   *   整数才做成链接，绝不链到 GitHub），前后两段文字用单独元素的 textContent。
+   * - 200：followTask 的 message 原文（不要再包一句）。
+   * - 非 2xx：api() 抛出的 error 文本。
+   */
+  async function runFollow() {
+    followBtn.disabled = true;
+    actionMsg.textContent = '';
+    try {
+      const result = await api(`/api/tasks/${state.id}/follow`, { method: 'POST', body: {} });
+      await doRefresh();
+      if (result?.kind === 'created') {
+        renderFollowCreated(result);
+      } else if (result?.kind === 'skipped') {
+        actionMsg.textContent = result.message; // 「PR 已合并」「没有待处理的修改请求」等原句
+      }
+    } catch (err) {
+      actionMsg.textContent = err?.message ?? String(err);
+    } finally {
+      followBtn.disabled = false;
+    }
+  }
+
+  /** 201 的成功提示：三个子节点（文字 span → 站内链接 → 文字 span），全部 textContent /
+   * setAttribute，branch 里就算有 < 也只是文本。 */
+  function renderFollowCreated({ id, branch }) {
+    actionMsg.textContent = '';
+    const lead = doc.createElement('span');
+    lead.textContent = '已入队 ';
+    actionMsg.appendChild(lead);
+    const idText = `#${id}`;
+    if (Number.isSafeInteger(id)) {
+      const link = doc.createElement('a');
+      link.setAttribute('href', `/task.html?id=${id}`); // 只链站内详情页
+      link.textContent = idText;
+      actionMsg.appendChild(link);
+    } else {
+      const span = doc.createElement('span');
+      span.textContent = idText; // 非安全整数：只做文本，不进 href
+      actionMsg.appendChild(span);
+    }
+    const tail = doc.createElement('span');
+    tail.textContent = `，在分支 ${branch} 上改`;
+    actionMsg.appendChild(tail);
   }
 
   /** 选中一次运行：清空日志区，运行中开 SSE 直播，已结束直接取日志全文。 */
@@ -512,6 +586,8 @@ export function createPage(options = {}) {
     headBadge.textContent = statusLabel(task.status);
     cancelBtn.style.display = task.status === 'queued' || task.status === 'running' ? '' : 'none';
     retryBtn.style.display = task.status === 'failed' || task.status === 'canceled' ? '' : 'none';
+    // 「跟进」（#68）：与取消 / 重试同一手法——不满足时 display 'none'，元素留在骨架里。
+    followBtn.style.display = canFollow(task) ? '' : 'none';
 
     fields.textContent = '';
     const addText = (label, value) => {
@@ -751,7 +827,7 @@ export function createPage(options = {}) {
   const page = {
     /** 关键节点，测试断言用；页面逻辑不该依赖从这里读。 */
     refs: {
-      root, app, fields, promptFold, promptBody, cancelBtn, retryBtn, actionMsg,
+      root, app, fields, promptFold, promptBody, cancelBtn, retryBtn, followBtn, actionMsg,
       runsTBody, logLabel, logView, rawBtn, simpleBtn, rawLogLink, jumpBtn, headBadge,
     },
     /** 最近一次异步操作（refresh / 选运行 / 取消重试）的 Promise，测试等待用。 */
