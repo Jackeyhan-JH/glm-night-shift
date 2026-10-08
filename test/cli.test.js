@@ -354,9 +354,18 @@ test('show 展示运行记录（尝试次数/模型/状态/耗时/额度/日志�
   for (const column of ['尝试次数', '模型', '状态', '耗时', '额度', '日志路径']) {
     assert.ok(res.stdout.includes(column), `运行记录表头缺「${column}」`);
   }
+  // #104：详情页已有的五个新列表头
+  for (const column of ['思考强度', '高峰', '开始时间', '轮数', '错误']) {
+    assert.ok(res.stdout.includes(column), `运行记录表头缺「${column}」`);
+  }
   assert.ok(res.stdout.includes('glm-5.3'));
   assert.ok(res.stdout.includes('succeeded'));
   assert.ok(res.stdout.includes('2')); // 额度 quotaUnits
+  // #104 新列的格子：effort high、peak false → 否；轮数 3 不只靠额度的 2 来佐证
+  assert.ok(res.stdout.includes('high'));
+  assert.ok(res.stdout.includes('否'));
+  const runLine = res.stdout.split('\n').find((l) => l.includes('/tmp/logs/task-1-run-1.log'));
+  assert.ok(runLine && runLine.includes('3'), `运行行应含轮数 3：${runLine}`);
   assert.ok(res.stdout.includes('/tmp/logs/task-1-run-1.log'));
 
   const json = await spawnCli(t, ['show', '1', '--json'], { cwd: home });
