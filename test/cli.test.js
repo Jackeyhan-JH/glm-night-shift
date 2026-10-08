@@ -381,6 +381,201 @@ test('show 展示运行记录（尝试次数/模型/状态/耗时/额度/日志�
   assert.ok(typeof run.startedAt === 'string' && typeof run.finishedAt === 'string');
 });
 
+// —— #75：list 的状态列 / show 的字段行补上 PR 结果、指定分支、暂不开始 ——
+// prOutcome 没有公开 setter（调度器查完 PR 才写），测试里直接 UPDATE 库模拟。
+
+test('验收: list 状态列在 succeeded 后标注「（已合并）」「（已关闭）」（全角括号）', async (t) => {
+  const home = makeTempHome(t);
+  const { openDb } = await import('../src/db.js');
+  const { createTask, claimNextTask, finishTask } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    for (const [id, outcome] of [[1, 'merged'], [2, 'closed']]) {
+      const task = createTask(db, { repo: 'a/b', prompt: 'x', title: `任务${id}` });
+      claimNextTask(db); // 队里最新的排队任务就是刚建的这条
+      finishTask(db, task.id, { status: 'succeeded', prUrl: `https://example.test/pr/${task.id}` });
+      db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run(outcome, task.id);
+    }
+    db.close();
+  }
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  const lines = res.stdout.trimEnd().split('\n');
+  assert.equal(lines.length, 3, '表头 + 两行数据');
+  // 完整字符串断言：状态单元格是「succeeded（已合并）」这整体，不是 succeeded 后随便拼字
+  assert.ok(lines.find((l) => l.includes('任务1')).includes('succeeded（已合并）'),
+    `任务 1 的状态列应是 succeeded（已合并）：${lines.find((l) => l.includes('任务1'))}`);
+  assert.ok(lines.find((l) => l.includes('任务2')).includes('succeeded（已关闭）'),
+    `任务 2 的状态列应是 succeeded（已关闭）：${lines.find((l) => l.includes('任务2'))}`);
+});
+
+test('验收: list 状态列：prOutcome 是 open / 大小写不同 / 没写时仍是光秃秃的 succeeded', async (t) => {
+  const home = makeTempHome(t);
+  const { openDb } = await import('../src/db.js');
+  const { createTask, claimNextTask, finishTask } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    // open、'MERGED'（大小写不同）、null（完全不写 pr_outcome）三种都不该出标注
+    for (const outcome of ['open', 'MERGED', null]) {
+      const task = createTask(db, { repo: 'a/b', prompt: 'x', title: '普通成功' });
+      claimNextTask(db);
+      finishTask(db, task.id, { status: 'succeeded', prUrl: `https://example.test/pr/${task.id}` });
+      if (outcome !== null) {
+        db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run(outcome, task.id);
+      }
+    }
+    db.close();
+  }
+  const res = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  const rows = res.stdout.trimEnd().split('\n').slice(1);
+  assert.equal(rows.length, 3);
+  for (const line of rows) {
+    assert.ok(line.includes(' succeeded '), `状态列应仍是 succeeded：${line}`);
+  }
+  assert.ok(!res.stdout.includes('已合并'), 'open / 大小写不同 / 空都不该出「已合并」');
+  assert.ok(!res.stdout.includes('已关闭'), '也不该出「已关闭」');
+});
+
+test('验收: list 状态列：排队等依赖的任务不吃 PR 结果标注', async (t) => {
+  const home = makeTempHome(t);
+  const { openDb } = await import('../src/db.js');
+  const { createTask, setDependencies } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    createTask(db, { repo: 'a/b', prompt: '上游' }); // 仍是 queued（未 succeeded）
+    createTask(db, { repo: 'a/b', prompt: '下游' });
+    setDependencies(db, 2, [1]); // 任务 2 被任务 1 挡住
+    db.close();
+  }
+  const before = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(before.code, 0, before.stderr);
+  const blockedRow = (out) => out.trimEnd().split('\n').find((l) => l.startsWith('2 '));
+  assert.ok(blockedRow(before.stdout).includes('queued（等 #1）'),
+    `状态列应是 queued（等 #1）：${blockedRow(before.stdout)}`);
+
+  // 即使这条任务上有 PR 结论，也仍是排队等依赖的显示
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run('merged', 2);
+    db.close();
+  }
+  const after = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(after.code, 0, after.stderr);
+  assert.ok(blockedRow(after.stdout).includes('queued（等 #1）'),
+    `prOutcome=merged 也该还是 queued（等 #1）：${blockedRow(after.stdout)}`);
+  assert.ok(!after.stdout.includes('已合并'), '排队等依赖的任务不该带 PR 结果标注');
+});
+
+test('验收: show 补上指定分支 / PR 结果 / 暂不开始三行（有值才出，都在 PR 行之后）', async (t) => {
+  const home = makeTempHome(t);
+  const { openDb } = await import('../src/db.js');
+  const { createTask, claimNextTask, finishTask } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    const task = createTask(db, { repo: 'a/b', prompt: '跟进上游', gitRef: 'night-shift/1-demo' });
+    claimNextTask(db);
+    // 限流退避的放回：排回队列并写 notBefore（spawnCli 固定 TZ=UTC → 显示 2026-10-08 18:30）
+    finishTask(db, task.id, {
+      status: 'queued', notBefore: '2026-10-08T18:30:00.000Z', refundAttempt: true,
+    });
+    db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run('merged', task.id);
+    db.close();
+  }
+  const res = await spawnCli(t, ['show', '1'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  const lines = res.stdout.split('\n');
+  const lineOf = (prefix, what) => {
+    const line = lines.find((l) => l.startsWith(prefix));
+    assert.ok(line !== undefined, `应有一行以「${prefix}」开头（${what}）`);
+    return line;
+  };
+  // 「PR」行本身保持原样（这条任务没有 prUrl → （无））；三行新字段按固定顺序跟在它后面
+  const prLine = lineOf('PR', 'PR 行');
+  assert.ok(!prLine.startsWith('PR 结果'), `找的应是「PR」行而不是「PR 结果」行：${prLine}`);
+  assert.ok(/^PR\s+（无）$/.test(prLine), `没有 prUrl 时 PR 行显示（无）：${prLine}`);
+  const gitRefLine = lineOf('指定分支', 'gitRef');
+  const outcomeLine = lineOf('PR 结果', 'PR 结果');
+  const notBeforeLine = lineOf('暂不开始', 'notBefore');
+  const errorLine = lineOf('最近错误', '最近错误');
+  const pos = (prefix) => lines.findIndex((l) => l.startsWith(prefix));
+  assert.ok(pos('PR') < pos('指定分支'), '指定分支在 PR 行之后');
+  assert.ok(pos('指定分支') < pos('PR 结果'), 'PR 结果在指定分支之后');
+  assert.ok(pos('PR 结果') < pos('暂不开始'), '暂不开始在 PR 结果之后');
+  assert.ok(pos('暂不开始') < pos('最近错误'), '三行插在 PR 与最近错误之间');
+  // 值在同一视觉行、且就是行尾（标签对齐后两个空格接值，后面没有别的字）
+  assert.ok(/night-shift\/1-demo\s*$/.test(gitRefLine), `gitRef 原样输出：${gitRefLine}`);
+  assert.ok(/已合并\s*$/.test(outcomeLine), `PR 结果的值是已合并：${outcomeLine}`);
+  assert.ok(/2026-10-08 18:30\s*$/.test(notBeforeLine), `notBefore 按 UTC 显示：${notBeforeLine}`);
+  // 与「创建时间」同一套 formatLocalMinute（YYYY-MM-DD HH:mm）和同一套 padEndDisplay 对齐
+  const createdLine = lineOf('创建时间', '创建时间');
+  assert.match(createdLine, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  const valueCol = (line, label) =>
+    displayWidth(label) + line.slice(label.length).match(/^ */)[0].length;
+  for (const [label, line] of [['指定分支', gitRefLine], ['PR 结果', outcomeLine], ['暂不开始', notBeforeLine]]) {
+    assert.equal(valueCol(line, label), valueCol(createdLine, '创建时间'),
+      `「${label}」的值应与「创建时间」的值对齐（进同一套 fields / padEndDisplay）`);
+  }
+});
+
+test('验收: show 普通任务（add 出来的）不出现指定分支 / PR 结果 / 暂不开始', async (t) => {
+  const home = makeTempHome(t);
+  await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: home });
+  const res = await spawnCli(t, ['show', '1'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  for (const label of ['指定分支', 'PR 结果', '暂不开始']) {
+    assert.ok(!res.stdout.includes(label), `没有值就不该出现「${label}」：\n${res.stdout}`);
+  }
+  assert.ok(/^PR\s+（无）$/m.test(res.stdout), '「PR」行本身保持原样（（无））');
+});
+
+test('验收: --json 形状不变：status 是裸状态串，prOutcome 原样，不掺人类可读装饰', async (t) => {
+  const home = makeTempHome(t);
+  const { openDb } = await import('../src/db.js');
+  const { createTask, claimNextTask, finishTask } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    const task = createTask(db, { repo: 'a/b', prompt: 'x', title: '带结论的任务' });
+    claimNextTask(db);
+    finishTask(db, task.id, { status: 'succeeded', prUrl: 'https://example.test/pr/1' });
+    db.prepare('UPDATE tasks SET pr_outcome = ? WHERE id = ?').run('merged', task.id);
+    db.close();
+  }
+  const listJson = await spawnCli(t, ['list', '--json'], { cwd: home });
+  assert.equal(listJson.code, 0, listJson.stderr);
+  const [task] = JSON.parse(listJson.stdout);
+  assert.equal(task.status, 'succeeded', 'status 仍是字符串 succeeded，不是 succeeded（已合并）');
+  assert.equal(task.prOutcome, 'merged');
+
+  const showJson = await spawnCli(t, ['show', '1', '--json'], { cwd: home });
+  assert.equal(showJson.code, 0, showJson.stderr);
+  const detail = JSON.parse(showJson.stdout);
+  assert.equal(detail.status, 'succeeded', 'show --json 顶层 status 同样是裸状态串');
+  assert.equal(detail.prOutcome, 'merged');
+  assert.ok(Array.isArray(detail.runs));
+  for (const deco of ['已合并', '已关闭', '指定分支', 'PR 结果', '暂不开始']) {
+    assert.ok(!showJson.stdout.includes(deco) && !listJson.stdout.includes(deco),
+      `JSON 输出不掺人类可读装饰「${deco}」`);
+  }
+
+  // 普通任务的 show --json：改前就有的键都在，也没有新造的键（本来就不该加）
+  const plainHome = makeTempHome(t);
+  await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: plainHome });
+  const plainJson = await spawnCli(t, ['show', '1', '--json'], { cwd: plainHome });
+  const plain = JSON.parse(plainJson.stdout);
+  for (const key of ['id', 'status', 'repo', 'title', 'prompt', 'gitRef', 'prOutcome',
+    'notBefore', 'prUrl', 'branch', 'runs', 'dependsOn', 'blockedBy']) {
+    assert.ok(key in plain, `改前就有的键 ${key} 应仍在`);
+  }
+  const knownKeys = new Set(['id', 'repo', 'source', 'gitRef', 'title', 'prompt', 'difficulty',
+    'priority', 'testCommand', 'allowPeak', 'status', 'attempts', 'maxAttempts', 'branch',
+    'prUrl', 'prOutcome', 'lastError', 'notBefore', 'createdAt', 'updatedAt', 'startedAt',
+    'finishedAt', 'dependsOn', 'blockedBy', 'runs']);
+  for (const key of Object.keys(plain)) {
+    assert.ok(knownKeys.has(key), `不该出现新造的键：${key}`);
+  }
+});
+
 test('cancel 已是终态的任务：退出 1（非法状态转换，中文原因）', async (t) => {
   const home = makeTempHome(t);
   await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: home });
