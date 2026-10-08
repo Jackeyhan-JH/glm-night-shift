@@ -4,7 +4,8 @@
 // 仓库筛选与「从 GitHub 导入 / 清理磁盘」两个面板的纯函数（选项、过滤、请求体、结果
 // 文案）；#62 增加队列行的 PR 结果标签（已合并 / 已关闭）判定；#74 增加状态条的
 // 「为什么还没领」一句与排队行的「等这个仓库」判定（retryAt 的格式化引 ./common.js
-// 的 fmtTime）。全部是无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器
+// 的 fmtTime）；#76 导入请求体带上表单选的 issue 状态（open / closed / all，没给
+// 就不发键）。全部是无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器
 // 环境，node:test 直接单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js /
 // test/board-import.test.js）；DOM 与网络逻辑在 queue.js。
 import { fmtTime } from './common.js';
@@ -323,9 +324,14 @@ export function filterTasksByRepo(tasks, selected) {
 
 /**
  * 导入面板的原始输入 → POST /api/import 的请求体（#50）。预览与确认是同一组
- * repo / label / difficulty，只有 dryRun 不同（预览 true 不落库，确认 false 真正入队）。
- * 文本 trim；空标签不进请求体（= gh 参数里不带 --label，与命令行缺省一致）。
- * @param {object} form { repo, label, difficulty }（queue.js 从 DOM 收集，值多为字符串）
+ * repo / label / difficulty / state，只有 dryRun 不同（预览 true 不落库，确认 false
+ * 真正入队）。文本 trim；空标签不进请求体（= gh 参数里不带 --label，与命令行缺省
+ * 一致）。
+ * #76：issue 状态（表单的「状态」下拉）只在严格全等 'open' / 'closed' / 'all' 时才
+ * 带上——不 trim、不折叠大小写（' open ' / 'OPEN' 都不算给了）。表单没给状态字段
+ * （undefined / null / 缺键 / 空串 / 其他值）就不发这个键，交给服务端按未关闭处理，
+ * 不在这里替调用方默认成 open（页面的 select 永远有值，缺省项自己会提交 open）。
+ * @param {object} form { repo, label, difficulty, state }（queue.js 从 DOM 收集，值多为字符串）
  * @param {boolean} dryRun
  * @returns {object} 请求体
  */
@@ -334,6 +340,9 @@ export function importBody(form, dryRun) {
   const label = String(form.label ?? '').trim();
   if (label !== '') body.label = label;
   body.difficulty = String(form.difficulty ?? '').trim() || 'medium';
+  if (form.state === 'open' || form.state === 'closed' || form.state === 'all') {
+    body.state = form.state;
+  }
   body.dryRun = dryRun === true;
   return body;
 }

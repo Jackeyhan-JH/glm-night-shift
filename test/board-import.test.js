@@ -204,6 +204,10 @@ test('验收: 队列页「预览 → 确认导入」：预览体 dryRun 为 true
   assert.equal(confirmBody.repo, previewBody.repo);
   assert.equal(previewBody.repo, 'a/b');
   assert.equal('label' in previewBody, false, '空标签不进请求体（gh 参数里不带 --label）');
+  // 这条测试的 form 故意不带 state 字段：表单没给状态时请求体就不该有 state 键
+  // （改成带 state: 'open' 就测不到「没给就不加键」了，别改）
+  assert.equal('state' in previewBody, false, '表单没给状态字段时请求体没有 state 键');
+  assert.equal('state' in confirmBody, false);
   assert.equal(importPreviewText({ added: [{}, {}], skipped: [{}] }), '将新增 2 个，跳过 1 个');
 
   // 与页面相同的两次 POST 打到真实服务上
@@ -223,6 +227,63 @@ test('验收: 队列页「预览 → 确认导入」：预览体 dryRun 为 true
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].status, 'queued');
   assert.equal(tasks[0].source, 'github:a/b#9');
+});
+
+// ---------------------------------------------------------------- 导入面板选 issue 状态（#76）
+
+test('验收: 不改选择（缺省第一项 state: open）时，预览与确认的请求体都带 state=open，dryRun 各自正确，repo 相同', () => {
+  // 页面的 select 永远有值，缺省第一项是 open——importFormValues 收上来就是这样
+  const form = { repo: 'a/b', label: '', difficulty: 'medium', state: 'open' };
+  const previewBody = importBody(form, true);
+  const confirmBody = importBody(form, false);
+  assert.equal(previewBody.state, 'open');
+  assert.equal(confirmBody.state, 'open');
+  assert.equal(previewBody.dryRun, true, '预览 dryRun 由第二参数决定');
+  assert.equal(confirmBody.dryRun, false, '确认导入 dryRun=false');
+  assert.equal(confirmBody.repo, previewBody.repo);
+  assert.equal(confirmBody.state, previewBody.state, '预览与确认带同一个状态');
+});
+
+test('验收: state 选「已关闭 / 全部」→ 请求体 state 是 closed / all；dryRun 仍由第二个参数决定，不被 state 带跑', () => {
+  const closed = importBody({ repo: 'a/b', label: '', difficulty: 'medium', state: 'closed' }, true);
+  assert.equal(closed.state, 'closed');
+  assert.equal(closed.dryRun, true);
+  const all = importBody({ repo: 'a/b', label: '', difficulty: 'medium', state: 'all' }, false);
+  assert.equal(all.state, 'all');
+  assert.equal(all.dryRun, false);
+});
+
+test('验收: 表单没给状态字段 → 请求体没有 state 键（缺字段 / undefined / null / 空串 / OPEN / Open / 带空格都不算给了）', () => {
+  assert.equal('state' in importBody({ repo: 'a/b', label: '', difficulty: 'medium' }, true), false,
+    'form 上没有 state 这个键时不发 state（服务端自己按未关闭处理）');
+  // 不 trim、不折叠大小写：不是这三个全等值就当没给，一个键都不加
+  for (const state of [undefined, null, '', 'OPEN', 'Open', ' open ', 'opened']) {
+    const body = importBody({ repo: 'a/b', label: '', difficulty: 'medium', state }, false);
+    assert.equal('state' in body, false, `state=${JSON.stringify(state)} 不该进请求体`);
+  }
+});
+
+test('验收: importBody 不修改入参对象', () => {
+  const form = { repo: ' a/b ', label: ' bug ', difficulty: '  ', state: 'open' };
+  importBody(form, true);
+  assert.deepEqual(form, { repo: ' a/b ', label: ' bug ', difficulty: '  ', state: 'open' });
+});
+
+test('验收: 导入面板 HTML 有「状态」选择：id=i-state，选项 open/closed/all 依次、open 带 selected，文案「未关闭 / 已关闭 / 全部」', () => {
+  const html = fs.readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
+  const panel = html.match(/<form id="import-panel"[\s\S]*?<\/form>/);
+  assert.ok(panel !== null, '#import-panel 表单存在');
+  assert.ok(panel[0].includes('id="i-state"'), '状态选择要有 id="i-state"');
+  assert.ok(panel[0].includes('>状态</span>'), '字段标签是「状态」');
+  const select = panel[0].match(/<select name="state" id="i-state">[\s\S]*?<\/select>/);
+  assert.ok(select !== null, '用 <select name="state" id="i-state">');
+  const options = [...select[0].matchAll(/<option\b([^>]*)>([^<]*)<\/option>/g)];
+  assert.equal(options.length, 3, '只有三个选项');
+  assert.deepEqual(options.map((m) => /value="([^"]*)"/.exec(m[1])?.[1]), ['open', 'closed', 'all'],
+    'value 依次是 open、closed、all');
+  assert.deepEqual(options.map((m) => m[1].includes('selected')), [true, false, false],
+    '缺省选中第一项 open，其余不选');
+  assert.deepEqual(options.map((m) => m[2].trim()), ['未关闭', '已关闭', '全部']);
 });
 
 // ---------------------------------------------------------------- POST /api/cleanup
