@@ -288,6 +288,8 @@ function readBody(req) {
     });
     req.on('end', () => finish({ text: Buffer.concat(chunks).toString('utf8') }));
     req.on('error', () => finish({ text: '' })); // 连接中断：当空体处理，后续解析自然报 400
+    // 客户端中途断开不一定触发 error：close 兜底（正常流程里它在 end 之后，finish 幂等）
+    req.on('close', () => finish({ text: '' }));
   });
 }
 
@@ -440,7 +442,21 @@ function handleStream({ req, res }, deps, bumpSse, runId) {
 
   // 先建定时器、再跑第一次 poll：连接时运行就已结束的话 poll → finishStream → cleanup
   // 会清掉这两个定时器；顺序反了（poll 先行）会漏掉尚未赋值的定时器句柄，泄漏到进程结束。
-  pollTimer = setInterval(poll, SSE_POLL_MS);
+  // safePoll 兜底：停机时 db 可能先于本连接被关闭（closeAllConnections 的 close 事件
+  // 是异步的），轮询打到已关闭的库会抛错——吞掉并安静收流，不能让 interval 回调把进程打崩。
+  const safePoll = () => {
+    try {
+      poll();
+    } catch {
+      try {
+        cleanup();
+        res.end();
+      } catch {
+        // 响应也已不可写：到此为止
+      }
+    }
+  };
+  pollTimer = setInterval(safePoll, SSE_POLL_MS);
   pingTimer = setInterval(() => {
     if (!closed) res.write(': ping\n\n');
   }, SSE_PING_MS);

@@ -150,6 +150,38 @@ test('serve-api 创建数据库与子目录，SIGINT 也正常退出 0，首页�
   assert.equal(closed.code, 0, `SIGINT 后应退出 0（stderr：${child.__stderr()}）`);
 });
 
+test('serve-api 有活跃 SSE 连接时 SIGTERM 也退出 0（不崩、不悬挂）', async (t) => {
+  const home = makeTempHome(t);
+  const { child, base, exit } = spawnServe(t, ['serve-api', '--port', '0'], home);
+  const url = await base;
+
+  // 从测试进程往同一个文件库写 run + 日志（WAL 支持多进程读写），让看板有一条活跃的 SSE 流
+  const { openDb } = await import('../src/db.js');
+  const { createTask, startRun } = await import('../src/tasks.js');
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const task = createTask(db, { repo: 'a/b', prompt: 'x' });
+  const logPath = path.join(home, 'logs', 'run-1.log');
+  fs.writeFileSync(logPath, '活跃连接里的一行\n');
+  const run = startRun(db, {
+    taskId: task.id, attempt: 1, model: 'glm-5.3', effort: 'low', peak: false, logPath,
+  });
+  db.close();
+
+  const controller = new AbortController();
+  const res = await fetch(`${url}/api/runs/${run.id}/stream`, { signal: controller.signal });
+  const reader = res.body.getReader();
+  const first = await reader.read();
+  assert.ok(new TextDecoder().decode(first.value).includes('活跃连接里的一行'), '应先收到重放行');
+
+  child.kill('SIGTERM');
+  const closed = await Promise.race([
+    exit,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('SIGTERM 后 5 秒未退出')), 5000)),
+  ]);
+  assert.equal(closed.code, 0, `带活跃 SSE 连接停机应退出 0（stderr：${child.__stderr()}）`);
+  controller.abort();
+});
+
 test('serve-api 不给 --port 时用配置端口（config.json 里的 port）', async (t) => {
   const home = makeTempHome(t);
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ port: 0 })); // 配置 0 = 随机
