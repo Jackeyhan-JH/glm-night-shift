@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 假 gh：模拟测试里用到的 `gh pr create`、`gh pr list` 和 `gh repo view`，绝不联网。
+// 假 gh：模拟测试里用到的 `gh pr create`、`gh pr list`、`gh repo view` 和 `gh issue view`，绝不联网。
 // 行为由环境变量控制：
 //   FAKE_GH_LOG            若设置，把 argv 作为一行 JSON 追加到该文件
 //   FAKE_GH_PR_NUMBER      pr create 输出的 PR 编号（默认 1）
@@ -9,9 +9,12 @@
 //   FAKE_GH_EXISTING_PR_URL pr list 输出里的 open PR 地址；未设置时输出空数组 []
 //   FAKE_GH_BODY_COPY      pr create 时把 --body-file 指向的文件内容复制到该路径
 //                          （临时正文文件用完就删，测试靠它检查 PR 正文；FAIL=1 时不复制）
+//   FAKE_GH_ISSUE_FILE     issue view 输出该 JSON 文件的内容（原样，优先级最高）
+//   FAKE_GH_ISSUE_JSON     issue view 输出该 JSON 字符串
+//   FAKE_GH_ISSUE_FAIL=1   issue view 报 GraphQL 错误退出 1（优先于上面两个）
 // 重要：不带任何参数被调用时（例如被 `node --test` 误当测试文件执行）静默退出 0，
 // 且 FAKE_GH_LOG 未设置时不写任何文件。
-import { appendFileSync, copyFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -85,6 +88,43 @@ function flagValue(args, name) {
   return null;
 }
 
+// `issue view <n> [--repo <r>] --json title,body`：stdout 输出 issue 的 JSON。
+// 内容优先取 FAKE_GH_ISSUE_FILE（文件内容原样输出），其次 FAKE_GH_ISSUE_JSON，
+// 都没有时输出 {"title":"Fake issue #<n>","body":"Fake body of <r>#<n>}（r 取
+// --repo 参数，兜底 FAKE_GH_REPO / fake-owner/fake-repo）。FAKE_GH_ISSUE_FAIL=1
+// 时 stderr 输出 GraphQL 解析错误并退出 1。
+function issueView(args) {
+  // 编号是 view 后第一个不以 - 开头的参数；--repo/-R 的值跳过，支持 flag 在前在后。
+  let number = '1';
+  for (let i = 2; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--repo' || arg === '-R') {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('-')) continue;
+    number = arg;
+    break;
+  }
+  if (process.env.FAKE_GH_ISSUE_FAIL === '1') {
+    process.stderr.write(`GraphQL: Could not resolve to an issue or pull request with the number of ${number}.\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const file = process.env.FAKE_GH_ISSUE_FILE;
+  if (file) {
+    process.stdout.write(readFileSync(file, 'utf8')); // 原样输出，不补换行
+    return;
+  }
+  const json = process.env.FAKE_GH_ISSUE_JSON;
+  if (json) {
+    process.stdout.write(`${json}\n`);
+    return;
+  }
+  const repo = repoFromArgs(args) || process.env.FAKE_GH_REPO || 'fake-owner/fake-repo';
+  process.stdout.write(`${JSON.stringify({ title: `Fake issue #${number}`, body: `Fake body of ${repo}#${number}` })}\n`);
+}
+
 function main() {
   writeLog();
   const sub = argv[0];
@@ -118,6 +158,11 @@ function main() {
   if (sub === 'repo' && subSub === 'view') {
     const name = process.env.FAKE_GH_DEFAULT_BRANCH || 'main';
     process.stdout.write(`${JSON.stringify({ defaultBranchRef: { name } })}\n`);
+    return;
+  }
+
+  if (sub === 'issue' && subSub === 'view') {
+    issueView(argv);
     return;
   }
 

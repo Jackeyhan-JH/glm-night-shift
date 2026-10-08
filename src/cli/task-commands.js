@@ -1,10 +1,11 @@
-// add / list / show / cancel / retry 五个子命令（issue #5）。命令对象形状见
-// bin/night-shift.mjs 的 COMMANDS 表：{ summary, usage, run(args, ctx) }。
+// add / list / show / cancel / retry 五个子命令（issue #5）；add 的 --template 渲染
+// （issue #13）也在本文件。命令对象形状见 bin/night-shift.mjs 的 COMMANDS 表：
+// { summary, usage, run(args, ctx) }。
 //
 // ⚠️ 本文件（及其静态依赖）绝不能 import src/db.js：db.js 是唯一加载 node:sqlite
 // 的模块，静态引入会让入口来不及先装 SQLite 警告过滤（时机说明见 src/warnings.js，
 // 已在 Node 22.13 上实测）。openDb 一律走下面 withDb() 里的动态 import。
-// tasks.js / config.js / render.js 不碰 node:sqlite，静态引入没问题。
+// tasks.js / config.js / render.js / templates.js 不碰 node:sqlite，静态引入没问题。
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -20,6 +21,7 @@ import {
   listTasks,
   retryTask,
 } from '../tasks.js';
+import { loadTemplate, renderTemplate } from '../templates.js';
 import { renderTaskDetail, renderTasksTable } from './render.js';
 
 /** 多行用法里续行的缩进：对齐到「用法：night-shift 」之后的命令名。 */
@@ -109,12 +111,34 @@ function parseIdPositional(ctx, positionals, usage) {
   return Number(raw);
 }
 
+/**
+ * add 的 --var <名字=值>（可重复，multiple 收成数组）：拆成 { 名字: 值 }。
+ * 在第一个 = 处切分（值可再含 =）；没有 = 或名字为空是用法错误（退出码 2）。
+ * 名字是否真的存在于模板，由 renderTemplate 校验（运行时错误，退出码 1）。
+ */
+function parseTemplateVars(ctx, items) {
+  const vars = {};
+  for (const item of items ?? []) {
+    const eq = item.indexOf('=');
+    const name = eq === -1 ? '' : item.slice(0, eq).trim();
+    if (name === '') {
+      throw new ctx.UsageError(`--var 必须是「名字=值」形式（当前值：${item}）`, {
+        usage: addCommand.usage,
+      });
+    }
+    vars[name] = item.slice(eq + 1);
+  }
+  return vars;
+}
+
 export const addCommand = {
   summary: '添加任务到队列',
   usage: [
-    '用法：night-shift add --repo <owner/name> (--prompt <文字> | --prompt-file <路径>)',
-    `${USAGE_CONT}[--title <标题>] [--difficulty easy|medium|hard] [--priority <整数>]`,
-    `${USAGE_CONT}[--test "<测试命令>"] [--allow-peak] [--max-attempts <次数>] [--json]`,
+    '用法：night-shift add --repo <owner/name> (--prompt <文字> | --prompt-file <路径>',
+    `${USAGE_CONT}| --template <名字>)`,
+    `${USAGE_CONT}[--var <名字=值>] [--title <标题>] [--difficulty easy|medium|hard]`,
+    `${USAGE_CONT}[--priority <整数>] [--test "<测试命令>"] [--allow-peak]`,
+    `${USAGE_CONT}[--max-attempts <次数>] [--json]`,
   ].join('\n'),
   async run(args, ctx) {
     const { values } = parseArgs({
@@ -123,6 +147,8 @@ export const addCommand = {
         repo: { type: 'string' },
         prompt: { type: 'string' },
         'prompt-file': { type: 'string' },
+        template: { type: 'string' },
+        var: { type: 'string', multiple: true },
         title: { type: 'string' },
         difficulty: { type: 'string' },
         priority: { type: 'string' },
@@ -138,11 +164,23 @@ export const addCommand = {
     if (values.prompt !== undefined && values['prompt-file'] !== undefined) {
       throw new ctx.UsageError('--prompt 与 --prompt-file 只能二选一', { usage: addCommand.usage });
     }
-    if (values.prompt === undefined && values['prompt-file'] === undefined) {
-      throw new ctx.UsageError('缺少必填参数：--prompt <文字> 或 --prompt-file <路径>', {
+    if (values.template !== undefined
+        && (values.prompt !== undefined || values['prompt-file'] !== undefined)) {
+      throw new ctx.UsageError('--template 不能与 --prompt / --prompt-file 同时使用', {
         usage: addCommand.usage,
       });
     }
+    if (values.template === undefined && values.prompt === undefined
+        && values['prompt-file'] === undefined) {
+      throw new ctx.UsageError(
+        '缺少必填参数：--prompt <文字>、--prompt-file <路径> 或 --template <名字>',
+        { usage: addCommand.usage },
+      );
+    }
+    if (values.var !== undefined && values.template === undefined) {
+      throw new ctx.UsageError('--var 只能与 --template 一起使用', { usage: addCommand.usage });
+    }
+    const templateVars = parseTemplateVars(ctx, values.var);
     let difficulty;
     if (values.difficulty !== undefined) {
       // 枚举在 CLI 层判（用法错误，退出码 2）；repo 格式等留给 store 判（运行时错误，退出码 1）。
@@ -176,13 +214,32 @@ export const addCommand = {
     }
 
     const config = effectiveConfig(ctx);
+
+    // --template：渲染出 prompt 与各默认值（fetchIssue 时会 spawn gh，故 await）。
+    // 显式给出的 --title / --difficulty / --test 优先于模板默认值。渲染失败（缺变量、
+    // 拼错变量名、gh 报错……）在这里就抛出，走统一的「错误：…」退出码 1，不会建任务。
+    let title = values.title;
+    let testCommand = values.test;
+    if (values.template !== undefined) {
+      const template = loadTemplate(values.template, { home: resolveHome(ctx.env) });
+      const rendered = await renderTemplate(template, templateVars, {
+        repo: values.repo,
+        config,
+        env: ctx.env,
+      });
+      prompt = rendered.prompt;
+      if (title === undefined && rendered.title !== null) title = rendered.title;
+      if (difficulty === undefined && rendered.difficulty !== null) difficulty = rendered.difficulty;
+      if (testCommand === undefined && rendered.testCommand !== null) testCommand = rendered.testCommand;
+    }
+
     const task = await withDb(ctx, (db) => createTask(db, {
       repo: values.repo,
       prompt,
-      title: values.title, // 未给时 store 取 prompt 前 60 个码点
+      title, // 未给（模板也没有 title）时 store 取 prompt 前 60 个码点
       difficulty,
       priority,
-      testCommand: values.test,
+      testCommand,
       allowPeak: values['allow-peak'] ?? false,
       maxAttempts: maxAttempts ?? config.maxAttempts, // 缺省取配置 maxAttempts
     }));
