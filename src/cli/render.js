@@ -77,6 +77,11 @@ export function renderTaskDetail(task, runs, deps = []) {
     ['难度', task.difficulty],
     ['优先级', String(task.priority)],
     ['仓库', task.repo],
+  ];
+  // 来源（#39 import 的 github:<repo>#<编号>）：只有非空才加这行，手工 add 的任务
+  // 输出保持原样（不出现「来源（无）」之类的空行）。
+  if (task.source) fields.push(['来源', task.source]);
+  fields.push(
     ['允许高峰', task.allowPeak ? '是' : '否'],
     ['尝试次数', `${task.attempts}/${task.maxAttempts}`],
     ['测试命令', task.testCommand ?? '（未设置）'],
@@ -87,7 +92,7 @@ export function renderTaskDetail(task, runs, deps = []) {
     ['更新时间', formatLocalMinute(task.updatedAt)],
     ['开始时间', task.startedAt ? formatLocalMinute(task.startedAt) : '（未开始）'],
     ['完成时间', task.finishedAt ? formatLocalMinute(task.finishedAt) : '（未完成）'],
-  ];
+  );
   const labelWidth = Math.max(...fields.map(([label]) => displayWidth(label)));
   const lines = [
     `任务 #${task.id}：${singleLine(task.title)}`,

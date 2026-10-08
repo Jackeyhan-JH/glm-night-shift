@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// 假 gh：模拟测试里用到的 `gh pr create`、`gh pr list`、`gh repo view` 和 `gh issue view`，绝不联网。
+// 假 gh：模拟测试里用到的 `gh pr create`、`gh pr list`、`gh repo view`、`gh issue view`
+// 和 `gh issue list`，绝不联网。
 // 行为由环境变量控制：
 //   FAKE_GH_LOG            若设置，把 argv 作为一行 JSON 追加到该文件
 //   FAKE_GH_PR_NUMBER      pr create 输出的 PR 编号（默认 1）
@@ -12,6 +13,9 @@
 //   FAKE_GH_ISSUE_FILE     issue view 输出该 JSON 文件的内容（原样，优先级最高）
 //   FAKE_GH_ISSUE_JSON     issue view 输出该 JSON 字符串
 //   FAKE_GH_ISSUE_FAIL=1   issue view 报 GraphQL 错误退出 1（优先于上面两个）
+//   FAKE_GH_ISSUE_LIST_FAIL=1 issue list 报错退出 1（优先于下面两个；不影响 issue view）
+//   FAKE_GH_ISSUE_LIST_FILE  issue list 输出该文件的内容（原样，不补换行）
+//   FAKE_GH_ISSUE_LIST_JSON  issue list 输出该 JSON 字符串（原样，不补换行）
 // 重要：不带任何参数被调用时（例如被 `node --test` 误当测试文件执行）静默退出 0，
 // 且 FAKE_GH_LOG 未设置时不写任何文件。
 import { appendFileSync, copyFileSync, readFileSync } from 'node:fs';
@@ -125,6 +129,30 @@ function issueView(args) {
   process.stdout.write(`${JSON.stringify({ title: `Fake issue #${number}`, body: `Fake body of ${repo}#${number}` })}\n`);
 }
 
+// `issue list [--repo <r>] --state <s> --json number,title,body --limit <n>`（flag 顺序
+// 无关，只看子命令）：stdout 输出 issue 列表 JSON。FAKE_GH_ISSUE_LIST_FAIL=1 时 stderr
+// 一行错误并退出 1（优先级最高）；否则 FAKE_GH_ISSUE_LIST_FILE 的文件内容原样输出，
+// 其次 FAKE_GH_ISSUE_LIST_JSON 字符串原样输出（都不补换行）；都没有时输出 []。
+// 这些 *_LIST_* 变量不影响 issue view（view 只看 FAKE_GH_ISSUE_*）。
+function issueList() {
+  if (process.env.FAKE_GH_ISSUE_LIST_FAIL === '1') {
+    process.stderr.write('fake gh issue list failure (FAKE_GH_ISSUE_LIST_FAIL=1)\n');
+    process.exitCode = 1;
+    return;
+  }
+  const file = process.env.FAKE_GH_ISSUE_LIST_FILE;
+  if (file) {
+    process.stdout.write(readFileSync(file, 'utf8')); // 原样输出，不补换行
+    return;
+  }
+  const json = process.env.FAKE_GH_ISSUE_LIST_JSON;
+  if (json) {
+    process.stdout.write(json); // 原样输出，不补换行
+    return;
+  }
+  process.stdout.write('[]\n');
+}
+
 function main() {
   writeLog();
   const sub = argv[0];
@@ -163,6 +191,11 @@ function main() {
 
   if (sub === 'issue' && subSub === 'view') {
     issueView(argv);
+    return;
+  }
+
+  if (sub === 'issue' && subSub === 'list') {
+    issueList();
     return;
   }
 

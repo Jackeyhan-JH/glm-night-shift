@@ -101,6 +101,8 @@ export class DependencyBlockedError extends InvalidTransitionError {
  * @typedef {object} TaskRow 对外返回的任务对象（驼峰字段，布尔是真布尔，NULL 保持 null）。
  * @property {number} id
  * @property {string} repo `owner/name`
+ * @property {?string} source 来源标识（#39）：import 建的任务是 `github:<repo>#<编号>`，
+ *   手工 add 的为 null
  * @property {string} title
  * @property {string} prompt
  * @property {('easy'|'medium'|'hard')} difficulty
@@ -157,6 +159,8 @@ export class DependencyBlockedError extends InvalidTransitionError {
  * @param {string} input.prompt 非空
  * @param {string} [input.title] 缺省（undefined/null）时取 prompt 前 60 个 Unicode 码点
  *   （按码点切，中文 / emoji 不会被切成半个）；给了则 trim 后必须非空
+ * @param {?string} [input.source=null] 来源标识（#39 的 import 用 `github:<repo>#<编号>`）；
+ *   null = 手工添加、无来源；给了则 trim 后必须非空
  * @param {('easy'|'medium'|'hard')} [input.difficulty='medium']
  * @param {number} [input.priority=0] 任意整数（越大越先被领取，负数合法）
  * @param {?string} [input.testCommand=null] null 或非空字符串
@@ -183,6 +187,7 @@ export function createTask(db, input = {}) {
     throw new ValidationError('priority', `必须是整数（当前值：${priority}）`);
   }
   const testCommand = optionalTrimmed(input.testCommand, 'testCommand');
+  const source = optionalTrimmed(input.source, 'source');
   const allowPeak = input.allowPeak ?? false;
   if (typeof allowPeak !== 'boolean') {
     throw new ValidationError('allowPeak', `必须是布尔值（当前值：${allowPeak}）`);
@@ -202,10 +207,10 @@ export function createTask(db, input = {}) {
   const row = inSavepoint(db, () => {
     const inserted = db.prepare(`
       INSERT INTO tasks (repo, title, prompt, difficulty, priority, test_command, allow_peak,
-                         status, attempts, max_attempts, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+                         status, attempts, max_attempts, source, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)
       RETURNING *
-    `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, now, now);
+    `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, source, now, now);
     insertTaskDeps(db, inserted.id, dependsOn);
     return inserted;
   });
@@ -223,6 +228,23 @@ export function getTask(db, id) {
   assertPositiveInt(id, 'id');
   const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
   return row === undefined ? null : hydrateTasks(db, [row])[0];
+}
+
+/**
+ * 按来源标识找已有任务（#39 的 import 去重用）：同 source 取 id 最小的一条，
+ * **任意状态都算**（queued / running / succeeded / failed / canceled）——已经为这个
+ * 来源建过任务就不再重复入队，不管它跑成什么样。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string} source 来源标识（如 `github:a/b#12`），trim 后必须非空
+ * @returns {?{id: number, status: string}} 没有同 source 的任务时 null
+ * @throws {ValidationError} source 不是非空字符串（field='source'）
+ */
+export function findTaskBySource(db, source) {
+  const theSource = requiredTrimmed(source, 'source');
+  const row = db.prepare(
+    'SELECT id, status FROM tasks WHERE source = ? ORDER BY id ASC LIMIT 1',
+  ).get(theSource);
+  return row === undefined ? null : { id: row.id, status: row.status };
 }
 
 /**
@@ -1051,6 +1073,7 @@ function rowToTask(row, dependsOn = [], blockedBy = []) {
   return {
     id: row.id,
     repo: row.repo,
+    source: row.source ?? null,
     title: row.title,
     prompt: row.prompt,
     difficulty: row.difficulty,

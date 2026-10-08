@@ -178,6 +178,15 @@ const MIGRATIONS = [
       ALTER TABLE runs ADD COLUMN diagnosis TEXT NULL;
     `);
   },
+  // 版本 5：tasks 加 source（issue #39 按 GitHub issue 批量入队）。来源标识（如
+  // `github:a/b#12`），可空：手工 add 的任务没有来源。idx_tasks_source 只是查找
+  // 索引、不 UNIQUE——import 遇到同一来源是跳过已有任务，重复本身不是错误。
+  (db) => {
+    db.exec(`
+      ALTER TABLE tasks ADD COLUMN source TEXT NULL;
+      CREATE INDEX idx_tasks_source ON tasks (source);
+    `);
+  },
 ];
 
 /**

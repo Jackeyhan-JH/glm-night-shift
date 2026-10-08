@@ -3,10 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { openDb, MIGRATIONS } from '../src/db.js';
 import {
   createTask, getTask, listTasks, claimNextTask, claimTaskById, finishTask, cancelTask, retryTask,
-  recoverStaleRunning, startRun, setRunLogPath, finishRun, listRuns,
+  recoverStaleRunning, startRun, setRunLogPath, finishRun, listRuns, findTaskBySource,
   ValidationError, NotFoundError, InvalidTransitionError,
 } from '../src/tasks.js';
 import { makeTempHome } from './helpers.js';
@@ -906,4 +907,61 @@ test('listRuns 组合过滤：taskId + since + limit 一起用，since 等于 st
   assert.deepEqual(listRuns(db, { since: '2026-01-02T12:00:00Z', limit: 1 }).map((r) => r.id), [a2.id]);
   assert.deepEqual(listRuns(db, { taskId: t1.id, limit: 1 }).map((r) => r.id), [a2.id]);
   assert.deepEqual(listRuns(db, { since: new Date('2026-01-04T00:00:00Z') }), []);
+});
+
+// ---------------------------------------------------------------- source（issue #39）
+
+test('升级路径：旧库（倒数第二步迁移、无 source 列）经 openDb 升级后 source 列存在、旧行 source 为 null', (t) => {
+  const file = path.join(makeTempHome(t), 'night-shift.db');
+  const old = new DatabaseSync(file);
+  // 迁移到倒数第二步：版本号用 slice 长度算，不写死数字
+  const previous = MIGRATIONS.slice(0, -1);
+  for (const migration of previous) migration(old);
+  old.exec(`PRAGMA user_version = ${previous.length}`);
+  const columnsBefore = old.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name);
+  assert.equal(columnsBefore.includes('source'), false, '升级前不应有 source 列');
+  old.prepare(`
+    INSERT INTO tasks (repo, title, prompt, max_attempts, created_at, updated_at)
+    VALUES ('a/b', '旧标题', '旧提示词', 2, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+  `).run();
+  old.close();
+
+  const db = openDb(file);
+  t.after(() => db.close());
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
+  const columns = db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name);
+  assert.ok(columns.includes('source'), '升级后应有 source 列');
+  const row = db.prepare('SELECT title, source FROM tasks WHERE id = 1').get();
+  assert.equal(row.title, '旧标题', '旧标题还在');
+  assert.equal(row.source, null, '旧行 source 为 null');
+  assert.equal(createTask(db, { ...VALID }).source, null, '不传 source 时新任务也是 null');
+});
+
+test('createTask 的 source：缺省 null、传入先 trim 入库、空串 / 纯空白抛 ValidationError', (t) => {
+  const db = openMemory(t);
+  assert.equal(createTask(db, { ...VALID, source: null }).source, null);
+  assert.equal(createTask(db, { ...VALID, source: '  github:a/b#12  ' }).source, 'github:a/b#12');
+  assert.throws(
+    () => createTask(db, { ...VALID, source: '   ' }),
+    (err) => err instanceof ValidationError && err.field === 'source',
+  );
+});
+
+test('findTaskBySource：同 source 取 id 最小的那条，任意状态都算；没有返回 null', (t) => {
+  const db = openMemory(t);
+  const source = 'github:a/b#12';
+  assert.equal(findTaskBySource(db, source), null);
+  const first = createTask(db, { ...VALID, source });
+  const second = createTask(db, { ...VALID, prompt: '再来一次', source });
+  assert.deepEqual(findTaskBySource(db, source), { id: first.id, status: 'queued' });
+  // 把两条都打成终态（claimTaskById → finishTask），查找仍然命中（含 id 最小规则）
+  claimTaskById(db, first.id);
+  claimTaskById(db, second.id);
+  finishTask(db, first.id, { status: 'failed' });
+  finishTask(db, second.id, { status: 'succeeded' });
+  assert.deepEqual(findTaskBySource(db, source), { id: first.id, status: 'failed' });
+  assert.throws(
+    () => findTaskBySource(db, '  '),
+    (err) => err instanceof ValidationError && err.field === 'source',
+  );
 });

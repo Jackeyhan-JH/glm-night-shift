@@ -14,6 +14,7 @@ import { installSqliteWarningFilter } from '../src/warnings.js';
 import {
   addCommand,
   cancelCommand,
+  importCommand,
   listCommand,
   retryCommand,
   showCommand,
@@ -53,6 +54,7 @@ const COMMANDS = {
   add: addCommand,
   list: listCommand,
   show: showCommand,
+  import: importCommand,
   cancel: cancelCommand,
   retry: retryCommand,
   start: startCommand,
