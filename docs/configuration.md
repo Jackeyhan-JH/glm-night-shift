@@ -371,8 +371,9 @@ prompt 也一样（渲染后压缩连续空行并 trim）。
 任务上，不会变成非零退出码。
 
 第一次 SIGINT（Ctrl-C）或第一次 SIGTERM 是优雅停止：不再领新任务，等运行中的任务收尾。
-第二次信号是强制停止，第二次也可以是 SIGTERM，不只是再按一次 Ctrl-C。帮助文案只写了
-「再按一次 Ctrl-C」，见 docs/inconsistencies.md。`serve` 在强制停止时还会掐掉剩余连接。
+第二次信号是强制停止，第二次也可以是 SIGTERM。`start` 的用法说明是「再来一次强制停止」。
+第一次停止、任务还在跑时，`start` 和 `serve` 的括号都是「再来一次 Ctrl-C 或 SIGTERM 强制停止」。
+`serve` 的用法说明仍是「再按一次强制停止」，没有改成「再来一次强制停止」。`serve` 在强制停止时还会掐掉剩余连接。
 
 ## logs --follow
 
