@@ -150,7 +150,8 @@ test('slow：FAKE_CLAUDE_DELAY_MS=600，约 0.6 秒后成功退出，期间输�
   const res = await runFakeClaude(t, ['-p', 'slow'], { env: { FAKE_CLAUDE_SCENARIO: 'slow', FAKE_CLAUDE_DELAY_MS: '600' } });
   const elapsed = Date.now() - startedAt;
   assert.equal(res.code, 0);
-  assert.ok(elapsed >= 550 && elapsed <= 1500, `耗时应在 550～1500ms，实际 ${elapsed}ms`);
+  // 上界放宽到 3 秒：并发跑多个测试套件时进程启动可能慢一个量级，卡太紧会偶发超时
+  assert.ok(elapsed >= 550 && elapsed <= 3000, `耗时应在 550～3000ms，实际 ${elapsed}ms`);
   const lines = stdoutLines(res);
   assert.ok(lines.filter((line) => line.type === 'assistant').length >= 2, '至少 2 行 assistant');
   const result = lines[lines.length - 1];

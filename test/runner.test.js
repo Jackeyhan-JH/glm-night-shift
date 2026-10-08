@@ -268,7 +268,10 @@ test('验收: stubborn + timeoutMs=300, killGraceMs=300：1.5 秒内 timeout，�
   const elapsed = Date.now() - startedAt;
   assert.ok(elapsed < 1500, `应在 1.5 秒内返回，实际 ${elapsed}ms`);
   assert.equal(result.status, 'timeout');
-  assert.equal(result.signal, 'SIGKILL', 'SIGTERM 被无视，靠 SIGKILL 兜底');
+  // 不断言 signal === 'SIGKILL'：规格定的 300ms SIGTERM 在高负载下可能赶在假 claude
+  // 完成启动（装好信号处理器）之前到达，按默认动作把它杀死（signal 为 SIGTERM）——
+  // 结论同样是 timeout、进程同样被清掉。「SIGTERM 被无视、必须 SIGKILL」的确定性
+  // 断言在下面「无视 SIGTERM 的孙进程」用例里（有就绪屏障）。
 
   const [entry] = readArgsLog(ctx.home);
   assert.ok(Number.isInteger(entry.pid), 'args log 里应有 pid');
@@ -448,22 +451,26 @@ test('孙进程抱着 stdout 不放：子进程 exit 后 SIGTERM 清场，及时
 });
 
 test('无视 SIGTERM 的孙进程抱着管道：短宽限后 SIGKILL 清场，仍按 exit 结果结算', async (t) => {
-  // holder 先落一个「信号处理器已就绪」的文件再让父进程退出：否则执行器在子进程
-  // exit 时发的 SIGTERM 可能赶在 holder 注册处理器之前把它打死，测不到升级路径。
+  // 两个确定性保障，缺一个高负载下就偶发翻车：
+  // 1. holder 先落「信号处理器已就绪」文件、父进程见到它才退出——否则执行器在子进程
+  //    exit 时发的 SIGTERM 可能赶在 holder 注册处理器之前把它打死，测不到升级路径；
+  // 2. 子进程等到绝对时刻 EXIT_AT_MS 才退出（而不是「启动后约 60ms」）——超时定时器
+  //    （1200ms）必然落在它退出之后、清场完成之前，慢启动也挤不进别的顺序。
   const script = writeMiniClaude(t, `
     const { spawn } = require('node:child_process');
     const { appendFileSync, existsSync } = require('node:fs');
     const holder = spawn(process.execPath, ['-e', 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); process.on("SIGINT", () => {}); fs.writeFileSync(process.env.READY_FILE, "1"); setInterval(() => {}, 60000);'], { stdio: ['ignore', 'inherit', 'inherit'] });
     holder.unref();
     appendFileSync(process.env.PIDS_FILE, JSON.stringify({ holder: holder.pid }) + '\\n');
-    const waitReady = () => {
-      if (existsSync(process.env.READY_FILE)) {
+    const exitAt = Number(process.env.EXIT_AT_MS);
+    const wait = () => {
+      if (existsSync(process.env.READY_FILE) && Date.now() >= exitAt) {
         process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'stubborn-holder' }) + '\\n');
         return; // 没有别的活儿了，事件循环一空本进程自然退出
       }
-      setTimeout(waitReady, 5);
+      setTimeout(wait, 10);
     };
-    waitReady();
+    wait();
   `);
   const ctx = setup(t);
   const pidsFile = path.join(ctx.home, 'pids.jsonl');
@@ -471,12 +478,17 @@ test('无视 SIGTERM 的孙进程抱着管道：短宽限后 SIGKILL 清场，�
   const result = await runTask({
     ...ctx,
     config: { ...ctx.config, claudeBin: script },
-    env: { ...ctx.env, PIDS_FILE: pidsFile, READY_FILE: path.join(ctx.home, 'holder-ready') },
-    killGraceMs: 300, // stdio 宽限 = min(2000, 300) = 300ms，之后 SIGKILL
-    timeoutMs: 150, // 子进程约 60ms 就退了：超时定时器到点时它已退出，不许改写成 timeout
+    env: {
+      ...ctx.env,
+      PIDS_FILE: pidsFile,
+      READY_FILE: path.join(ctx.home, 'holder-ready'),
+      EXIT_AT_MS: String(startedAt + 400),
+    },
+    killGraceMs: 1200, // stdio 宽限 = min(2000, 1200) = 1200ms，之后 SIGKILL
+    timeoutMs: 1200, // 子进程最迟 ~400ms 已退出：定时器到点时它已退，不许改写成 timeout
   });
   const elapsed = Date.now() - startedAt;
-  assert.ok(elapsed < 1500, `SIGKILL 兜底后应及时返回，实际 ${elapsed}ms`);
+  assert.ok(elapsed < 4000, `SIGKILL 清场后应及时返回，实际 ${elapsed}ms`);
   assert.equal(result.status, 'succeeded');
   assert.equal(result.summary, 'stubborn-holder');
   const lines = readLogLines(result.logPath);

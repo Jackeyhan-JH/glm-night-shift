@@ -8,8 +8,11 @@
 //                               没有 result 行，退出 1（模拟请求被限流拒绝）
 //                             - truncated：init + 2 行 assistant 后退出 1，没有 result 行，
 //                               stderr 不含 429 / rate limit 字样（模拟输出被截断）
-//                             - stubborn：init 后忽略 SIGTERM / SIGINT，只能被 SIGKILL 结束
+//                             - stubborn：忽略 SIGTERM / SIGINT，只能被 SIGKILL 结束
 //                               （测执行器的 SIGKILL 兜底）
+//                             就绪约定：hang / stubborn 等信号敏感场景都在输出 init 行
+//                             「之前」装好信号处理器——init 行一到，之后任意时刻发信号，
+//                             行为都是确定的（hang 被 SIGTERM 杀出 143；stubborn 无视）。
 //   FAKE_CLAUDE_DELAY_MS    slow 场景的等待毫秒数（默认 2000，非法值按 2000）
 //   FAKE_CLAUDE_SEQUENCE    逗号分隔的场景序列（如 fail,success）：第 N 次调用用第 N 个场景，
 //                           用完后一直用最后一个；优先于 FAKE_CLAUDE_SCENARIO（调度器 /
@@ -217,18 +220,21 @@ async function main() {
   }
 
   if (scenario === 'stubborn') {
-    process.stdout.write(initLine());
-    // 有意不退出：SIGTERM / SIGINT 都只打一行日志，只有 SIGKILL 能结束本进程
+    // 先装信号处理器、再输出 init 行：init 行是调用方的「就绪」信号，看到它之后发的
+    // SIGTERM 必须已被无视——顺序反了的话，看到 init 就发信号的测试会赶在处理器注册
+    // 之前把本进程按默认动作杀死（signal SIGTERM 而不是活到 SIGKILL）。
     process.on('SIGTERM', () => process.stderr.write('stubborn: SIGTERM ignored\n'));
     process.on('SIGINT', () => process.stderr.write('stubborn: SIGINT ignored\n'));
+    process.stdout.write(initLine());
     setInterval(() => {}, 60_000); // 保持进程存活
     return 0; // 不会真正到达（interval 挡住事件循环）
   }
 
   if (scenario === 'hang') {
-    process.stdout.write(initLine());
+    // 同 stubborn：先装处理器再报就绪，收到 SIGTERM 恰好落在 init 行之后也能退出 143
     process.on('SIGTERM', () => process.exit(143));
     process.on('SIGINT', () => process.exit(130));
+    process.stdout.write(initLine());
     setInterval(() => {}, 60_000); // 保持进程存活，直到收到信号
     return 0; // 不会真正到达（interval 挡住事件循环）
   }
