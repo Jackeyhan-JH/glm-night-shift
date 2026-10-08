@@ -56,6 +56,12 @@ const COMMANDS = {
 
 const TOP_OPTIONS = new Set(['--version', '-v', '--help', '-h']);
 
+// 任何 usage/帮助文本写出前都过这一道：保证以且仅以一个换行结尾（缺则补、
+// 多则裁），免得 shell 提示符粘在用法后面，也不用给每条 usage 字符串手工配换行。
+function withTrailingNewline(text) {
+  return `${String(text).replace(/\n+$/, '')}\n`;
+}
+
 function usageText() {
   const commandLines = Object.entries(COMMANDS).map(([name, cmd]) => `  ${name.padEnd(10)}${cmd.summary}`);
   // 各命令的 usage 单一来源：帮助里原样列出（help 自身显而易见，不重复）。
@@ -126,7 +132,7 @@ async function runMain(argv, ctx) {
   if (!cmd) throw new UsageError(`未知命令：${command}`);
   // `night-shift <命令> --help` / `-h`：打印该命令自己的用法（顶层 --help 在前面已处理）。
   if (rest.length === 1 && (rest[0] === '--help' || rest[0] === '-h')) {
-    ctx.stdout.write(`${cmd.usage}\n`);
+    ctx.stdout.write(withTrailingNewline(cmd.usage));
     return 0;
   }
   try {
@@ -158,7 +164,8 @@ async function runCli(argv, {
   } catch (err) {
     if (err instanceof UsageError) {
       stderr.write(`错误：${err.message}\n`);
-      stderr.write(err.usage ?? usageText());
+      // 所有用法错误都汇到这里：统一保证 usage 以且仅以一个换行结尾。
+      stderr.write(withTrailingNewline(err.usage ?? usageText()));
       return 2;
     }
     stderr.write(`错误：${err instanceof Error ? err.message : String(err)}\n`);

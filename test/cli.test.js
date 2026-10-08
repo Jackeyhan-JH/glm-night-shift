@@ -583,6 +583,25 @@ test('<命令> --help / -h：退出 0，打印该命令自己的用法（含全�
   assert.ok(results[2].stdout.includes('--limit'));
 });
 
+test('用法/帮助输出都以且仅以一个换行结尾（不粘 shell 提示符）', async (t) => {
+  const endsWithExactlyOneNewline = (text, label) => {
+    assert.ok(text.endsWith('\n'), `${label} 应以换行结尾：${JSON.stringify(text.slice(-50))}`);
+    assert.ok(!text.endsWith('\n\n'), `${label} 结尾不应有多余换行`);
+  };
+  // 用法错误：该命令的 usage 打到 stderr（全局 usage 的未知命令也查一遍）
+  const badStatus = await spawnCli(t, ['list', '--status', 'bogus']);
+  assert.equal(badStatus.code, 2);
+  endsWithExactlyOneNewline(badStatus.stderr, 'list --status bogus 的 stderr');
+  const unknownCmd = await spawnCli(t, ['frobnicate']);
+  endsWithExactlyOneNewline(unknownCmd.stderr, '未知命令的 stderr');
+  // 帮助路径：命令级 --help 与全局 help / --help 打到 stdout
+  for (const args of [['add', '--help'], ['help'], ['--help'], []]) {
+    const res = await spawnCli(t, args);
+    assert.equal(res.code, 0, JSON.stringify(args));
+    endsWithExactlyOneNewline(res.stdout, `${JSON.stringify(args)} 的 stdout`);
+  }
+});
+
 test('COMMANDS 表包含 #5 的全部子命令（供后续 issue 在进程内扩展）', () => {
   for (const name of ['add', 'list', 'show', 'cancel', 'retry', 'config', 'help']) {
     const cmd = COMMANDS[name];
