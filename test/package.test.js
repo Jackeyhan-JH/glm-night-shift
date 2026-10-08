@@ -11,7 +11,7 @@ test('package.json 符合骨架约定', () => {
   assert.equal(pkg.name, 'glm-night-shift');
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.equal(pkg.type, 'module');
-  assert.deepEqual(pkg.engines, { node: '>=22' });
+  assert.deepEqual(pkg.engines, { node: '>=22.13' });
   assert.equal(pkg.scripts.test, 'node --test');
   assert.deepEqual(pkg.bin, { 'night-shift': 'bin/night-shift.mjs' });
   assert.ok(!('dependencies' in pkg), '不应有 dependencies');
