@@ -80,8 +80,10 @@ const wtPath = (home, id) => path.join(home, 'worktrees', `task-${id}`);
 async function makeTask({ db, home, config, status }) {
   const task = addTask(db, `${status} 任务`);
   if (status === 'canceled') {
-    cancelTask(db, task.id); // queued → canceled
-  } else if (status === 'queued' || status === 'running') {
+    cancelTask(db, task.id); // queued → canceled，从未被领取
+  } else if (status === 'queued') {
+    // 保持 queued：不要 claim，否则会变成 running，测不到「排队中的目录也不动」
+  } else if (status === 'running') {
     const claimed = claimNextTask(db);
     assert.ok(claimed !== null && claimed.id === task.id, '刚建的任务应被立刻领到');
   } else {
@@ -89,6 +91,7 @@ async function makeTask({ db, home, config, status }) {
     assert.ok(claimed !== null && claimed.id === task.id, '刚建的任务应被立刻领到');
     finishTask(db, task.id, { status });
   }
+  assert.equal(getTask(db, task.id).status, status);
   await createWorktree({ home, repo: 'a/b', task, baseBranch: 'main' });
   assert.ok(fs.existsSync(wtPath(home, task.id)), 'worktree 应建在 worktrees/task-<id>');
   return task;
