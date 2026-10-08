@@ -71,7 +71,7 @@ test('显式 title：trim 后入库；空白 title 报 ValidationError', (t) => 
   );
 });
 
-test('createTask 校验失败时抛 ValidationError 且点名字段（验收：repo / difficulty）', (t) => {
+test('验收: createTask 传 repo "not a repo" 或 difficulty "extreme" 抛 ValidationError，错误里能看出是哪个字段', (t) => {
   const db = openMemory(t);
   const cases = [
     [{ ...VALID, repo: 'not a repo' }, 'repo'],
@@ -126,7 +126,7 @@ test('createTask 接受合法值：先 trim 再入库，maxAttempts / testComman
 
 // ---------------------------------------------------------------- 领取与列表
 
-test('领取顺序：3 个任务 priority 0/5/0 依次创建，按 5、第 1 个、第 3 个领取，之后 null（验收）', (t) => {
+test('验收: 3 个排队任务 priority 0/5/0 依次创建，claimNextTask 依次返回 priority 5 的、第 1 个、第 3 个，之后 null；每个 running 且 attempts 1', (t) => {
   const db = openMemory(t);
   const first = createTask(db, { ...VALID, prompt: 'first' });
   const top = createTask(db, { ...VALID, prompt: 'top', priority: 5 });
@@ -156,7 +156,7 @@ test('同一毫秒创建的同优先级任务按 id 升序领取（FIFO 兜底�
   assert.equal(claimNextTask(db), null);
 });
 
-test('allowPeakOnly: true 只领取 allowPeak 任务，即使其优先级更低（验收）', (t) => {
+test('验收: allowPeakOnly true 时只领取 allowPeak 为 true 的任务', (t) => {
   const db = openMemory(t);
   const plain1 = createTask(db, { ...VALID, prompt: 'plain1' });
   const peaky = createTask(db, { ...VALID, prompt: 'peaky', allowPeak: true, priority: -1 });
@@ -283,7 +283,7 @@ test('finishTask 只允许 running → succeeded|failed|queued，其余抛 Inval
   assert.throws(() => finishTask(db, 0, { status: 'succeeded' }), ValidationError);
 });
 
-test('cancelTask：queued / running → canceled 并写 finished_at；终态再取消抛 InvalidTransitionError（验收）', (t) => {
+test('验收: cancelTask 对 succeeded 任务抛 InvalidTransitionError；queued / running 可取消并写 finished_at', (t) => {
   const db = openMemory(t);
   const queued = createTask(db, { ...VALID });
   assert.equal(cancelTask(db, queued.id).status, 'canceled');
@@ -311,7 +311,7 @@ test('cancelTask：queued / running → canceled 并写 finished_at；终态再�
   assert.throws(() => cancelTask(db, 999), (err) => err instanceof NotFoundError && err.id === 999);
 });
 
-test('retryTask：failed|canceled → queued，attempts 归零、last_error / finished_at 清空（验收）', (t) => {
+test('验收: retryTask 把 failed 任务变回 queued 且 attempts 归零、last_error / finished_at 清空', (t) => {
   const db = openMemory(t);
   const failed = createTask(db, { ...VALID });
   claimNextTask(db);
@@ -349,7 +349,7 @@ test('retryTask：failed|canceled → queued，attempts 归零、last_error / fi
 
 // ---------------------------------------------------------------- 崩溃恢复
 
-test('recoverStaleRunning：running 任务回 queued、未结束 run 标 failed + interrupted（验收）', (t) => {
+test('验收: recoverStaleRunning 后任务为 queued，未结束的 run 为 failed 且 error = "interrupted"', (t) => {
   const db = openMemory(t);
   assert.deepEqual(recoverStaleRunning(db), []); // 空库无副作用
 
@@ -390,7 +390,7 @@ test('recoverStaleRunning：running 任务回 queued、未结束 run 标 failed 
 
 // ---------------------------------------------------------------- 运行记录
 
-test('startRun / finishRun：durationMs 恒为正、prompts 默认 1、可选字段给了才更新（验收）', (t) => {
+test('验收: finishRun 后 durationMs 为正数；prompts 默认 1，可选字段给了才更新', (t) => {
   const db = openMemory(t);
   const task = createTask(db, { ...VALID });
   claimNextTask(db);
@@ -537,7 +537,7 @@ test('listRuns：taskId / since / limit 过滤，started_at DESC → id DESC，s
 
 // ---------------------------------------------------------------- 持久性与并发
 
-test('文件库：close 后重新 openDb，任务 / run 数据都在，user_version 仍为 1（验收）', (t) => {
+test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_version 为 1，迁移不重跑', (t) => {
   const file = tempDbFile(t);
   const db = openDb(file);
   const task = createTask(db, { ...VALID, priority: 2 });
@@ -593,4 +593,146 @@ test('两个连接开同一文件库：交替领取永不重复，写入互相�
     assert.equal(task.status, 'running');
     assert.equal(task.attempts, 1);
   }
+});
+
+// ---------------------------------------------------------------- 并发下的过期状态（TOCTOU）
+
+test('验收: 另一连接取消后，过期的 finishTask(succeeded) 抛 InvalidTransitionError 且不覆盖 canceled', (t) => {
+  const file = tempDbFile(t);
+  const sched = openDb(file); // 调度器
+  const dash = openDb(file); // 看板 / CLI
+  t.after(() => {
+    sched.close();
+    dash.close();
+  });
+
+  const task = createTask(sched, { ...VALID });
+  assert.equal(claimNextTask(sched).id, task.id); // 调度器领取，开始跑
+  assert.equal(cancelTask(dash, task.id).status, 'canceled'); // 期间看板取消了它
+
+  // 调度器拿着过期的 running 认知来报成功：必须抛错，且 canceled 不被覆盖
+  assert.throws(
+    () => finishTask(sched, task.id, { status: 'succeeded', prUrl: 'https://github.com/o/r/pull/1' }),
+    (err) => err instanceof InvalidTransitionError && err.from === 'canceled' && err.to === 'succeeded'
+      && err.message.includes('canceled') && err.message.includes('succeeded'),
+  );
+  const after = getTask(dash, task.id);
+  assert.equal(after.status, 'canceled');
+  assert.equal(after.prUrl, null);
+});
+
+test('两连接下 retryTask / cancelTask / finishRun 都以数据库当前状态为准，不覆盖并发结果', (t) => {
+  const file = tempDbFile(t);
+  const a = openDb(file);
+  const b = openDb(file);
+  t.after(() => {
+    a.close();
+    b.close();
+  });
+
+  // retryTask：a 端看到的 failed，已被 b 端 retry 并重新领走（running）
+  const t1 = createTask(a, { ...VALID, prompt: 't1' });
+  claimNextTask(a);
+  finishTask(a, t1.id, { status: 'failed', lastError: 'x' });
+  retryTask(b, t1.id);
+  assert.equal(claimNextTask(b).id, t1.id);
+  assert.throws(
+    () => retryTask(a, t1.id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'running' && err.to === 'queued',
+  );
+  assert.equal(getTask(b, t1.id).status, 'running');
+
+  // cancelTask：a 端想取消，但 b 端已把任务跑到 succeeded
+  const t2 = createTask(a, { ...VALID, prompt: 't2' });
+  assert.equal(claimNextTask(b).id, t2.id);
+  finishTask(b, t2.id, { status: 'succeeded' });
+  assert.throws(
+    () => cancelTask(a, t2.id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'succeeded' && err.to === 'canceled',
+  );
+  assert.equal(getTask(b, t2.id).status, 'succeeded');
+
+  // finishRun：run 已被 b 端标 timeout，a 端再报 succeeded 要抛错且不覆盖
+  const t3 = createTask(a, { ...VALID, prompt: 't3' });
+  assert.equal(claimNextTask(a).id, t3.id);
+  const run = startRun(a, { taskId: t3.id, attempt: 1, model: 'm', effort: 'low', peak: false, logPath: '/l' });
+  finishRun(b, run.id, { status: 'timeout', error: '60min 上限' });
+  assert.throws(
+    () => finishRun(a, run.id, { status: 'succeeded', exitCode: 0 }),
+    (err) => err instanceof InvalidTransitionError && err.from === 'timeout' && err.to === 'succeeded',
+  );
+  const after = listRuns(b, { taskId: t3.id })[0];
+  assert.equal(after.status, 'timeout');
+  assert.equal(after.error, '60min 上限');
+  assert.equal(after.exitCode, null, '未被 a 端的 exitCode=0 覆盖');
+});
+
+test('finishTask 可选字段给了就必须是字符串或 null（undefined = 保持）', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  claimNextTask(db);
+  for (const fields of [{ lastError: 42 }, { prUrl: 9 }, { branch: {} }]) {
+    assert.throws(
+      () => finishTask(db, task.id, { status: 'succeeded', ...fields }),
+      (err) => err instanceof ValidationError && err.message.includes(Object.keys(fields)[0]),
+      `${JSON.stringify(fields)} 应报 ValidationError`,
+    );
+  }
+  assert.equal(getTask(db, task.id).status, 'running', '校验失败不应改动任务');
+});
+
+// ---------------------------------------------------------------- 排序与过滤的组合
+
+test('listTasks 按每个状态过滤各自排序，limit 生效，未知 status 报 ValidationError', (t) => {
+  const db = openMemory(t);
+  // 先把要进各终态的任务走完流程，再建留在队列里的，最后建 running 的，
+  // 这样每一步 claimNextTask 领到的都是刚建的任务，互不干扰。
+  const succeeded = createTask(db, { ...VALID, prompt: 's' });
+  assert.equal(claimNextTask(db).id, succeeded.id);
+  finishTask(db, succeeded.id, { status: 'succeeded' });
+  const failed = createTask(db, { ...VALID, prompt: 'f' });
+  assert.equal(claimNextTask(db).id, failed.id);
+  finishTask(db, failed.id, { status: 'failed' });
+  const canceled = createTask(db, { ...VALID, prompt: 'c' });
+  cancelTask(db, canceled.id);
+  const q2 = createTask(db, { ...VALID, prompt: 'q2', priority: 3 });
+  assert.equal(claimNextTask(db).id, q2.id); // q2 running
+  const q1 = createTask(db, { ...VALID, prompt: 'q1' });
+  const q3 = createTask(db, { ...VALID, prompt: 'q3' });
+
+  assert.deepEqual(listTasks(db, { status: 'queued' }).map((task) => task.id), [q1.id, q3.id]);
+  assert.deepEqual(listTasks(db, { status: 'running' }).map((task) => task.id), [q2.id]);
+  assert.deepEqual(listTasks(db, { status: 'succeeded' }).map((task) => task.id), [succeeded.id]);
+  assert.deepEqual(listTasks(db, { status: 'failed' }).map((task) => task.id), [failed.id]);
+  assert.deepEqual(listTasks(db, { status: 'canceled' }).map((task) => task.id), [canceled.id]);
+  // 不传 status：全部，created_at DESC → id DESC（创建顺序 s f c q2 q1 q3 的倒序）
+  assert.deepEqual(listTasks(db).map((task) => task.id), [q3.id, q1.id, q2.id, canceled.id, failed.id, succeeded.id]);
+  assert.deepEqual(listTasks(db, { limit: 2 }).map((task) => task.id), [q3.id, q1.id]);
+  assert.throws(() => listTasks(db, { status: 'paused' }), (err) => err instanceof ValidationError && err.field === 'status');
+});
+
+test('listRuns 组合过滤：taskId + since + limit 一起用，since 等于 started_at 也包含', (t) => {
+  const db = openMemory(t);
+  const t1 = createTask(db, { ...VALID });
+  claimNextTask(db);
+  const t2 = createTask(db, { ...VALID, prompt: 'two' });
+  claimNextTask(db);
+  const run = (taskId, logPath) => startRun(db, { taskId, attempt: 1, model: 'm', effort: 'low', peak: false, logPath });
+  const a1 = run(t1.id, '/a1');
+  const a2 = run(t1.id, '/a2');
+  const b1 = run(t2.id, '/b1');
+  const setStartedAt = (id, iso) => db.prepare('UPDATE runs SET started_at = ? WHERE id = ?').run(iso, id);
+  setStartedAt(a1.id, '2026-01-01T00:00:00.000Z');
+  setStartedAt(a2.id, '2026-01-03T00:00:00.000Z');
+  setStartedAt(b1.id, '2026-01-02T00:00:00.000Z');
+
+  assert.deepEqual(listRuns(db, { taskId: t1.id }).map((r) => r.id), [a2.id, a1.id]);
+  assert.deepEqual(listRuns(db, { taskId: t2.id }).map((r) => r.id), [b1.id]);
+  // since 恰好等于 a2 的 started_at：包含
+  assert.deepEqual(listRuns(db, { taskId: t1.id, since: '2026-01-03T00:00:00.000Z' }).map((r) => r.id), [a2.id]);
+  assert.deepEqual(listRuns(db, { taskId: t2.id, since: '2026-01-01T00:00:00.000Z' }).map((r) => r.id), [b1.id]);
+  // 三个条件一起：全库只有 a2 晚于 1 月 2 日中午，limit 1 也拿到它
+  assert.deepEqual(listRuns(db, { since: '2026-01-02T12:00:00Z', limit: 1 }).map((r) => r.id), [a2.id]);
+  assert.deepEqual(listRuns(db, { taskId: t1.id, limit: 1 }).map((r) => r.id), [a2.id]);
+  assert.deepEqual(listRuns(db, { since: new Date('2026-01-04T00:00:00Z') }), []);
 });

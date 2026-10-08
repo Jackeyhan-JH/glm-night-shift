@@ -10,12 +10,15 @@ import { DatabaseSync } from 'node:sqlite';
  * - `path` 为文件路径时递归创建父目录；`':memory:'` 原样传给 node:sqlite。
  * - 打开 WAL（多连接 / 调度器与看板可同时读写同一文件）、外键约束、busy_timeout，
  *   busy_timeout 让两个写连接短暂争锁时自动等待而不是立刻报 SQLITE_BUSY。
- * - 用 `PRAGMA user_version` 做版本迁移：每个迁移在 IMMEDIATE 事务里执行，
- *   成功才把版本号写进去；重复打开不会重跑（迁移里是裸 CREATE TABLE，重跑必报错）。
+ * - 用 `PRAGMA user_version` 做版本迁移：整个升级在单个 IMMEDIATE 事务里执行（版本号
+ *   也在锁内读，两个进程同时冷启动同一空库也只有一方真正迁移），成功才提交；
+ *   重复打开不会重跑（迁移里是裸 CREATE TABLE，重跑必报错）。
  * - 库的 user_version 比代码认识的版本新（新版程序降级打开旧库）：直接抛错，不猜。
  *
- * @param {string} dbPath 数据库文件路径，或 ':memory:'
- * @returns {import('node:sqlite').DatabaseSync}
+ * @param {string} [dbPath=':memory:'] 数据库文件路径，或 ':memory:'
+ * @returns {import('node:sqlite').DatabaseSync} 打开并迁移到最新版本的连接
+ * @throws {Error} 路径不是非空字符串；无法打开 / 迁移失败（message 带路径与版本）；
+ *   或库的 user_version 比代码认识的版本新（旧版程序打开了新版库）
  */
 export function openDb(dbPath = ':memory:') {
   if (typeof dbPath !== 'string' || dbPath === '') {
@@ -40,28 +43,35 @@ export function openDb(dbPath = ':memory:') {
 }
 
 function migrate(db, dbPath) {
-  const current = userVersion(db);
-  if (current > SCHEMA_VERSION) {
-    throw new Error(
-      `数据库 ${dbPath} 的 user_version 是 ${current}，比本程序支持的最新版本 ${SCHEMA_VERSION} 新；`
-        + '请先升级 night-shift 再打开它。',
-    );
-  }
-  for (let v = current; v < SCHEMA_VERSION; v++) {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      MIGRATIONS[v](db);
-      // PRAGMA 赋值不能带参数，v+1 由 SCHEMA_VERSION 推出、必是整数，可以安全内插。
-      db.exec(`PRAGMA user_version = ${v + 1}`);
-      db.exec('COMMIT');
-    } catch (err) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        // 事务已不在（比如 COMMIT 报错前其实已提交）：保留原始错误，别让它被覆盖
-      }
-      throw new Error(`迁移数据库到版本 ${v + 1} 失败（${dbPath}）：${err.message}`);
+  db.exec('BEGIN IMMEDIATE');
+  let current;
+  try {
+    // 版本要在写锁内读：调度器和看板是两个进程，同时首次打开同一个空库时，
+    // 后抢到锁的那个会看到先到者已提交的 user_version 并跳过，而不是重跑 CREATE TABLE。
+    current = userVersion(db);
+    if (current > SCHEMA_VERSION) {
+      throw new Error(
+        `数据库 ${dbPath} 的 user_version 是 ${current}，比本程序支持的最新版本 ${SCHEMA_VERSION} 新；`
+          + '请先升级 night-shift 再打开它。',
+      );
     }
+    for (; current < SCHEMA_VERSION; current++) {
+      try {
+        MIGRATIONS[current](db);
+      } catch (err) {
+        throw new Error(`迁移数据库到版本 ${current + 1} 失败（${dbPath}）：${err.message}`);
+      }
+      // PRAGMA 赋值不能带参数，current+1 由 SCHEMA_VERSION 推出、必是整数，可以安全内插。
+      db.exec(`PRAGMA user_version = ${current + 1}`);
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // 事务已不在（比如 COMMIT 报错前其实已提交）：保留原始错误，别让它被覆盖
+    }
+    throw err;
   }
 }
 
@@ -136,4 +146,10 @@ const MIGRATIONS = [
  */
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
+/**
+ * 迁移函数列表：MIGRATIONS[v] 把 user_version 为 v 的库升到 v+1（v 从 0 起）。
+ * 只允许在末尾追加，不要改写已发布的迁移；整个升级在单个 IMMEDIATE 事务里跑，
+ * 两个进程同时首次打开同一个库也只会有一方真正执行迁移。
+ * @type {Array<(db: import('node:sqlite').DatabaseSync) => void>}
+ */
 export { MIGRATIONS };

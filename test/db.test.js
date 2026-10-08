@@ -3,9 +3,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import { openDb, SCHEMA_VERSION, MIGRATIONS } from '../src/db.js';
 import { DatabaseSync } from 'node:sqlite';
 import { makeTempHome } from './helpers.js';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test(':memory: 建出 tasks / runs 两张表和四个索引，user_version 为 1', () => {
   const db = openDb();
@@ -116,3 +120,41 @@ test('非法路径参数直接报错（undefined 走默认 :memory: 不报）', 
 function userVersion(db) {
   return db.prepare('PRAGMA user_version').get().user_version;
 }
+
+test('验收: engines.node 为 >=22.13（node:sqlite 从 22.13 起无需开关），且不引入任何依赖', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  assert.equal(pkg.engines.node, '>=22.13');
+  assert.ok(!('dependencies' in pkg), '不应有 dependencies');
+  assert.ok(!('devDependencies' in pkg), '不应有 devDependencies');
+});
+
+test('4 个 worker 同时首次打开同一文件库：迁移只跑一次，人人都能打开并写入', async (t) => {
+  const file = path.join(makeTempHome(t), 'night-shift.db');
+  const dbUrl = pathToFileURL(path.join(repoRoot, 'src', 'db.js')).href;
+  // 模拟调度器 / 看板 / CLI 多个进程同时冷启动：谁先抢到写锁谁迁移，
+  // 其余 worker 必须看到已提交的 user_version 并跳过，而不是重跑 CREATE TABLE 报错。
+  const source = `
+    const { parentPort, workerData } = require('node:worker_threads');
+    (async () => {
+      const { openDb } = await import(workerData.dbUrl);
+      const db = openDb(workerData.file);
+      const now = new Date().toISOString();
+      db.prepare(
+        "INSERT INTO tasks (repo, title, prompt, max_attempts, created_at, updated_at) VALUES ('w/w', 'w', 'w', 2, ?, ?)"
+      ).run(now, now);
+      db.close();
+      parentPort.postMessage({ ok: true });
+    })().catch((err) => parentPort.postMessage({ ok: false, error: err.message }));
+  `;
+  const results = await Promise.all(Array.from({ length: 4 }, () => new Promise((resolve) => {
+    const worker = new Worker(source, { eval: true, workerData: { file, dbUrl } });
+    worker.on('message', (message) => resolve(message));
+    worker.on('error', (err) => resolve({ ok: false, error: `worker 崩溃：${err.message}` }));
+  })));
+  for (const result of results) assert.deepEqual(result, { ok: true }, '每个 worker 都应成功打开并写入');
+
+  const db = openDb(file);
+  t.after(() => db.close());
+  assert.equal(userVersion(db), SCHEMA_VERSION);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 4);
+});

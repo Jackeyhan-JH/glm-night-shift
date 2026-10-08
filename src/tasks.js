@@ -1,17 +1,34 @@
 // 任务与运行记录的领域逻辑（issue #3）。所有函数第一个参数是 openDb() 的 DatabaseSync，
 // 返回驼峰字段的普通对象：布尔（allowPeak / peak）转回真布尔，NULL 保持 null。
 // 时间一律存 UTC ISO 字符串（约定见 #1），对外接受 Date 或 ISO 字符串（见 toIso）。
+//
+// 并发约定：调度器、看板、命令行会是不同进程，各自 openDb 同一个文件库（WAL +
+// busy_timeout 支持多读单写）。因此所有状态流转都是「单条带状态守卫的原子
+// UPDATE … WHERE id = ? AND status IN (…) RETURNING」——先到者的更新生效；后到者
+// 未命中时重读库里的当前状态，抛 NotFoundError / InvalidTransitionError，绝不静默
+// 覆盖别人的结果（例：看板刚取消了一个 running 任务，调度器再报成功会抛错而不是
+// 把 canceled 改回 succeeded）。
 import { DEFAULT_CONFIG } from './config.js';
 
+/** tasks.status 的全部合法值。 */
 export const TASK_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'canceled'];
+/** runs.status 的全部合法值。 */
 export const RUN_STATUSES = ['running', 'succeeded', 'failed', 'timeout', 'canceled'];
+/** tasks.difficulty 的全部合法值。 */
 export const DIFFICULTIES = ['easy', 'medium', 'hard'];
 
 const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const TITLE_MAX_CODE_POINTS = 60; // title 缺省时取 prompt 的前 60 个字符（按 Unicode 码点数）
 
-/** 字段校验失败：`err.field` 是字段名，message 里也点名该字段。 */
+/**
+ * 字段校验失败。
+ * @property {string} field 出问题的字段名（驼峰），message 里也点名该字段。
+ */
 export class ValidationError extends Error {
+  /**
+   * @param {string} field 字段名
+   * @param {string} reason 该字段为什么不合法
+   */
   constructor(field, reason) {
     super(`字段 ${field} 不合法：${reason}`);
     this.name = 'ValidationError';
@@ -19,8 +36,15 @@ export class ValidationError extends Error {
   }
 }
 
-/** 任务或 run 不存在：`err.id` 是查找的 id。 */
+/**
+ * 任务或 run 不存在。
+ * @property {number} id 查找的 id。
+ */
 export class NotFoundError extends Error {
+  /**
+   * @param {number} id 查找的 id
+   * @param {string} [kind='任务'] 报错时说的种类（任务 / run）
+   */
   constructor(id, kind = '任务') {
     super(`${kind} ${id} 不存在`);
     this.name = 'NotFoundError';
@@ -28,8 +52,17 @@ export class NotFoundError extends Error {
   }
 }
 
-/** 非法状态转换：`err.from` / `err.to`，message 同时包含两个状态。 */
+/**
+ * 非法状态转换。message 同时包含源状态和目标状态。
+ * @property {string} from 库里实际的当前状态。
+ * @property {string} to 调用方想要的目标状态。
+ */
 export class InvalidTransitionError extends Error {
+  /**
+   * @param {string} from 当前状态
+   * @param {string} to 目标状态
+   * @param {string} [kind='任务'] 报错时说的种类（任务 / run）
+   */
   constructor(from, to, kind = '任务') {
     super(`${kind}状态不能从 ${from} 转为 ${to}`);
     this.name = 'InvalidTransitionError';
@@ -38,17 +71,65 @@ export class InvalidTransitionError extends Error {
   }
 }
 
+/**
+ * @typedef {object} TaskRow 对外返回的任务对象（驼峰字段，布尔是真布尔，NULL 保持 null）。
+ * @property {number} id
+ * @property {string} repo `owner/name`
+ * @property {string} title
+ * @property {string} prompt
+ * @property {('easy'|'medium'|'hard')} difficulty
+ * @property {number} priority
+ * @property {?string} testCommand
+ * @property {boolean} allowPeak
+ * @property {('queued'|'running'|'succeeded'|'failed'|'canceled')} status
+ * @property {number} attempts
+ * @property {number} maxAttempts
+ * @property {?string} branch
+ * @property {?string} prUrl
+ * @property {?string} lastError
+ * @property {string} createdAt UTC ISO
+ * @property {string} updatedAt UTC ISO
+ * @property {?string} startedAt UTC ISO，最近一次领取时间（重试再领会覆盖）
+ * @property {?string} finishedAt UTC ISO，终态（含 canceled）达成时间；重试回排队时为 null
+ */
+
+/**
+ * @typedef {object} RunRow 对外返回的运行记录对象。
+ * @property {number} id
+ * @property {number} taskId
+ * @property {number} attempt
+ * @property {string} model
+ * @property {string} effort
+ * @property {boolean} peak
+ * @property {('running'|'succeeded'|'failed'|'timeout'|'canceled')} status
+ * @property {?number} exitCode
+ * @property {?number} numTurns
+ * @property {number} prompts
+ * @property {?number} quotaUnits
+ * @property {string} logPath
+ * @property {string} startedAt UTC ISO
+ * @property {?string} finishedAt UTC ISO
+ * @property {?number} durationMs 毫秒；崩溃恢复标记的 run 为 null（真实耗时不可知）
+ * @property {?string} error
+ */
+
 // ---------------------------------------------------------------- 任务
 
 /**
  * 新建任务（状态 queued，attempts 0）。字符串字段先 trim 再校验/入库。
- * - repo 形如 `owner/name`（`^[\w.-]+\/[\w.-]+$`）。
- * - prompt 非空；title 缺省（undefined/null）时取 prompt 前 60 个 Unicode 码点
- *   （按码点切，中文 / emoji 不会被切成半个）；显式给 title 则 trim 后必须非空。
- * - difficulty ∈ easy|medium|hard，默认 medium；priority 任意整数，默认 0。
- * - testCommand null 或非空字符串；allowPeak 布尔，默认 false。
- * - maxAttempts 缺省取 DEFAULT_CONFIG.maxAttempts（当前 2），必须是正整数。
- * 校验失败抛 ValidationError（带字段名）。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} input
+ * @param {string} input.repo `owner/name`，须匹配 `^[\w.-]+\/[\w.-]+$`
+ * @param {string} input.prompt 非空
+ * @param {string} [input.title] 缺省（undefined/null）时取 prompt 前 60 个 Unicode 码点
+ *   （按码点切，中文 / emoji 不会被切成半个）；给了则 trim 后必须非空
+ * @param {('easy'|'medium'|'hard')} [input.difficulty='medium']
+ * @param {number} [input.priority=0] 任意整数（越大越先被领取，负数合法）
+ * @param {?string} [input.testCommand=null] null 或非空字符串
+ * @param {boolean} [input.allowPeak=false]
+ * @param {number} [input.maxAttempts=DEFAULT_CONFIG.maxAttempts] 正整数（当前默认 2）
+ * @returns {TaskRow} 新建的任务
+ * @throws {ValidationError} 任一字段不合法（err.field 指明字段，message 点名）
  */
 export function createTask(db, input = {}) {
   const repo = requiredTrimmed(input.repo, 'repo');
@@ -87,7 +168,13 @@ export function createTask(db, input = {}) {
   return rowToTask(row);
 }
 
-/** 按 id 取任务；不存在返回 null（与 NotFoundError 的“操作类”函数区分开）。 */
+/**
+ * 按 id 取任务。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @returns {?TaskRow} 不存在返回 null（“操作类”函数才抛 NotFoundError）
+ * @throws {ValidationError} id 不是正整数（field='id'）
+ */
 export function getTask(db, id) {
   assertPositiveInt(id, 'id');
   return rowToTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id));
@@ -95,8 +182,14 @@ export function getTask(db, id) {
 
 /**
  * 任务列表。queued 按队列语义（priority DESC → created_at ASC → id ASC，先进先出），
- * 其他状态以及不传 status 时按 created_at DESC → id DESC（最新在前）。
- * id 兜底保证同一毫秒创建的任务顺序也确定。limit 默认 100。
+ * 其他状态以及不传 status 时按 created_at DESC → id DESC（最新在前）；id 兜底保证
+ * 同一毫秒创建的任务顺序也确定。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} [options]
+ * @param {('queued'|'running'|'succeeded'|'failed'|'canceled')} [options.status] 按状态过滤
+ * @param {number} [options.limit=100] 正整数
+ * @returns {TaskRow[]}
+ * @throws {ValidationError} status 不在枚举里（field='status'）或 limit 非正整数
  */
 export function listTasks(db, { status, limit = 100 } = {}) {
   if (status !== undefined && !TASK_STATUSES.includes(status)) {
@@ -115,10 +208,14 @@ export function listTasks(db, { status, limit = 100 } = {}) {
 
 /**
  * 原子领取下一个排队任务：单条 UPDATE（子查询选 id + `AND status = 'queued'` 双保险，
- * SQLite 写语句串行执行），改为 running、attempts + 1、写 started_at / updated_at，返回
- * 更新后的任务；没有可领的返回 null。allowPeakOnly 为 true 时只领 allow_peak = 1 的。
- *
- * started_at 语义：最近一次被领取的时间（重试后再领会覆盖，配合 attempts 递增读）。
+ * SQLite 写语句串行执行），两个连接 / 进程绝不会领到同一个任务。改为 running、
+ * attempts + 1、写 started_at / updated_at。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} [options]
+ * @param {boolean} [options.allowPeakOnly=false] true 时只领 allow_peak = 1 的任务
+ * @returns {?TaskRow} 被领取的任务；没有可领的返回 null。
+ *   started_at 语义：最近一次领取时间（重试后再领会覆盖，配合 attempts 递增读）
+ * @throws {ValidationError} allowPeakOnly 非布尔
  */
 export function claimNextTask(db, { allowPeakOnly = false } = {}) {
   if (typeof allowPeakOnly !== 'boolean') {
@@ -144,10 +241,21 @@ export function claimNextTask(db, { allowPeakOnly = false } = {}) {
 const FINISH_TASK_STATUSES = ['succeeded', 'failed', 'queued'];
 
 /**
- * 结束一个 running 任务。status 只能是 succeeded | failed | queued（queued = 排队重试）：
- * 终态写 finished_at，重试清空它（下次领取再写新的）。started_at 不动，仍是最近一次
- * 领取时间。lastError / prUrl / branch 只有调用方给了才更新（undefined = 保持原值；
- * 显式传 null 表示清空该列）。返回更新后的任务。
+ * 结束一个 running 任务。原子：UPDATE 带 `status = 'running'` 守卫，未命中（任务不存在，
+ * 或状态已被别的连接改掉）时重读库里的当前状态抛错，不会静默覆盖并发操作的结果。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @param {object} fields
+ * @param {('succeeded'|'failed'|'queued')} fields.status queued 表示排回队列重试
+ * @param {?string} [fields.lastError] undefined = 保持原值；给了则覆盖（null = 清空）
+ * @param {?string} [fields.prUrl] 同上
+ * @param {?string} [fields.branch] 同上
+ * @returns {TaskRow} 更新后的任务。终态写 finished_at，重试（queued）清空它；
+ *   started_at 不动，仍是最近一次领取时间；attempts 不变（只有 retryTask 归零）
+ * @throws {ValidationError} id 非正整数、status 不在允许集合（field='status'），
+ *   或 lastError/prUrl/branch 给了却不是字符串或 null
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 当前状态不是 running（err.from 是库里实际的当前状态）
  */
 export function finishTask(db, id, { status, lastError, prUrl, branch } = {}) {
   assertPositiveInt(id, 'id');
@@ -157,10 +265,9 @@ export function finishTask(db, id, { status, lastError, prUrl, branch } = {}) {
       `finishTask 只接受 ${FINISH_TASK_STATUSES.join(' | ')}（queued 表示重试；当前值：${status}）`,
     );
   }
-  const current = taskRow(db, id);
-  if (current.status !== 'running') {
-    throw new InvalidTransitionError(current.status, status);
-  }
+  assertOptionalString(lastError, 'lastError');
+  assertOptionalString(prUrl, 'prUrl');
+  assertOptionalString(branch, 'branch');
   const now = nowIso();
   const sets = ['status = ?', 'updated_at = ?', 'finished_at = ?'];
   const params = [status, now, status === 'queued' ? null : now];
@@ -168,54 +275,69 @@ export function finishTask(db, id, { status, lastError, prUrl, branch } = {}) {
   appendOptionalColumn(sets, params, ['pr_url', prUrl]);
   appendOptionalColumn(sets, params, ['branch', branch]);
   params.push(id);
-  const row = db.prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ? RETURNING *`).get(...params);
+  const row = db.prepare(
+    `UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'running' RETURNING *`,
+  ).get(...params);
+  if (row === undefined) throw staleTransitionError(db, id, status);
   return rowToTask(row);
 }
 
 /**
  * 取消任务：queued | running → canceled（终态，写 finished_at）。
- * succeeded / failed / canceled 上再取消抛 InvalidTransitionError。
+ * 原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @returns {TaskRow} 更新后的任务
+ * @throws {ValidationError} id 非正整数
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 当前已是终态（succeeded / failed / canceled）
  */
 export function cancelTask(db, id) {
   assertPositiveInt(id, 'id');
-  const current = taskRow(db, id);
-  if (current.status !== 'queued' && current.status !== 'running') {
-    throw new InvalidTransitionError(current.status, 'canceled');
-  }
   const now = nowIso();
-  const row = db.prepare(
-    "UPDATE tasks SET status = 'canceled', finished_at = ?, updated_at = ? WHERE id = ? RETURNING *",
-  ).get(now, now, id);
+  const row = db.prepare(`
+    UPDATE tasks
+    SET status = 'canceled', finished_at = ?, updated_at = ?
+    WHERE id = ? AND status IN ('queued', 'running')
+    RETURNING *
+  `).get(now, now, id);
+  if (row === undefined) throw staleTransitionError(db, id, 'canceled');
   return rowToTask(row);
 }
 
 /**
- * 重新排队：failed | canceled → queued，attempts 归零、last_error / finished_at 清空。
- * started_at 保留（下次领取时覆盖），可空字段（branch / pr_url）也保留，方便接着上次的开 PR 结果。
+ * 重新排队：failed | canceled → queued；attempts 归零、last_error / finished_at 清空；
+ * started_at 保留（下次领取时覆盖），branch / pr_url 也保留（接着上次的开 PR 结果）。
+ * 原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @returns {TaskRow} 更新后的任务
+ * @throws {ValidationError} id 非正整数
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 当前状态不是 failed / canceled
  */
 export function retryTask(db, id) {
   assertPositiveInt(id, 'id');
-  const current = taskRow(db, id);
-  if (current.status !== 'failed' && current.status !== 'canceled') {
-    throw new InvalidTransitionError(current.status, 'queued');
-  }
   const now = nowIso();
   const row = db.prepare(`
     UPDATE tasks
     SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL, updated_at = ?
-    WHERE id = ?
+    WHERE id = ? AND status IN ('failed', 'canceled')
     RETURNING *
   `).get(now, id);
+  if (row === undefined) throw staleTransitionError(db, id, 'queued');
   return rowToTask(row);
 }
 
 /**
- * 服务重启时的恢复（单个 IMMEDIATE 事务）：所有 running 任务改回 queued，
- * 它们未结束的 run 标为 failed、error = 'interrupted'。返回受影响的任务 id（升序）。
+ * 服务重启时的恢复（单个 IMMEDIATE 事务）：所有 running 任务改回 queued，它们未结束
+ * 的 run 标为 failed、error = 'interrupted'。
  *
  * 取舍（规格未明说）：任务的 attempts / started_at 保留不重置——中断的那次算消耗掉，
  * 防止反复崩溃导致无限重试；run 的 finished_at 记恢复时刻，duration_ms 留 null，
  * 因为进程已死，真实耗时不可知（不拿停机时长冒充执行时长）。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {number[]} 受影响的任务 id（升序）
  */
 export function recoverStaleRunning(db) {
   const now = nowIso();
@@ -248,9 +370,18 @@ export function recoverStaleRunning(db) {
 // ---------------------------------------------------------------- 运行记录（runs）
 
 /**
- * 开始一次运行（status = running，prompts 先按默认 1 记，finishRun 时可覆盖）。
- * attempt 一般传任务当时的 attempts（≥ 1）。任务不存在抛 NotFoundError。
- * model / effort / logPath 必须是非空字符串，peak 布尔。
+ * 开始一次运行（status = 'running'，prompts 先按默认 1 记，finishRun 时可覆盖）。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} input
+ * @param {number} input.taskId 正整数，任务必须存在
+ * @param {number} input.attempt 正整数，一般传任务当时的 attempts（领取后 ≥ 1）
+ * @param {string} input.model 非空
+ * @param {string} input.effort 非空
+ * @param {boolean} input.peak 开始时是否高峰
+ * @param {string} input.logPath 非空
+ * @returns {RunRow} 新建的 run
+ * @throws {ValidationError} 任一字段缺失或类型不对（err.field 指明字段）
+ * @throws {NotFoundError} 任务不存在
  */
 export function startRun(db, { taskId, attempt, model, effort, peak, logPath } = {}) {
   assertPositiveInt(taskId, 'taskId');
@@ -274,10 +405,24 @@ export function startRun(db, { taskId, attempt, model, effort, peak, logPath } =
 const FINISH_RUN_STATUSES = ['succeeded', 'failed', 'timeout', 'canceled'];
 
 /**
- * 结束一次运行：只允许 running → 终态，自动写 finished_at 并算 duration_ms
- * （finished_at - started_at，钳到至少 1ms：同毫秒开始并结束也算正数）。
- * exitCode / numTurns / prompts / quotaUnits / error 只有给了才更新（undefined = 保持）。
- * prompts 不给时保持 startRun 写入的默认 1。返回更新后的 run。
+ * 结束一次运行。原子：UPDATE 带 `status = 'running'` 守卫，run 已被别的连接结束 /
+ * 恢复时抛错而不是覆盖。自动写 finished_at 并算 duration_ms = finished_at -
+ * started_at，钳到至少 1ms（同毫秒开始并结束的 run 也报告正数）。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} runId 正整数
+ * @param {object} fields
+ * @param {('succeeded'|'failed'|'timeout'|'canceled')} fields.status
+ * @param {?number} [fields.exitCode] 整数或 null；undefined = 保持原值
+ * @param {?number} [fields.numTurns] 非负整数或 null；undefined = 保持原值
+ * @param {number} [fields.prompts] 非负数值（列 NOT NULL DEFAULT 1，不接受 null）；
+ *   undefined = 保持 startRun 写入的 1
+ * @param {?number} [fields.quotaUnits] 数值或 null；undefined = 保持原值
+ * @param {?string} [fields.error] 字符串或 null；undefined = 保持原值
+ * @returns {RunRow} 更新后的 run
+ * @throws {ValidationError} runId 非正整数、status 不在允许集合（field='status'），
+ *   或可选字段给了却类型不对（field = 对应字段名）
+ * @throws {NotFoundError} run 不存在
+ * @throws {InvalidTransitionError} run 已不是 running（err.from 是库里实际的当前状态）
  */
 export function finishRun(db, runId, { status, exitCode, numTurns, prompts, quotaUnits, error } = {}) {
   assertPositiveInt(runId, 'runId');
@@ -286,11 +431,6 @@ export function finishRun(db, runId, { status, exitCode, numTurns, prompts, quot
       'status',
       `finishRun 只接受 ${FINISH_RUN_STATUSES.join(' | ')}（当前值：${status}）`,
     );
-  }
-  const current = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
-  if (current === undefined) throw new NotFoundError(runId, 'run');
-  if (current.status !== 'running') {
-    throw new InvalidTransitionError(current.status, status, 'run');
   }
   if (exitCode !== undefined && !(exitCode === null || Number.isInteger(exitCode))) {
     throw new ValidationError('exitCode', `必须是整数或 null（当前值：${exitCode}）`);
@@ -310,6 +450,10 @@ export function finishRun(db, runId, { status, exitCode, numTurns, prompts, quot
     throw new ValidationError('error', `必须是字符串或 null（当前值：${error}）`);
   }
 
+  // started_at 只在 startRun 时写、running 期间不变，可以先读再条件更新；
+  // 若期间被别的连接结束 / 恢复，下面的 UPDATE 会因状态守卫未命中而抛错。
+  const current = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
+  if (current === undefined) throw new NotFoundError(runId, 'run');
   const finishedAt = nowIso();
   const durationMs = Math.max(1, Date.parse(finishedAt) - Date.parse(current.started_at));
   const sets = ['status = ?', 'finished_at = ?', 'duration_ms = ?'];
@@ -320,14 +464,27 @@ export function finishRun(db, runId, { status, exitCode, numTurns, prompts, quot
   appendOptionalColumn(sets, params, ['quota_units', quotaUnits]);
   appendOptionalColumn(sets, params, ['error', error]);
   params.push(runId);
-  const row = db.prepare(`UPDATE runs SET ${sets.join(', ')} WHERE id = ? RETURNING *`).get(...params);
+  const row = db.prepare(
+    `UPDATE runs SET ${sets.join(', ')} WHERE id = ? AND status = 'running' RETURNING *`,
+  ).get(...params);
+  if (row === undefined) {
+    const nowCurrent = db.prepare('SELECT * FROM runs WHERE id = ?').get(runId);
+    if (nowCurrent === undefined) throw new NotFoundError(runId, 'run');
+    throw new InvalidTransitionError(nowCurrent.status, status, 'run');
+  }
   return rowToRun(row);
 }
 
 /**
  * 运行记录列表：started_at DESC → id DESC（同毫秒开始的按新 id 在前）。
- * taskId 可选按任务过滤；since 可选（Date 或 ISO 字符串，含等于）过滤 started_at >= since；
- * limit 默认 100。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} [options]
+ * @param {number} [options.taskId] 正整数，按任务过滤
+ * @param {Date|string} [options.since] 只取 started_at >= since（含等于）；字符串须能被
+ *   Date.parse 解析，比较前统一规范化成 UTC ISO
+ * @param {number} [options.limit=100] 正整数
+ * @returns {RunRow[]}
+ * @throws {ValidationError} taskId / limit 非正整数，或 since 不是合法时间（field='since'）
  */
 export function listRuns(db, { taskId, since, limit = 100 } = {}) {
   if (taskId !== undefined) assertPositiveInt(taskId, 'taskId');
@@ -387,11 +544,25 @@ function assertPositiveInt(value, field) {
   }
 }
 
+/** finishTask 的可选字段：undefined = 不更新；其余必须是字符串或 null。 */
+function assertOptionalString(value, field) {
+  if (value === undefined) return;
+  if (value !== null && typeof value !== 'string') {
+    throw new ValidationError(field, `必须是字符串或 null（当前值：${value}）`);
+  }
+}
+
 // 动态拼 SET 子句用：value !== undefined 才追加 `column = ?`（undefined = 保持原值）。
 function appendOptionalColumn(sets, params, [column, value]) {
   if (value === undefined) return;
   sets.push(`${column} = ?`);
   params.push(value);
+}
+
+// 条件 UPDATE 因状态守卫未命中时：任务不在了 → NotFoundError；
+// 状态被并发改掉 → InvalidTransitionError（按库里当前的实际情况报）。
+function staleTransitionError(db, id, to) {
+  return new InvalidTransitionError(taskRow(db, id).status, to);
 }
 
 function rowToTask(row) {
