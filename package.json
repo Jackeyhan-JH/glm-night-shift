@@ -1,0 +1,14 @@
+{
+  "name": "glm-night-shift",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "bin": {
+    "night-shift": "bin/night-shift.mjs"
+  }
+}

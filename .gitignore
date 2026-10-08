@@ -1,0 +1,7 @@
+node_modules/
+.glm-night-shift/
+NIGHT_SHIFT_FAKE.md
+*.log
+tmp/
+.DS_Store
+coverage/
