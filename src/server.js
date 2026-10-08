@@ -23,6 +23,7 @@ import { multiplierFor, toDate, usage } from './quota.js';
 import { HISTORY_DAYS_MAX, HISTORY_DAYS_MIN, hourlyUsage } from './stats.js';
 import {
   DIFFICULTIES,
+  DependencyBlockedError,
   InvalidTransitionError,
   NotFoundError,
   ValidationError,
@@ -218,6 +219,52 @@ function buildRoutes(deps, bumpSse) {
     } },
     { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/retry$/, handler: (ctx) => {
       sendJson(ctx.res, 200, retryTask(deps.db, parseId(ctx.params[0], '任务')));
+    } },
+    // 详情页「立刻跑」按钮的接口（#83）：让**当前进程里**的调度器点名跑一个排队任务
+    // （beginRunNow，与命令行 run-now 同一份领取逻辑），但**不等流水线结束**——领取
+    // 成功就回 202，浏览器靠状态刷新与日志流看进展。请求体必须是空对象 {}：多出来的
+    // 键 → 400 点名字段，不领取。判定顺序：未知字段 → id → 不存在（404）→ 非 queued
+    // （409，不碰调度器）→ 调度器没在跑（409）→ beginRunNow。与 runNow 一样不检查
+    // 高峰 / 额度 / 手动暂停 / 限流退避 / not_before / 并发上限 / 同仓库互斥；依赖没
+    // 完成时 claimTaskById 抛 DependencyBlockedError（409，任务仍是 queued）。
+    { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/run-now$/, handler: (ctx) => {
+      for (const key of Object.keys(ctx.body)) {
+        throw new HttpError(400, `未知字段：${key}（请求体必须是空对象 {}）`, key);
+      }
+      const id = parseId(ctx.params[0], '任务');
+      const task = getTask(deps.db, id);
+      if (task === null) throw new NotFoundError(id); // 与 GET 详情同一条 404
+      if (task.status !== 'queued') {
+        // 已 running / 终态都不点名：此时再碰调度器只会得到竞态版的同一句
+        throw new HttpError(409, runNowNotQueuedMessage(id, task.status));
+      }
+      if (deps.scheduler === null || deps.scheduler === undefined) {
+        throw new HttpError(409, '调度器没在跑'); // serve-api 没挂调度器：没进程能执行它
+      }
+      let started;
+      try {
+        started = deps.scheduler.beginRunNow(id);
+      } catch (err) {
+        if (err instanceof DependencyBlockedError) {
+          // message 自带 #<id>（<status>）清单；任务仍是 queued，不要改写成「不是 queued」
+          throw new HttpError(409, err.message);
+        }
+        if (err instanceof InvalidTransitionError) {
+          // 竞态：GET 与领取之间任务被别的进程改了状态，from 用库里实际的状态
+          throw new HttpError(409, runNowNotQueuedMessage(id, err.from));
+        }
+        if (err instanceof NotFoundError) throw err; // 统一映射成 404
+        if (err instanceof Error && err.message.startsWith('调度器正在停止')) {
+          throw new HttpError(409, err.message); // 停止中的拒绝原句，不改写
+        }
+        throw err; // 其余错误不吞（TypeError 等按 500 如实暴露）
+      }
+      // 不 await done：响应必须先于流水线结束发出。processTask 承诺不 reject，这里的
+      // catch 只是兜底（与 doTick 调 processTask 同一款防御），防实现失误变成 unhandled rejection。
+      started.done.catch((err) => {
+        console.error(`[server] run-now 任务 ${id} 流水线意外失败：`, err);
+      });
+      sendJson(ctx.res, 202, { id: started.id, status: 'running' });
     } },
     // 详情页「跟进」按钮的接口（#68）：判定全部交给 followTask（与命令行 follow <id>
     // 同一份，不另写一套，也不在路由里先挑高峰 / autoFollowReviews / 状态——那是调度器
@@ -940,6 +987,17 @@ function parseId(raw, kind) {
  * 其余（不能跟进、prUrl 解析不出 PR 编号、入队失败）→ 409。句子原样送出去，不改写。 */
 function followFailureStatus(message) {
   return String(message).includes('gh pr view 失败') ? 502 : 409;
+}
+
+/**
+ * run-now 的「不是 queued」错误句（#83）：与命令行 run-now 的同一句（src/cli/run-commands.js
+ * 对 InvalidTransitionError 的改写）一字不差，前端 / 排错不用学第二套文案。
+ * @param {number} id 任务 id
+ * @param {string} status 库里实际的当前状态（GET 读到的，或竞态后 err.from）
+ */
+function runNowNotQueuedMessage(id, status) {
+  return `任务 #${id} 当前状态是 ${status}，不是 queued；run-now 只执行排队中的任务`
+    + '（失败/已取消的任务先用 retry 放回队列）';
 }
 
 function requireRun(db, id) {

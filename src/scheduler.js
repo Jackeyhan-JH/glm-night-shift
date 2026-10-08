@@ -70,7 +70,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   生产环境的 claude 正是靠 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN 等变量连
  *   GLM，在这里剥掉它们会让执行器失去凭据；需要隔离时由调用方（如测试的
  *   fakeEnv()）先构造好再传入。git.js 内部的 git 命令仍走它自己的 process.env。
- * @returns {object} 调度器：{ events, start, tick, stop, runNow, status }
+ * @returns {object} 调度器：{ events, start, tick, stop, beginRunNow, runNow, status }
  *   （各方法的语义见下方 JSDoc）
  * @throws {TypeError} 任一参数缺失或类型不符（db/config/home/env 非对象、home 非非空
  *   字符串、clock/runner 非函数、concurrency 非正整数、pollSeconds / cancelPollMs /
@@ -192,9 +192,28 @@ export function createScheduler({
     stop,
 
     /**
+     * 点名立刻跑一个任务，**不等结束**（#83 把 runNow 的「领取」与「等到结束」拆开，
+     * HTTP 路由用它立刻回 202）。领取前的检查与 runNow 完全相同：normalizeTaskId、
+     * 停止中抛同一句、claimTaskById。领取成功后立刻调用 processTask——流水线已经开始、
+     * 任务已同步登记进 running——但不 await；返回的 done 就是 processTask 的 Promise
+     * （永不 reject，resolve 流水线结束后的任务）。领取没发生（非法 id / 停止中 /
+     * 非 queued / 在等依赖 / 不存在）时什么都不会启动。
+     * @param {number|string} taskId 正整数或其字符串形式
+     * @returns {{ id: number, status: 'running', done: Promise<import('./tasks.js').TaskRow> }}
+     * @throws {TypeError} taskId 不是正整数（或数字字符串）
+     * @throws {Error} 调度器正在停止（stop 后未重启）
+     * @throws {import('./tasks.js').NotFoundError} 任务不存在
+     * @throws {import('./tasks.js').DependencyBlockedError} 任务在等依赖（见 runNow 的说明）
+     * @throws {InvalidTransitionError} 任务当前不是 queued（原子领取保证同一任务绝不会
+     *   被执行两次）
+     */
+    beginRunNow,
+
+    /**
      * 点名立刻跑一个任务：无视高峰、额度、限流暂停、手动暂停（#38 的 userPaused）、
      * not_before 与并发上限（用户显式要求「现在就跑」），走完整流水线，返回最终任务
-     * 对象（Promise）。
+     * 对象（Promise）。对外语义与 #83 拆分前完全一致——命令行 run-now 仍靠它等到结束
+     * 再打印结果、定退出码；实现上就是 beginRunNow 领取启动后等它的 done。
      * 任务会在 running 里登记（stop / 取消轮询 / status 都能看到它）。
      * id 接受数字或数字字符串（"12"）；只领 queued 的任务。
      * **不绕过任务依赖**（#11）：依赖还没全部 succeeded 时 claimTaskById 抛
@@ -212,12 +231,8 @@ export function createScheduler({
      *   tick 领走正在 running——原子领取保证同一任务绝不会被执行两次）
      */
     async runNow(taskId) {
-      const id = normalizeTaskId(taskId);
-      if (stopping) {
-        throw new Error(`调度器正在停止，runNow 被拒绝（任务 ${id} 未领取；重启调度器后再试）`);
-      }
-      const task = claimTaskById(db, id); // 非 queued 或在等依赖都抛 InvalidTransitionError（后者是子类 DependencyBlockedError）
-      return processTask(task);
+      const started = beginRunNow(taskId);
+      return started.done;
     },
 
     /**
@@ -418,6 +433,21 @@ export function createScheduler({
   }
 
   // ---------------------------------------------------------------- 单任务流水线
+
+  /**
+   * beginRunNow 的实现（挂在调度器对象上，语义见其 JSDoc）：runNow 的「领取 + 启动」
+   * 前半段。停止中的拒绝必须发生在 claim 之前（任务状态不变）；claimTaskById 的语义
+   * （只领 queued、不绕过依赖、原子守卫）与 runNow 完全同一份。
+   */
+  function beginRunNow(taskId) {
+    const id = normalizeTaskId(taskId);
+    if (stopping) {
+      throw new Error(`调度器正在停止，runNow 被拒绝（任务 ${id} 未领取；重启调度器后再试）`);
+    }
+    const task = claimTaskById(db, id); // 非 queued 或在等依赖都抛 InvalidTransitionError（后者是子类 DependencyBlockedError）
+    const done = processTask(task); // 不 await：调用方（HTTP 路由）拿着 done 先回话
+    return { id: task.id, status: 'running', done };
+  }
 
   /**
    * 登记并执行一个已领取的任务（tick 领到的与 runNow 点名的都走这里）。
