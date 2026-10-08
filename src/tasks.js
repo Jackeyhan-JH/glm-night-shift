@@ -1087,6 +1087,8 @@ function rowToRun(row) {
     numTurns: row.num_turns,
     prompts: row.prompts,
     quotaUnits: row.quota_units,
+    // #12 迁移（版本 4）的 runs.kind / runs.diagnosis，#16 详情页靠这里透传：
+    // kind 为空则类型列不显示，diagnosis 有值才展开。两边都留，不重复键。
     kind: row.kind,
     diagnosis: row.diagnosis,
     logPath: row.log_path,

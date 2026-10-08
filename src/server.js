@@ -1,5 +1,6 @@
 // 看板后端（issue #14）：node:http 实现的只听本机的小服务——任务的增删查与操作、
-// 运行日志全文 / SSE 实时跟踪、高峰与额度状态、近几天的用量统计，顺带托管 web/ 静态页。
+// 运行日志全文 / SSE 实时跟踪、高峰与额度状态、近几天的用量统计、任务模板接口（#15），
+// 顺带托管 web/ 静态页。
 // 零依赖；不加载 node:sqlite（连接由调用方 openDb 后传入），SSE 只依赖「runs.log_path
 // 指向的日志文件每行一条」的约定（见 #7），不依赖执行器。
 //
@@ -27,9 +28,16 @@ import {
   listTasks,
   retryTask,
 } from './tasks.js';
+import { listTemplates, loadTemplate, renderTemplate } from './templates.js';
 
 /** web/ 静态文件根目录（src/server.js 的上一级里的 web/）。 */
 const WEB_ROOT = path.resolve(fileURLToPath(new URL('../web', import.meta.url)));
+/** src/ 里允许浏览器按路径只读取用的模块白名单（issue #17：额度页在浏览器里
+ *  import /src/peak.js 复用高峰纯函数算高峰带与未来时段，不把这些结果塞进 /api/status）。
+ *  只此一个路径——其余 src/** 一律不暴露。 */
+const SRC_FILES = new Map([
+  ['/src/peak.js', path.resolve(fileURLToPath(new URL('./peak.js', import.meta.url)))],
+]);
 /** POST 请求体上限（issue 规格：1MB）。 */
 const MAX_BODY_BYTES = 1024 * 1024;
 /** SSE：轮询兜底间隔（fs.watch 在网络盘 / 部分文件系统上不发事件，也是发现日志文件被创建、运行结束的手段）。 */
@@ -48,9 +56,11 @@ const MIME_TYPES = new Map([
   ['.png', 'image/png'],
 ]);
 
-/** POST /api/tasks 允许的请求体字段（createTask 的可选输入；未知字段 → 400 点名字段）。 */
+/** POST /api/tasks 允许的请求体字段（createTask 的可选输入；未知字段 → 400 点名字段）。
+ * #15 增加 dependsOn / template / vars（见 renderTemplateBody）。 */
 const TASK_BODY_FIELDS = new Set([
   'repo', 'prompt', 'title', 'difficulty', 'priority', 'testCommand', 'allowPeak', 'maxAttempts',
+  'dependsOn', 'template', 'vars',
 ]);
 
 /**
@@ -79,13 +89,15 @@ class HttpError extends Error {
  * @param {string} [options.home] 数据目录（预留：目前日志路径都来自 runs.log_path 绝对路径）
  * @param {() => Date} [options.clock=systemClock()] 时钟（测试用 NIGHT_SHIFT_NOW 固定时间）
  * @param {{ status: () => object }} [options.scheduler=null] 调度器（#18 传入；有则 /api/status 带上它的 status()）
+ * @param {object} [options.env=process.env] 传给 gh 子进程的环境变量（模板 fetchIssue 用；
+ *   测试用它注入 FAKE_GH_* 开关，见 test/server-templates.test.js）
  * @returns {import('node:http').Server} 未监听的 http.Server；额外挂了 sseConnections
  *   getter（当前存活的 SSE 连接数，测试断言断开清理用）
  */
-export function createServer({ db, config, home, clock = systemClock(), scheduler = null } = {}) {
+export function createServer({ db, config, home, clock = systemClock(), scheduler = null, env = process.env } = {}) {
   if (db === undefined || db === null) throw new Error('createServer 需要 db（openDb 的返回值）');
   if (config === undefined || config === null) throw new Error('createServer 需要 config（loadConfig 的返回值）');
-  const deps = { db, config, home, clock, scheduler };
+  const deps = { db, config, home, clock, scheduler, env };
 
   let sseConnections = 0;
   const bumpSse = (delta) => { sseConnections += delta; };
@@ -118,17 +130,37 @@ function buildRoutes(deps, bumpSse) {
         limit: limitRaw === undefined ? undefined : Number(limitRaw),
       }));
     } },
-    { method: 'POST', pattern: /^\/api\/tasks$/, handler: (ctx) => {
+    { method: 'POST', pattern: /^\/api\/tasks$/, handler: async (ctx) => {
       for (const key of Object.keys(ctx.body)) {
         if (!TASK_BODY_FIELDS.has(key)) {
           throw new HttpError(400, `未知字段：${key}（允许：${[...TASK_BODY_FIELDS].join(' | ')}）`, key);
         }
       }
+      if (ctx.body.template !== undefined && ctx.body.prompt !== undefined) {
+        throw new HttpError(400, 'template 与 prompt 不能同时提供：prompt 由模板渲染生成', 'template');
+      }
+      if (ctx.body.vars !== undefined && !isPlainObject(ctx.body.vars)) {
+        throw new HttpError(400, `vars 必须是「变量名: 值」的对象（当前值：${JSON.stringify(ctx.body.vars)}）`, 'vars');
+      }
+      const fields = ctx.body.template === undefined
+        ? ctx.body
+        : await renderTemplateBody(deps, ctx.body);
       const task = createTask(deps.db, {
-        ...ctx.body,
-        maxAttempts: ctx.body.maxAttempts ?? deps.config.maxAttempts, // 缺省取配置
+        ...fields,
+        maxAttempts: fields.maxAttempts ?? deps.config.maxAttempts, // 缺省取配置
       });
       sendJson(ctx.res, 201, task);
+    } },
+    { method: 'GET', pattern: /^\/api\/templates$/, handler: (ctx) => {
+      // listTemplates 的结果去掉 path（服务端文件绝对路径，页面用不上，不往外发）。
+      sendJson(ctx.res, 200, listTemplates({ home: deps.home }).map((tpl) => ({
+        name: tpl.name,
+        description: tpl.description,
+        difficulty: tpl.difficulty,
+        testCommand: tpl.testCommand,
+        vars: tpl.vars,
+        source: tpl.source,
+      })));
     } },
     { method: 'GET', pattern: /^\/api\/tasks\/(\d+)$/, handler: (ctx) => {
       const id = parseId(ctx.params[0], '任务');
@@ -177,6 +209,8 @@ function buildRoutes(deps, bumpSse) {
         },
         usage: usage(runs, now, { plan: deps.config.plan, weekStart: deps.config.weekStart }),
         plan: deps.config.plan,
+        // 额度页判定「超过安全阈值标黄」用的阈值（issue #17；与配置里的 safetyRatio 同源）。
+        safetyRatio: deps.config.safetyRatio,
         runningCount: countTasks(deps.db, 'running'),
         queuedCount: countTasks(deps.db, 'queued'),
         scheduler: deps.scheduler === null || deps.scheduler === undefined
@@ -199,6 +233,50 @@ function buildRoutes(deps, bumpSse) {
       sendJson(ctx.res, 200, hourlyUsage(runs, now, days));
     } },
   ];
+}
+
+// ---------------------------------------------------------------- 模板建任务（#15）
+
+/**
+ * POST /api/tasks 带 template 时的字段预处理：renderTemplate 生成 prompt（可能要 spawn
+ * gh 拉 issue，故异步），显式给出的 title / difficulty / testCommand 优先于模板默认值
+ * （命令行 add --template 同一套语义，见 src/cli/task-commands.js）。
+ *
+ * 渲染失败统一 400：ValidationError 保留自带 field（vars / template / repo / prompt，
+ * 如「缺少必填变量：issue」）；模板不存在归到 template 字段；gh 执行失败这类意外错误
+ * 也归到 template 字段（issue 规格：field 为 vars 或 template）。
+ * @param {object} deps createServer 的依赖集（home / config / env）
+ * @param {object} body 已通过字段白名单的请求体（template 与 prompt 互斥已在上游保证）
+ * @returns {Promise<object>} createTask 的输入（template / vars 已剥离，prompt 已生成）
+ */
+async function renderTemplateBody(deps, body) {
+  const { template, vars, ...rest } = body;
+  let rendered;
+  try {
+    rendered = await renderTemplate(loadTemplate(template, { home: deps.home }), vars ?? {}, {
+      repo: rest.repo,
+      config: deps.config,
+      env: deps.env,
+    });
+  } catch (err) {
+    if (err instanceof ValidationError) throw err;
+    if (err instanceof NotFoundError) {
+      throw new HttpError(400, `模板 ${template} 不存在（可用模板见 GET /api/templates）`, 'template');
+    }
+    throw new HttpError(400, `模板 ${template} 渲染失败：${err.message}`, 'template');
+  }
+  return {
+    ...rest,
+    prompt: rendered.prompt,
+    title: rest.title ?? rendered.title,
+    difficulty: rest.difficulty ?? rendered.difficulty,
+    testCommand: rest.testCommand ?? rendered.testCommand,
+  };
+}
+
+/** JSON 里的「普通对象」：非 null 非数组的对象（vars 的形状检查）。 */
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 async function handleRequest(req, res, routes) {
@@ -476,7 +554,8 @@ function resolveStaticPath(pathname) {
 }
 
 function serveStatic(req, res, pathname) {
-  const filePath = resolveStaticPath(pathname);
+  // 白名单里的 src/ 模块直接按绝对路径取；其余仍按 web/ 内的相对路径解析（越界 → 404）。
+  const filePath = SRC_FILES.get(pathname) ?? resolveStaticPath(pathname);
   let data = null;
   if (filePath !== null) {
     try {
