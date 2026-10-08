@@ -19,7 +19,7 @@ test('package.json 符合骨架约定', () => {
 });
 
 test('入口和假替身都有可执行位', () => {
-  for (const file of ['bin/night-shift.mjs', 'test/fixtures/fake-claude.mjs', 'test/fixtures/fake-gh.mjs']) {
+  for (const file of ['bin/night-shift.mjs', 'test/fixtures/fake-claude.mjs', 'test/fixtures/fake-gh.mjs', 'test/fixtures/fake-systemctl.mjs']) {
     const mode = fs.statSync(path.join(repoRoot, file)).mode;
     assert.ok((mode & 0o111) !== 0, `${file} 应可执行`);
   }

@@ -20,7 +20,7 @@ const STRIP_ENV_KEYS = new Set([
   'NODE_TEST_CONTEXT',
   'MAX_THINKING_TOKENS',
 ]);
-const STRIP_ENV_PREFIXES = ['NIGHT_SHIFT_', 'FAKE_CLAUDE_', 'FAKE_GH_'];
+const STRIP_ENV_PREFIXES = ['NIGHT_SHIFT_', 'FAKE_CLAUDE_', 'FAKE_GH_', 'FAKE_SYSTEMCTL_'];
 
 let sandbox = null;
 
@@ -97,8 +97,21 @@ function ensureSandbox() {
     fs.writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${fixturePath(fixture)}" "$@"\n`);
     fs.chmodSync(shim, 0o755);
   }
+  // systemctl 陷阱：沙箱 PATH 上的 systemctl 记一笔就退出 99。任何忘了把
+  // NIGHT_SHIFT_SYSTEMCTL_BIN 指到假替身的测试都会在这里失败（fail closed），
+  // 绝不会碰到真实 systemd。默认配置的 systemctlBin 就是 'systemctl'（走 PATH），
+  // 所以这个陷阱正是默认路径的保险丝；服务相关测试会显式覆盖成会成功的假替身。
+  const trapLog = path.join(root, 'systemctl-trap.log');
+  const trap = path.join(dirs.shim, 'systemctl');
+  fs.writeFileSync(trap, `#!/bin/sh\necho trap >> ${shellQuote(trapLog)}\nexit 99\n`);
+  fs.chmodSync(trap, 0o755);
   // 进程退出时删掉整个沙箱，避免在 /tmp 残留。
   process.once('exit', () => fs.rmSync(root, { recursive: true, force: true }));
-  sandbox = dirs;
+  sandbox = { ...dirs, systemctlTrapLog: trapLog };
   return sandbox;
+}
+
+/** 单引号包裹路径给 /bin/sh 用（内嵌单引号按 '\'' 转义）。 */
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }

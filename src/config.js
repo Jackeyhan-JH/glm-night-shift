@@ -35,6 +35,8 @@ export const DEFAULT_CONFIG = deepFreeze({
   autoDiagnose: true,          // 普通失败且还有重试次数时，先用便宜模型诊断再重跑
   diagnoseModel: 'glm-5.3-flash', // 诊断用的便宜模型
   diagnoseTimeoutMinutes: 5,   // 诊断超时（诊断不该比任务本身还久）
+  // —— issue #18 新增（一键启动 serve 与 systemd 用户服务），按约定追加在对象末尾 ——
+  systemctlBin: 'systemctl',   // install/uninstall-service 用的 systemctl 可执行文件
 });
 
 /**
@@ -115,6 +117,8 @@ function applyEnvOverrides(config, env) {
   if (claudeBin !== undefined) config.claudeBin = claudeBin;
   const ghBin = readEnvValue(env, 'NIGHT_SHIFT_GH_BIN');
   if (ghBin !== undefined) config.ghBin = ghBin;
+  const systemctlBin = readEnvValue(env, 'NIGHT_SHIFT_SYSTEMCTL_BIN');
+  if (systemctlBin !== undefined) config.systemctlBin = systemctlBin;
   const portRaw = readEnvValue(env, 'NIGHT_SHIFT_PORT');
   if (portRaw !== undefined) {
     const port = Number(portRaw);
