@@ -1,9 +1,10 @@
 // 队列页的纯函数库（issue #15）：按状态分组、依赖提示文本、状态条文案、表单数据 →
 // POST /api/tasks 请求体、HTML 转义、lastError 第一行；#46 增加编辑排队中任务的
-// 纯函数（行操作按钮、表单模式视图、任务 → 表单值、表单 → PATCH 请求体）。全部是
-// 无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器环境，node:test 直接
-// 单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js）；DOM 与网络
-// 逻辑在 queue.js。
+// 纯函数（行操作按钮、表单模式视图、任务 → 表单值、表单 → PATCH 请求体）；#50 增加
+// 仓库筛选与「从 GitHub 导入 / 清理磁盘」两个面板的纯函数（选项、过滤、请求体、结果
+// 文案）。全部是无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器环境，
+// node:test 直接单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js /
+// test/board-import.test.js）；DOM 与网络逻辑在 queue.js。
 
 /** 历史标签最多展示的条数（issue 规格：最近 100 条）。 */
 export const HISTORY_LIMIT = 100;
@@ -256,4 +257,100 @@ export function editBody(form) {
   const maxAttempts = toSafeInt(form.maxAttempts);
   if (maxAttempts !== null && maxAttempts >= 1) body.maxAttempts = maxAttempts;
   return body;
+}
+
+// ---------------------------------------------------------------- 仓库筛选与导入/清理面板（#50）
+
+/** 仓库筛选「全部」选项的值（空串：真实仓库值不会为空，不会撞车）。 */
+export const REPO_FILTER_ALL = '';
+
+/**
+ * 仓库筛选的选项（#50）：这一页已经拉到的任务里出现过的仓库（去重、按字节序），
+ * 最前面外加「全部」（值为 REPO_FILTER_ALL）。只在浏览器里过滤，不发 repo 查询参数。
+ * @param {Array<object>} tasks 当前已拉到的任务（GET /api/tasks 的返回）
+ * @returns {string[]} 选项值数组（首项是 REPO_FILTER_ALL）
+ */
+export function repoFilterOptions(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const repos = [...new Set(
+    list.map((t) => String(t?.repo ?? '')).filter((repo) => repo !== ''),
+  )].sort();
+  return [REPO_FILTER_ALL, ...repos];
+}
+
+/**
+ * 仓库筛选（#50）：选中某仓库后只留该仓库的任务（新数组，不改入参）；「全部」
+ * （空串 / null / undefined）原样全留。三个标签的表格都用它先滤再分组。
+ * @param {Array<object>} tasks 当前已拉到的任务
+ * @param {string} selected 选中的仓库（REPO_FILTER_ALL = 全部）
+ * @returns {Array<object>} 筛出来的任务
+ */
+export function filterTasksByRepo(tasks, selected) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  if (selected === null || selected === undefined || selected === REPO_FILTER_ALL) {
+    return [...list];
+  }
+  return list.filter((t) => t?.repo === selected);
+}
+
+/**
+ * 导入面板的原始输入 → POST /api/import 的请求体（#50）。预览与确认是同一组
+ * repo / label / difficulty，只有 dryRun 不同（预览 true 不落库，确认 false 真正入队）。
+ * 文本 trim；空标签不进请求体（= gh 参数里不带 --label，与命令行缺省一致）。
+ * @param {object} form { repo, label, difficulty }（queue.js 从 DOM 收集，值多为字符串）
+ * @param {boolean} dryRun
+ * @returns {object} 请求体
+ */
+export function importBody(form, dryRun) {
+  const body = { repo: String(form.repo ?? '').trim() };
+  const label = String(form.label ?? '').trim();
+  if (label !== '') body.label = label;
+  body.difficulty = String(form.difficulty ?? '').trim() || 'medium';
+  body.dryRun = dryRun === true;
+  return body;
+}
+
+/** POST /api/import 响应里 added / skipped 数组的安全长度（残缺响应当 0）。 */
+function resultCount(result, key) {
+  return Array.isArray(result?.[key]) ? result[key].length : 0;
+}
+
+/** 导入预览的一行文案（预览写出将新增和将跳过的数量）。 */
+export function importPreviewText(result) {
+  return `将新增 ${resultCount(result, 'added')} 个，跳过 ${resultCount(result, 'skipped')} 个`;
+}
+
+/** 导入完成的一行文案（数量语义与 import 命令的合计行一致）。 */
+export function importDoneText(result) {
+  return `新增 ${resultCount(result, 'added')} 个，跳过 ${resultCount(result, 'skipped')} 个`;
+}
+
+/**
+ * 清理面板 → POST /api/cleanup 的请求体（#50）：预览 dryRun true、确认 false；
+ * logsOlderThan 用服务端缺省（14 天），面板不另设天数输入。
+ * @param {boolean} dryRun
+ * @returns {{ dryRun: boolean }} 请求体
+ */
+export function cleanupBody(dryRun) {
+  return { dryRun: dryRun === true };
+}
+
+/**
+ * 清理预览的多行文案：第一行是将删的数量，其后逐行列出将删除的路径
+ * （worktrees 在前、logs 在后）。
+ */
+export function cleanupPreviewText(result) {
+  const worktrees = Array.isArray(result?.worktrees) ? result.worktrees : [];
+  const logs = Array.isArray(result?.logs) ? result.logs : [];
+  const lines = [`将删除 worktree ${worktrees.length} 个、日志 ${logs.length} 个`];
+  for (const p of worktrees) lines.push(String(p));
+  for (const p of logs) lines.push(String(p));
+  return lines.join('\n');
+}
+
+/** 清理完成的一行文案（failed 时页面错误条另有「有的没删掉」提示，不在这里重复）。 */
+export function cleanupDoneText(result) {
+  const worktrees = Array.isArray(result?.worktrees) ? result.worktrees : [];
+  const logs = Array.isArray(result?.logs) ? result.logs : [];
+  return `已删除 worktree ${worktrees.length} 个、日志 ${logs.length} 个`;
 }

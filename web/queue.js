@@ -1,21 +1,33 @@
 // 队列与操作页（issue #15）：状态条（含 #38 的手动暂停/恢复按钮）、三个标签（排队中 /
 // 运行中 / 历史）、每行取消/重试、新增任务表单（模板下拉 + 按模板动态生成变量输入 +
 // 依赖多选）。#46：排队中的行多了「修改」，复用新增表单装进任务值、提交改走 PATCH。
-// DOM 与网络都在这里，纯函数（分组、提示文本、表单转请求体……）在 queue-lib.js。
+// #50：状态条附近多了「从 GitHub 导入」「清理磁盘」两个入口（先预览后确认）与表格
+// 上方的仓库筛选（浏览器内过滤，不发 repo 参数）。DOM 与网络都在这里，纯函数（分组、
+// 提示文本、表单转请求体、筛选、预览文案……）在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
-// 刷新只重绘状态条 / 标签 / 表格 / 依赖下拉的选项，不重建表单其余输入——正在填写的
-// 内容不会被轮询打断。所有异步都就地捕获，页面不会往控制台抛未处理异常。
+// 刷新只重绘状态条 / 标签 / 仓库筛选 / 表格 / 依赖下拉的选项，不重建表单其余输入、
+// 也不动两个面板——正在填写的内容不会被轮询打断。所有异步都就地捕获，页面不会往
+// 控制台抛未处理异常。
 import { api, fmtTime, navHtml, statusLabel } from '/common.js';
 import {
+  REPO_FILTER_ALL,
+  cleanupBody,
+  cleanupDoneText,
+  cleanupPreviewText,
   depHint,
   editBody,
   escapeHtml,
+  filterTasksByRepo,
   firstLine,
   formModeView,
   formToBody,
   groupTasks,
+  importBody,
+  importDoneText,
+  importPreviewText,
   pauseToggleView,
+  repoFilterOptions,
   statusBarText,
   taskRowActions,
   taskToForm,
@@ -41,6 +53,7 @@ const els = {
   statusbar: document.getElementById('statusbar'),
   tabs: document.getElementById('tabs'),
   table: document.getElementById('task-table'),
+  repoFilter: document.getElementById('repo-filter'),
   form: document.getElementById('add-form'),
   heading: document.getElementById('form-heading'),
   submitBtn: document.getElementById('form-submit'),
@@ -55,6 +68,23 @@ const els = {
   difficulty: document.getElementById('f-difficulty'),
   allowPeak: document.getElementById('f-allow-peak'),
   depends: document.getElementById('f-depends'),
+  // #50：导入 / 清理两个面板（面板本身在 HTML 里只建一次）
+  importToggle: document.getElementById('import-toggle'),
+  importPanel: document.getElementById('import-panel'),
+  importRepo: document.getElementById('i-repo'),
+  importLabel: document.getElementById('i-label'),
+  importDifficulty: document.getElementById('i-difficulty'),
+  importPreview: document.getElementById('i-preview'),
+  importConfirm: document.getElementById('i-confirm'),
+  importCancel: document.getElementById('i-cancel'),
+  importError: document.getElementById('import-error'),
+  importResult: document.getElementById('import-result'),
+  cleanupToggle: document.getElementById('cleanup-toggle'),
+  cleanupPanel: document.getElementById('cleanup-panel'),
+  cleanupPreview: document.getElementById('c-preview'),
+  cleanupConfirm: document.getElementById('c-confirm'),
+  cleanupCancel: document.getElementById('c-cancel'),
+  cleanupResult: document.getElementById('cleanup-result'),
 };
 
 // 状态条 = 文本 span + 暂停/恢复按钮（#38）。按钮只建一次，轮询刷新只改文本与
@@ -65,8 +95,14 @@ pauseToggle.type = 'button';
 pauseToggle.id = 'pause-toggle';
 els.statusbar.append(statusText, pauseToggle);
 
-/** 页面状态：最近一次拉到的任务 / 模板 / 状态与当前标签。 */
-const state = { tasks: [], templates: [], status: null, activeTab: 'queued' };
+/** 页面状态：最近一次拉到的任务 / 模板 / 状态、当前标签与仓库筛选（#50）。 */
+const state = {
+  tasks: [],
+  templates: [],
+  status: null,
+  activeTab: 'queued',
+  repoFilter: REPO_FILTER_ALL,
+};
 
 /** 正在编辑的任务 id（#46）；null = 表单是「新增任务」模式。轮询刷新不重绘表单，
  * 填到一半的编辑不会被冲掉（与新增一致）。 */
@@ -74,7 +110,7 @@ let editingId = null;
 
 // ---------------------------------------------------------------- 数据与渲染
 
-/** 拉状态条与任务列表并重绘（表单不动）。失败抛给调用方（轮询里静默吞掉）。 */
+/** 拉状态条与任务列表并重绘（表单与两个面板不动）。失败抛给调用方（轮询里静默吞掉）。 */
 async function refresh() {
   const [status, tasks] = await Promise.all([
     api('/api/status'),
@@ -83,6 +119,7 @@ async function refresh() {
   state.status = status;
   state.tasks = Array.isArray(tasks) ? tasks : [];
   renderStatusBar();
+  renderRepoFilter();
   renderTabs();
   renderTable();
   renderDependOptions();
@@ -95,8 +132,31 @@ function renderStatusBar() {
   pauseToggle.textContent = view.buttonLabel;
 }
 
+/**
+ * 仓库筛选（#50）：选项 = 当前已拉到的任务里出现过的仓库 +「全部」。选中的仓库还
+ * 在选项里时保持选中（轮询不重置）；不在了（任务翻出这一页）才回到「全部」。选项
+ * 没变时只同步选中值，不重建 <option>——用户正展开着下拉时不被打断。
+ */
+function renderRepoFilter() {
+  const options = repoFilterOptions(state.tasks);
+  if (!options.includes(state.repoFilter)) state.repoFilter = REPO_FILTER_ALL;
+  const current = [...els.repoFilter.options].map((o) => o.value);
+  if (current.length !== options.length || current.some((v, i) => v !== options[i])) {
+    els.repoFilter.innerHTML = options.map((repo) => {
+      const label = repo === REPO_FILTER_ALL ? '全部' : repo;
+      return `<option value="${escapeHtml(repo)}">${escapeHtml(label)}</option>`;
+    }).join('');
+  }
+  els.repoFilter.value = state.repoFilter;
+}
+
+/** 仓库筛选后的任务（#50）：标签数量与表格行都基于这一份，三个标签都生效。 */
+function visibleTasks() {
+  return filterTasksByRepo(state.tasks, state.repoFilter);
+}
+
 function renderTabs() {
-  const groups = groupTasks(state.tasks);
+  const groups = groupTasks(visibleTasks());
   els.tabs.innerHTML = TABS.map(({ key, label }) => {
     const active = key === state.activeTab;
     return `<button type="button" role="tab" aria-selected="${active}" data-tab="${key}"` +
@@ -105,7 +165,7 @@ function renderTabs() {
 }
 
 function renderTable() {
-  const groups = groupTasks(state.tasks);
+  const groups = groupTasks(visibleTasks());
   const tasks = groups[state.activeTab] ?? [];
   if (tasks.length === 0) {
     els.table.innerHTML = '<div class="card empty-hint">这个标签下还没有任务</div>';
@@ -397,6 +457,104 @@ function hideFormError() {
   els.formError.hidden = true;
 }
 
+// ---------------------------------------------------------------- 从 GitHub 导入（#50）
+
+/** 导入面板的原始输入（值多为字符串；转请求体交给 queue-lib 的 importBody）。 */
+function importFormValues() {
+  return {
+    repo: els.importRepo.value,
+    label: els.importLabel.value,
+    difficulty: els.importDifficulty.value,
+  };
+}
+
+function showImportError(message) {
+  els.importError.textContent = message;
+  els.importError.hidden = false;
+}
+
+function hideImportError() {
+  els.importError.hidden = true;
+}
+
+/** 预览（dry-run）：写出将新增 / 将跳过的数量；成功后才亮出「确认导入」。 */
+async function onImportPreview(event) {
+  event.preventDefault();
+  hideImportError();
+  const form = importFormValues();
+  if (String(form.repo).trim() === '') {
+    showImportError('仓库必填：owner/name');
+    return;
+  }
+  els.importPreview.disabled = true;
+  try {
+    const result = await api('/api/import', { method: 'POST', body: importBody(form, true) });
+    els.importResult.textContent = importPreviewText(result);
+    els.importResult.hidden = false;
+    els.importConfirm.hidden = false;
+  } catch (err) {
+    showImportError(err.message);
+  } finally {
+    els.importPreview.disabled = false;
+  }
+}
+
+/** 确认导入（dry-run=false，同一 repo/label/difficulty）：完成后刷新表格。 */
+async function onImportConfirm() {
+  const form = importFormValues();
+  els.importConfirm.disabled = true;
+  try {
+    const result = await api('/api/import', { method: 'POST', body: importBody(form, false) });
+    els.importResult.textContent = importDoneText(result);
+    els.importResult.hidden = false;
+    els.importConfirm.hidden = true; // 要再导先重新预览（列表可能已变）
+    hideImportError();
+    hidePageError();
+    await refresh(); // 新任务出现在排队表格里
+  } catch (err) {
+    showImportError(err.message);
+  } finally {
+    els.importConfirm.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------- 清理磁盘（#50）
+
+/** 预览（dry-run）：列出将删除的路径；成功后才亮出「确认删除」。 */
+async function onCleanupPreview() {
+  els.cleanupPreview.disabled = true;
+  try {
+    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(true) });
+    els.cleanupResult.textContent = cleanupPreviewText(result);
+    els.cleanupResult.hidden = false;
+    els.cleanupConfirm.hidden = false;
+  } catch (err) {
+    showPageError(err.message);
+  } finally {
+    els.cleanupPreview.disabled = false;
+  }
+}
+
+/** 确认删除（dry-run=false）：failed 为 true 时其余已删、有的没删掉，走页面错误条。 */
+async function onCleanupConfirm() {
+  els.cleanupConfirm.disabled = true;
+  try {
+    const result = await api('/api/cleanup', { method: 'POST', body: cleanupBody(false) });
+    if (result !== null && typeof result === 'object' && result.failed === true) {
+      showPageError('有的没删掉，其余已经删了');
+    } else {
+      hidePageError();
+    }
+    els.cleanupResult.textContent = cleanupDoneText(result);
+    els.cleanupResult.hidden = false;
+    els.cleanupConfirm.hidden = true; // 要再删先重新预览
+  } catch (err) {
+    showPageError(err.message);
+  } finally {
+    els.cleanupConfirm.disabled = false;
+  }
+}
+
 // ---------------------------------------------------------------- 启动
 
 els.nav.innerHTML = navHtml('/');
@@ -410,8 +568,38 @@ els.tabs.addEventListener('click', (event) => {
   renderTabs();
   renderTable();
 });
+els.repoFilter.addEventListener('change', () => {
+  state.repoFilter = els.repoFilter.value;
+  renderTabs();
+  renderTable();
+});
 els.table.addEventListener('click', (event) => {
   onTableClick(event).catch((err) => showPageError(err.message));
+});
+// #50：两个面板的开合与预览/确认。面板本身只建一次（HTML），轮询不重建。
+els.importToggle.addEventListener('click', () => {
+  els.importPanel.hidden = !els.importPanel.hidden;
+});
+els.importPanel.addEventListener('submit', (event) => {
+  onImportPreview(event).catch((err) => showImportError(err.message));
+});
+els.importConfirm.addEventListener('click', () => {
+  onImportConfirm().catch((err) => showImportError(err.message));
+});
+els.importCancel.addEventListener('click', () => {
+  els.importPanel.hidden = true;
+});
+els.cleanupToggle.addEventListener('click', () => {
+  els.cleanupPanel.hidden = !els.cleanupPanel.hidden;
+});
+els.cleanupPreview.addEventListener('click', () => {
+  onCleanupPreview().catch((err) => showPageError(err.message));
+});
+els.cleanupConfirm.addEventListener('click', () => {
+  onCleanupConfirm().catch((err) => showPageError(err.message));
+});
+els.cleanupCancel.addEventListener('click', () => {
+  els.cleanupPanel.hidden = true;
 });
 pauseToggle.addEventListener('click', () => {
   onPauseToggleClick().catch((err) => showPageError(err.message));
