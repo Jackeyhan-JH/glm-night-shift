@@ -32,6 +32,9 @@ const EXPECTED_DEFAULTS = {
   testTimeoutMinutes: 15,
   rateLimitBackoffMinutes: 15,
   keepFailedWorktrees: false,
+  autoDiagnose: true,
+  diagnoseModel: 'glm-5.3-flash',
+  diagnoseTimeoutMinutes: 5,
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {

@@ -67,7 +67,8 @@ function depsLine(deps) {
 
 /**
  * show 的任务详情：标题行 + 对齐的字段列表 + 依赖行 + 缩进的提示词 + 运行记录表格
- * （列：尝试次数、模型、状态、耗时、额度、日志路径）。没有运行记录时明确说无。
+ * （列：尝试次数、类型、模型、状态、耗时、额度、日志路径）。没有运行记录时明确说无。
+ * 带诊断（#12）的运行在表格后逐行列出诊断第一行（诊断是多行文本，塞进表格会撑破列宽）。
  * deps 是 listDependencies() 的结果（[{id, status}]，升序）；缺省视为无依赖。
  */
 export function renderTaskDetail(task, runs, deps = []) {
@@ -99,9 +100,10 @@ export function renderTaskDetail(task, runs, deps = []) {
   if (runs.length === 0) {
     lines.push('', '运行记录：无');
   } else {
-    const header = ['尝试次数', '模型', '状态', '耗时', '额度', '日志路径'];
+    const header = ['尝试次数', '类型', '模型', '状态', '耗时', '额度', '日志路径'];
     const rows = runs.map((r) => [
       String(r.attempt),
+      r.kind ?? 'task',
       r.model,
       r.status,
       formatDurationMs(r.durationMs),
@@ -109,8 +111,21 @@ export function renderTaskDetail(task, runs, deps = []) {
       r.logPath,
     ]);
     lines.push('', `运行记录（${runs.length} 条）：`, ...renderTable(header, rows, '  ').split('\n'));
+    // 诊断第一行（#12）：标注在哪条运行上；多行诊断的其余行看 show --json 的 diagnosis 字段
+    for (const r of runs) {
+      if (r.diagnosis !== null && r.diagnosis !== undefined && r.diagnosis !== '') {
+        lines.push(`诊断（run ${r.id}）：${singleLine(firstLine(r.diagnosis))}`);
+      }
+    }
   }
   return `${lines.join('\n')}\n`;
+}
+
+/** 多行文本的第一行（\r\n / \r 也归一按换行切）；没有内容返回 ''。 */
+function firstLine(text) {
+  const normalized = String(text).replace(/\r\n?/g, '\n');
+  const nl = normalized.indexOf('\n');
+  return nl === -1 ? normalized : normalized.slice(0, nl);
 }
 
 /** 通用小表格：首行表头，列间两空格，按显示宽度对齐；indent 是每行前缀。 */
