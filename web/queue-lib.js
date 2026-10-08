@@ -2,7 +2,8 @@
 // POST /api/tasks 请求体、HTML 转义、lastError 第一行；#46 增加编辑排队中任务的
 // 纯函数（行操作按钮、表单模式视图、任务 → 表单值、表单 → PATCH 请求体）；#50 增加
 // 仓库筛选与「从 GitHub 导入 / 清理磁盘」两个面板的纯函数（选项、过滤、请求体、结果
-// 文案）。全部是无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器环境，
+// 文案）；#62 增加队列行的 PR 结果标签（已合并 / 已关闭）判定。全部是无副作用纯函数——
+// 不碰 DOM、不发请求，import 时不依赖浏览器环境，
 // node:test 直接单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js /
 // test/board-import.test.js）；DOM 与网络逻辑在 queue.js。
 
@@ -353,4 +354,21 @@ export function cleanupDoneText(result) {
   const worktrees = Array.isArray(result?.worktrees) ? result.worktrees : [];
   const logs = Array.isArray(result?.logs) ? result.logs : [];
   return `已删除 worktree ${worktrees.length} 个、日志 ${logs.length} 个`;
+}
+
+// ---------------------------------------------------------------- 队列行的 PR 结果标签（#62）
+
+/**
+ * 队列行的 PR 结果标签（#62）：PR 在 GitHub 上已合并 / 已关闭时，在状态徽章旁边
+ * 额外显示两个字（成功建出的 PR 后来被合并 / 关闭，任务状态本身仍是「成功」）。
+ * 只认 task.prOutcome 全等 'merged' / 'closed'（与详情页 #56 的「PR 结果」同一判定）；
+ * 'open'、null / undefined / 缺字段、空串、大小写不同（MERGED / CLOSED）及其他任何
+ * 值都返回 ''——调用方（queue.js）收到空串一个节点都不建，行文本里不出现这两个词。
+ * @param {object} [task] TaskRow（只读 prOutcome，不改任务、不碰 task.status）
+ * @returns {'已合并'|'已关闭'|''}
+ */
+export function prOutcomeLabel(task) {
+  if (task?.prOutcome === 'merged') return '已合并';
+  if (task?.prOutcome === 'closed') return '已关闭';
+  return '';
 }
