@@ -27,6 +27,7 @@ import {
   finishTask,
   getRun,
   getTask,
+  getUserPaused,
   listRuns,
   recoverStaleRunning,
 } from './tasks.js';
@@ -169,8 +170,9 @@ export function createScheduler({
     stop,
 
     /**
-     * 点名立刻跑一个任务：无视高峰、额度、限流暂停、not_before 与并发上限（用户显式
-     * 要求「现在就跑」），走完整流水线，返回最终任务对象（Promise）。
+     * 点名立刻跑一个任务：无视高峰、额度、限流暂停、手动暂停（#38 的 userPaused）、
+     * not_before 与并发上限（用户显式要求「现在就跑」），走完整流水线，返回最终任务
+     * 对象（Promise）。
      * 任务会在 running 里登记（stop / 取消轮询 / status 都能看到它）。
      * id 接受数字或数字字符串（"12"）；只领 queued 的任务。
      * **不绕过任务依赖**（#11）：依赖还没全部 succeeded 时 claimTaskById 抛
@@ -199,9 +201,11 @@ export function createScheduler({
     /**
      * 调度器当前状态（给 #14 的 /api/status 和 #10 命令行用）。
      * @returns {{ running: number[], stopping: boolean, pausedUntil: Date | null,
-     *   blocked: null | { reason: 'peak'|'five-hour'|'weekly'|'rate-limit', retryAt: Date | null } }}
+     *   blocked: null | { reason: 'peak'|'five-hour'|'weekly'|'rate-limit', retryAt: Date | null },
+     *   userPaused: boolean }}
      *   pausedUntil 只在暂停仍生效（now < pausedUntil）时非 null；blocked 是最近一轮
-     *   调度判定的拦截原因，队列为空/正常领取时为 null。
+     *   调度判定的拦截原因，队列为空/正常领取时为 null。userPaused 是手动暂停标记
+     *   （#38），每次从库里现读、不在进程里缓存，与 pausedUntil 互相独立。
      */
     status() {
       let activePause = null;
@@ -211,6 +215,13 @@ export function createScheduler({
       } catch {
         activePause = pausedUntil; // 时钟坏了也照实报告暂停时刻，别让 status() 抛错
       }
+      let userPaused = false;
+      try {
+        userPaused = getUserPaused(db);
+      } catch (err) {
+        // 读库失败（连接被关等）按未暂停报告并记日志，status() 一如既往不抛错
+        console.error('[night-shift] 读取手动暂停标记失败（按未暂停报告）：', err);
+      }
       return {
         running: [...running.keys()],
         stopping,
@@ -218,6 +229,7 @@ export function createScheduler({
         blocked: activePause !== null
           ? { reason: 'rate-limit', retryAt: activePause }
           : blocked,
+        userPaused,
       };
     },
   };
@@ -247,6 +259,11 @@ export function createScheduler({
       setBlocked({ reason: 'rate-limit', retryAt: pausedUntil });
       return [];
     }
+    // 手动暂停（#38）：库里 meta.userPaused 为 1 时本轮不领任何新任务（用户说
+    // 「先别领」）。与上面的限流退避互相独立、可同时生效；也故意不写 blocked——
+    // 那是闸门/限流的拦截原因，人主动按的暂停不算「被拦」。正在跑的任务不走这里，
+    // 照常收尾；runNow 点名的也不走这里（见其 JSDoc）。
+    if (getUserPaused(db)) return [];
     const claimed = [];
     while (running.size < config.concurrency) {
       // 每次领取前重取时钟与用量：上一轮刚起的任务已经以 running run 行计入用量

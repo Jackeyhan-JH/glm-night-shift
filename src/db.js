@@ -187,6 +187,20 @@ const MIGRATIONS = [
       CREATE INDEX idx_tasks_source ON tasks (source);
     `);
   },
+  // 版本 6：meta 键值表（issue #38 手动暂停；与 #39 并行，合并时顺延到 source 之后）。
+  // 目前只有一个键：userPaused（'1' / '0'，缺行 = 未暂停），调度器每轮领取前读它。
+  // 只 CREATE TABLE、不插入行——「没有这行」就是默认的未暂停状态，语义见
+  // src/tasks.js 的 getUserPaused / setUserPaused。
+  // 它与调度器内存里的限流退避（pausedUntil）互相独立：这里是「人说不领」，那是
+  // 「限流说要缓一缓」，两个可以同时生效。
+  (db) => {
+    db.exec(`
+      CREATE TABLE meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+    `);
+  },
 ];
 
 /**

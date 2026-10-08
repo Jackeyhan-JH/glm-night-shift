@@ -818,6 +818,38 @@ export function getRun(db, id) {
   return rowToRun(db.prepare('SELECT * FROM runs WHERE id = ?').get(id));
 }
 
+// ---------------------------------------------------------------- meta（手动暂停 #38）
+
+/** meta 表里手动暂停标记的键：值为 '1'（暂停领取新任务）或 '0'；缺行 = 未暂停。 */
+export const USER_PAUSED_KEY = 'userPaused';
+
+/**
+ * 读手动暂停标记（#38）：meta.userPaused 为 '1' 表示用户要求暂不领取新任务，
+ * 缺行 / 其他值都按未暂停处理。每次调用直接查库、不在进程里缓存——调度器、
+ * 看板、命令行是多进程共享同一个文件库，谁改了都要立刻被别人看见。
+ * 与调度器内存里的限流退避（pausedUntil）互相独立，读这里不影响那边。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {boolean}
+ */
+export function getUserPaused(db) {
+  const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(USER_PAUSED_KEY);
+  return row?.value === '1';
+}
+
+/**
+ * 写手动暂停标记（#38）：paused → '1' / '0'（UPSERT，幂等，重复写同值不报错）。
+ * 只动 meta 这一行：不清限流退避（pausedUntil / rateLimitBackoffMinutes）、
+ * 不碰任务自己的 not_before——恢复领取 ≠ 限流已过。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {boolean} paused
+ */
+export function setUserPaused(db, paused) {
+  db.prepare(`
+    INSERT INTO meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(USER_PAUSED_KEY, paused ? '1' : '0');
+}
+
 // ---------------------------------------------------------------- 辅助
 
 function nowIso() {

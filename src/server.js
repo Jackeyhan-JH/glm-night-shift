@@ -24,9 +24,11 @@ import {
   createTask,
   getRun,
   getTask,
+  getUserPaused,
   listRuns,
   listTasks,
   retryTask,
+  setUserPaused,
 } from './tasks.js';
 import { listTemplates, loadTemplate, renderTemplate } from './templates.js';
 
@@ -192,6 +194,16 @@ function buildRoutes(deps, bumpSse) {
     { method: 'GET', pattern: /^\/api\/runs\/(\d+)\/stream$/, handler: (ctx) => {
       handleStream(ctx, deps, bumpSse, parseId(ctx.params[0], '运行记录'));
     } },
+    // 手动暂停 / 恢复领取（#38）：只写库里的 meta.userPaused，不要求调度器对象存在
+    // （serve-api 没有调度器也能暂停）；空 body {} 即可，走与其他 POST 相同的防护。
+    { method: 'POST', pattern: /^\/api\/scheduler\/pause$/, handler: (ctx) => {
+      setUserPaused(deps.db, true);
+      sendJson(ctx.res, 200, { userPaused: true });
+    } },
+    { method: 'POST', pattern: /^\/api\/scheduler\/resume$/, handler: (ctx) => {
+      setUserPaused(deps.db, false);
+      sendJson(ctx.res, 200, { userPaused: false });
+    } },
     { method: 'GET', pattern: /^\/api\/status$/, handler: (ctx) => {
       const now = deps.clock();
       // 用量窗口取最早需要的起点：滚动 7 天与 weekStart 周期起点里更早的那个。
@@ -213,6 +225,10 @@ function buildRoutes(deps, bumpSse) {
         safetyRatio: deps.config.safetyRatio,
         runningCount: countTasks(deps.db, 'running'),
         queuedCount: countTasks(deps.db, 'queued'),
+        // 顶层的手动暂停标记（#38）：从库里现读（缺行 = false），不从 scheduler 的
+        // status() 抄——serve-api 没有 scheduler 时也要能看到暂停状态。
+        userPaused: getUserPaused(deps.db),
+        // scheduler 字段原样放调度器的 status()（有 userPaused 等全部字段），不包装。
         scheduler: deps.scheduler === null || deps.scheduler === undefined
           ? null
           : deps.scheduler.status(),

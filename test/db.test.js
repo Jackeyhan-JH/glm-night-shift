@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { openDb, SCHEMA_VERSION, MIGRATIONS } from '../src/db.js';
+import { getUserPaused, setUserPaused } from '../src/tasks.js';
 import { DatabaseSync } from 'node:sqlite';
 import { makeTempHome } from './helpers.js';
 
@@ -96,6 +97,50 @@ test('关掉再打开同一文件：数据还在，user_version 等于迁移步�
   assert.equal(row.priority, 7);
 });
 
+test('验收: 打开旧库（建到追加 meta 前一步的 schema）自动补上 meta 表，任务还在，缺 userPaused 行 = 未暂停', (t) => {
+  const file = path.join(makeTempHome(t), 'night-shift.db');
+  // 模拟升级现场：用 MIGRATIONS.slice(0, -1) 建到「追加 meta 之前」的 schema，
+  // user_version 设成那时的迁移步数，库里还有一行老任务。
+  const prior = MIGRATIONS.slice(0, -1);
+  const raw = new DatabaseSync(file);
+  for (const migrateStep of prior) migrateStep(raw);
+  raw.exec(`PRAGMA user_version = ${prior.length}`);
+  const now = new Date().toISOString();
+  raw.prepare(`
+    INSERT INTO tasks (repo, title, prompt, priority, max_attempts, created_at, updated_at)
+    VALUES ('a/b', '老任务', 'p', 7, 3, ?, ?)
+  `).run(now, now);
+  raw.close();
+
+  const db = openDb(file);
+  t.after(() => db.close());
+  assert.equal(userVersion(db), prior.length + 1, 'user_version 应为迁移前 + 1');
+  assert.equal(userVersion(db), MIGRATIONS.length);
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    .all().map((row) => row.name);
+  assert.ok(tables.includes('meta'), '应有 meta 表');
+  // 迁移只建表不插行：userPaused 缺行就是「未暂停」
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM meta WHERE key = 'userPaused'").get().n, 0);
+  assert.equal(getUserPaused(db), false, '缺行读出来是未暂停');
+  const row = db.prepare('SELECT repo, title, priority FROM tasks').get();
+  assert.equal(row.repo, 'a/b', '原有任务还在');
+  assert.equal(row.title, '老任务');
+  assert.equal(row.priority, 7);
+});
+
+test('meta.userPaused 读写：缺行为 false，写 1 读 true，写回 0 读 false（UPSERT 幂等）', (t) => {
+  const db = openDb(':memory:');
+  t.after(() => db.close());
+  assert.equal(getUserPaused(db), false, '新库缺行 = 未暂停');
+  setUserPaused(db, true);
+  assert.equal(getUserPaused(db), true);
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'userPaused'").get().value, '1');
+  setUserPaused(db, true); // 幂等：重复写同值不报错
+  setUserPaused(db, false);
+  assert.equal(getUserPaused(db), false);
+  assert.equal(db.prepare("SELECT value FROM meta WHERE key = 'userPaused'").get().value, '0');
+});
+
 test('user_version 比代码认识的版本新时，openDb 报清晰错误且不动数据', (t) => {
   const file = path.join(makeTempHome(t), 'night-shift.db');
   const future = MIGRATIONS.length + 1; // 不管以后加到多少步，“比代码新”都成立
@@ -162,7 +207,7 @@ test('4 个 worker 同时首次打开同一文件库：迁移只跑一次，人�
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 4);
 });
 
-test('版本 5 的迁移（MIGRATIONS 最后一步）：tasks.source 可空列 + 非唯一索引 idx_tasks_source', () => {
+test('版本 5 的迁移：tasks.source 可空列 + 非唯一索引 idx_tasks_source', () => {
   const db = openDb(':memory:');
   try {
     const columns = db.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name);

@@ -101,6 +101,24 @@ export function statusBarText(status) {
   return parts.join(' · ');
 }
 
+/**
+ * 手动暂停的展示视图（issue #38）：读 /api/status 顶层的 userPaused。
+ * - 暂停中：按钮文案「恢复领任务」（点了去恢复），状态条追加一段「已暂停领取」
+ *   （与按钮分开，不点按钮也能看见现在没在领）；
+ * - 未暂停：按钮文案「暂停领任务」，不追加任何段（页面不该出现「已暂停领取」）。
+ * status 残缺（null / 缺字段）按未暂停处理，不抛错。
+ * @param {object} [status] GET /api/status 的返回
+ * @returns {{ paused: boolean, buttonLabel: '恢复领任务'|'暂停领任务', pausedText: '已暂停领取'|'' }}
+ */
+export function pauseToggleView(status) {
+  const paused = status !== null && typeof status === 'object' && status.userPaused === true;
+  return {
+    paused,
+    buttonLabel: paused ? '恢复领任务' : '暂停领任务',
+    pausedText: paused ? '已暂停领取' : '',
+  };
+}
+
 /** 数字输入（字符串）→ 安全整数；空 / 非整数 → null（该字段不进请求体）。 */
 function toSafeInt(value) {
   if (value === null || value === undefined || String(value).trim() === '') return null;

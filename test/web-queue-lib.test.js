@@ -9,6 +9,7 @@ import {
   firstLine,
   formToBody,
   groupTasks,
+  pauseToggleView,
   statusBarText,
 } from '../web/queue-lib.js';
 
@@ -93,6 +94,33 @@ test('statusBarText：数据残缺不抛错（null / 缺 usage / limit 非法时
     statusBarText({ peak: { peak: false }, usage: { fiveHour: { used: 3, limit: 0 } } }),
     '非高峰时段 · 5 小时额度 - · 运行中 0 个',
   );
+});
+
+// ---------- 手动暂停的展示（#38） ----------
+
+test('验收: pauseToggleView：userPaused true → 按钮「恢复领任务」、状态条带「已暂停领取」', () => {
+  const view = pauseToggleView({ userPaused: true });
+  assert.deepEqual(view, { paused: true, buttonLabel: '恢复领任务', pausedText: '已暂停领取' });
+  // 按钮文案与暂停短语是两段不同的文字（不靠按钮本身展示暂停状态）
+  assert.notEqual(view.buttonLabel, view.pausedText);
+});
+
+test('验收: userPaused false / 缺字段 / status 为 null → 按钮「暂停领任务」、不出现「已暂停领取」', () => {
+  for (const status of [{ userPaused: false }, {}, null, undefined]) {
+    const view = pauseToggleView(status);
+    assert.deepEqual(view, { paused: false, buttonLabel: '暂停领任务', pausedText: '' }, JSON.stringify(status));
+    assert.ok(!view.buttonLabel.includes('已暂停领取'), '未暂停时按钮文案不含暂停短语');
+    assert.equal(view.pausedText, '', '未暂停时状态条不追加「已暂停领取」');
+  }
+});
+
+test('pauseToggleView 与 statusBarText 组合：暂停时状态条文案 = 常规文案 · 已暂停领取', () => {
+  const status = { peak: { peak: false }, usage: { fiveHour: { used: 16, limit: 1600 } }, runningCount: 2, userPaused: true };
+  const view = pauseToggleView(status);
+  const rendered = view.pausedText === ''
+    ? statusBarText(status)
+    : `${statusBarText(status)} · ${view.pausedText}`;
+  assert.equal(rendered, '非高峰时段 · 5 小时额度 1.0%（16/1600） · 运行中 2 个 · 已暂停领取');
 });
 
 // ---------- 表单数据 → 请求体 ----------

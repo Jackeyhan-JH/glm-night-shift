@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from '../src/db.js';
-import { createTask, getTask, listRuns, startRun, finishRun } from '../src/tasks.js';
+import { createTask, getTask, getUserPaused, listRuns, startRun, finishRun } from '../src/tasks.js';
 import { fakeEnv, makeTempHome } from './helpers.js';
 
 // 隔离 git 配置（同 test/scheduler-integration.test.js）：不读机器配置，提交身份显式给；
@@ -408,6 +408,31 @@ test('run-now 任务不存在：退出 1，stderr 说明', async (t) => {
   const res = await runCli(['run-now', '99'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
   assert.equal(res.code, 1);
   assert.ok(res.stderr.includes('任务 99 不存在'), res.stderr);
+});
+
+test('验收·#38：pause 之后 run-now 子进程仍把任务跑完（手动暂停不拦点名执行）', async (t) => {
+  const { home } = setup(t);
+  const add = await runCli([
+    'add', '--repo', 'a/b', '--prompt', '做点修改', '--test', 'test -f NIGHT_SHIFT_FAKE.md',
+  ], { home });
+  assert.equal(add.code, 0, add.stderr);
+
+  const pause = await runCli(['pause'], { home });
+  assert.equal(pause.code, 0, pause.stderr);
+  assert.equal(pause.stdout, '已暂停：不再领取新任务（正在跑的会跑完）\n');
+
+  const res = await runCli(['run-now', '1'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  assert.equal(res.code, 0, res.stderr);
+  assert.ok(res.stdout.includes('#1 成功：https://github.com/a/b/pull/'), res.stdout);
+  assert.equal(readTask(home, 1).status, 'succeeded');
+
+  // run-now 不动暂停标记：库里仍是暂停状态
+  const db = openDb(path.join(home, 'night-shift.db'));
+  try {
+    assert.equal(getUserPaused(db), true);
+  } finally {
+    db.close();
+  }
 });
 
 // ---------------------------------------------------------------- logs
