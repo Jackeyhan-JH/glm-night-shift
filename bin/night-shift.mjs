@@ -22,6 +22,13 @@ import { depsCommand } from '../src/cli/deps-command.js';
 import { configCommand } from '../src/cli/config-command.js';
 import { templatesCommand } from '../src/cli/template-commands.js';
 import { serveCommand } from '../src/cli/serve-command.js';
+import {
+  logsCommand,
+  peakCommand,
+  runNowCommand,
+  startCommand,
+  usageCommand,
+} from '../src/cli/run-commands.js';
 
 // 通过 import.meta.url 相对路径读 package.json，任意 cwd / npm link 下都能找到。
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -46,6 +53,11 @@ const COMMANDS = {
   show: showCommand,
   cancel: cancelCommand,
   retry: retryCommand,
+  start: startCommand,
+  peak: peakCommand,
+  usage: usageCommand,
+  logs: logsCommand,
+  'run-now': runNowCommand,
   deps: depsCommand,
   config: configCommand,
   templates: templatesCommand,
@@ -92,7 +104,7 @@ function usageText() {
     'deps --set 的 id 列表逗号分隔、容忍空格，空串表示无依赖（--set "" 即清空）。',
     '数据目录：$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
     '',
-    'start / peak / logs / serve（调度器一键启动）等命令将在后续版本加入；',
+    'serve（调度器与看板一键启动）等命令将在后续版本加入；',
     '看板服务见 serve-api。',
     '',
   ].join('\n');
