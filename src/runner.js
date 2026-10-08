@@ -4,8 +4,16 @@
 //
 // 进程控制：spawn 用 detached（子进程自成进程组），超时与取消时先
 // process.kill(-pid, 'SIGTERM')，killGrace 后仍存活再 SIGKILL，把 Claude Code 自己
-// 起的孙进程一起带走。子进程退出即清掉全部定时器、摘掉 abort 监听，保证事件循环
-// 不被残留句柄拖住；日志流落盘（close）之后才 resolve。
+// 起的孙进程一起带走。子进程退出后进程组也不许活过本次运行：exit 时组里若还有成员
+// （claude 起的后台进程等遗留者）立即 SIGTERM 清场；若它们抱着 stdout/stderr 导致
+// close 迟迟不来，短宽限（min(2000, killGraceMs)）后升到 SIGKILL，再不行（fd 被组外
+// 进程持有）就按 exit 时的退出码兜底结算——总之 runTask 不会因为孤儿进程挂住。
+// 子进程退出即清掉全部定时器、摘掉 abort 监听，保证事件循环不被残留句柄拖住；日志
+// 流落盘（close）之后才 resolve。
+//
+// 内存：stdout / stderr 逐行流式处理，不整段驻留；内存里只留判定要用的少东西
+// （最后一个 result 对象、最后一条非空 stderr、第一条限流行），且各自截断
+// （RETAIN_MAX_CHARS / LINE_BUFFER_MAX_CHARS），与输出总量无关。日志文件始终写完整行。
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -29,6 +37,15 @@ const RATE_LIMIT_PATTERN = /\b429\b|rate[ _-]?limit|too many requests/i;
 const SUMMARY_MAX_CHARS = 2000;
 const RATE_LINE_MAX_CHARS = 200;
 const ERROR_MAX_CHARS = 500;
+// 单条输出在内存里保留的上限（判定与错误信息最多用到 2000/500 字符，日志文件照写完整行）：
+// 一条超长行不会让运行器的内存随输出量无限增长
+const RETAIN_MAX_CHARS = 64 * 1024;
+// 子进程 exit 后等 close 的宽限上限（实际取 min(本值, killGraceMs)）；SIGKILL 清场后
+// 仍等不到 close（fd 被组外进程持有等极端情况）时的最终兜底等待
+const STDIO_GRACE_MAX_MS = 2000;
+const STUCK_DRAIN_MS = 250;
+// 无换行的超长输出：行缓冲到顶就强制按一行切出（日志里表现为拆行），防内存无限增长
+const LINE_BUFFER_MAX_CHARS = 4 * 1024 * 1024;
 
 const CLAUDE_ARGS = ['--dangerously-skip-permissions', '--output-format', 'stream-json', '--verbose'];
 
@@ -116,6 +133,9 @@ export async function runTask({
   if (typeof theKillGraceMs !== 'number' || !Number.isFinite(theKillGraceMs) || theKillGraceMs < 0) {
     throw new TypeError(`killGraceMs 必须是不小于 0 的有限数字，当前值：${String(killGraceMs)}`);
   }
+  // 子进程 exit 后等 close 的宽限：短于击杀宽限（正常 close 只差几毫秒），防止孤儿
+  // 进程抱着管道把 runTask 拖到超时。
+  const stdioGraceMs = Math.min(STDIO_GRACE_MAX_MS, theKillGraceMs);
 
   const startedAt = clock();
   if (!(startedAt instanceof Date) || Number.isNaN(startedAt.getTime())) {
@@ -156,10 +176,28 @@ export async function runTask({
 
   const taskId = task.id;
   const runId = run.id;
+  // 日志写不进去（磁盘满 / 权限等，流已 destroyed）时跳过写入、事件照发——实时日志
+  // 的消费者（SSE）不该跟着断流，运行结果更不该受影响。
+  const writeRaw = (stream, line, ts) => {
+    if (logStream.destroyed) return;
+    logStream.write(`${ts} [${stream}] ${line}\n`);
+  };
+  // runEvents 的监听器抛错只影响它自己：记一行 meta（尽力而为），绝不打断运行或写库。
+  const emitEvent = (name, payload) => {
+    try {
+      runEvents.emit(name, payload);
+    } catch (err) {
+      try {
+        writeRaw('meta', `事件 ${name} 的监听器抛错：${err.message}`, clock().toISOString());
+      } catch {
+        // 日志流也写不进去：忽略，别让监听器的错误以另一种方式炸出来
+      }
+    }
+  };
   const writeLine = (stream, line) => {
     const ts = clock().toISOString();
-    logStream.write(`${ts} [${stream}] ${line}\n`);
-    runEvents.emit('log', { taskId, runId, stream, line, ts });
+    writeRaw(stream, line, ts);
+    emitEvent('log', { taskId, runId, stream, line, ts });
   };
 
   // ---------------------------------------------------------------- 运行状态
@@ -170,6 +208,7 @@ export async function runTask({
     aborted: false,     // signal 已触发（先于超时触发时，状态按取消 / 停机记）
     abortReason: undefined,
     spawnError: null,   // spawn 'error'（ENOENT / EACCES 等）
+    stuckStdio: false,  // SIGKILL 清场后 stdio 仍未关闭，按 exit 信息兜底结算
     result: null,       // stdout 里最后一个 type === 'result' 的解析结果
     rateStderrLine: null, // stderr 里第一条命中限流特征的行
     lastStderrLine: null, // stderr 最后一条非空行
@@ -184,14 +223,20 @@ export async function runTask({
     }
   });
   const stderrSink = makeLineSink((line) => {
-    writeLine('stderr', line);
-    if (state.rateStderrLine === null && RATE_LIMIT_PATTERN.test(line)) state.rateStderrLine = line;
-    if (line.trim() !== '') state.lastStderrLine = line;
+    writeLine('stderr', line); // 日志文件写完整行；下面只留截断后的（见 RETAIN_MAX_CHARS）
+    if (state.rateStderrLine === null && RATE_LIMIT_PATTERN.test(line)) {
+      state.rateStderrLine = truncateByCodePoints(line, RETAIN_MAX_CHARS);
+    }
+    if (line.trim() !== '') {
+      state.lastStderrLine = truncateByCodePoints(line, RETAIN_MAX_CHARS);
+    }
   });
 
   let child = null;
   let termTimer = null;  // 超时定时器（到点发 SIGTERM）
   let graceTimer = null; // SIGTERM 后的 SIGKILL 兜底
+  let stdioTimer = null; // 子进程 exit 后等 close 的定时器（孤儿进程清场）
+  let stuckTimer = null; // SIGKILL 清场后仍无 close 的最终兜底
   let settled = false;
   let resolveCompletion;
   let rejectCompletion;
@@ -210,10 +255,23 @@ export async function runTask({
     }
   };
 
+  // 任务的进程组里是否还有存活成员。kill(-pgid, 0) 在组空时抛 ESRCH；EPERM 说明组里
+  // 有我们没权限杀的进程，也算「有成员」。
+  const groupHasMembers = () => {
+    if (child === null || child.pid === undefined) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (err) {
+      return err.code !== 'ESRCH';
+    }
+  };
+
   const onAbort = () => {
-    // 运行已结束（子进程已退 / 已判定）：迟到的 abort 没有可杀的进程，也写不进已关闭
-    // 的日志流——直接忽略，否则会白挂一个 graceTimer 拖住事件循环。
-    if (settled) return;
+    // 运行已结束，或子进程赶在取消到来之前已经退出（close 可能还在路上——孤儿进程
+    // 抱着管道）：取消改变不了已定的结果，别把 succeeded 改写成 canceled，也别白挂
+    // 一个 graceTimer 拖住事件循环。
+    if (settled || state.exitCode !== null) return;
     // 取消先于超时发生时，超时定时器作废（否则晚到的超时会改写取消语义）
     if (termTimer !== null) clearTimeout(termTimer);
     termTimer = null;
@@ -231,15 +289,19 @@ export async function runTask({
     settled = true;
     if (termTimer !== null) clearTimeout(termTimer);
     if (graceTimer !== null) clearTimeout(graceTimer);
+    if (stdioTimer !== null) clearTimeout(stdioTimer);
+    if (stuckTimer !== null) clearTimeout(stuckTimer);
     termTimer = null;
     graceTimer = null;
+    stdioTimer = null;
+    stuckTimer = null;
     if (signal !== undefined && signal !== null) signal.removeEventListener('abort', onAbort);
     try {
       stdoutSink.flush(); // 不完整的最后一行在进程结束时补写
       stderrSink.flush();
       const outcome = recordOutcome();
       endLogStream().then(() => {
-        runEvents.emit('finish', { taskId, runId, status: outcome.status, error: outcome.error });
+        emitEvent('finish', { taskId, runId, status: outcome.status, error: outcome.error });
         resolveCompletion(outcome);
       });
     } catch (err) {
@@ -285,7 +347,7 @@ export async function runTask({
     return outcome;
   };
 
-  runEvents.emit('start', { taskId, runId, logPath });
+  emitEvent('start', { taskId, runId, logPath });
   writeLine('meta', `开始 model=${model} effort=${effort} thinking=${thinkingTokens}`
     + ` peak=${peak} cwd=${workdir}`);
 
@@ -310,6 +372,29 @@ export async function runTask({
     state.spawnError = `无法启动 claude（${config.claudeBin}）：${err.message}`;
     if (child.pid === undefined) finalize(); // 根本没起来：不会有 close 事件
   });
+  // 孤儿进程清场：任务的进程组不应活过本次运行。子进程已退（此刻已被 reap，组里若
+  // 还有成员只能是 claude 起的后台进程等遗留者），立即 SIGTERM 清场；若它们抱着
+  // stdout/stderr 不放导致 close 迟迟不来，短宽限后升到 SIGKILL。正常路径（组已空、
+  // close 立刻到）不多杀任何进程。
+  child.on('exit', (code, exitSignal) => {
+    state.exitCode = code;
+    state.closeSignal = exitSignal;
+    if (groupHasMembers()) {
+      writeLine('meta', '子进程已退出但进程组仍有成员，对进程组发 SIGTERM 清场');
+      killGroup('SIGTERM');
+    }
+    stdioTimer = setTimeout(() => {
+      writeLine('meta', '子进程退出后 stdio 仍未关闭，对进程组发 SIGKILL');
+      if (groupHasMembers()) killGroup('SIGKILL');
+      // SIGKILL 后仍无 close：fd 被组外进程持有等极端情况。给一小段排空时间（管道里
+      // 已有但未送达的数据仍要读出来），到点按 exit 时的退出码 / 信号结算。
+      stuckTimer = setTimeout(() => {
+        state.stuckStdio = true;
+        writeLine('meta', 'SIGKILL 清场后 stdio 仍未关闭（fd 被组外进程持有？），按已退出的子进程结算');
+        finalize();
+      }, STUCK_DRAIN_MS);
+    }, stdioGraceMs);
+  });
   child.on('close', (code, closeSignal) => {
     state.exitCode = code;
     state.closeSignal = closeSignal;
@@ -317,7 +402,8 @@ export async function runTask({
   });
   if (signal !== undefined && signal !== null) signal.addEventListener('abort', onAbort, { once: true });
   termTimer = setTimeout(() => {
-    if (state.aborted) return; // 已按取消处理，迟到的超时不再改写状态
+    // 已按取消处理，或子进程赶在超时前已退出（close 可能还在路上）：都不再改写状态
+    if (state.aborted || state.exitCode !== null) return;
     state.timeout = true;
     writeLine('meta', `超时 ${minutesLabel(theTimeoutMs)} 分钟，对进程组发 SIGTERM`);
     killGroup('SIGTERM');
@@ -388,21 +474,27 @@ function rateLimitResult(line) {
   return { status: 'failed', rateLimited: true, error: `rate_limit: ${truncateByCodePoints(line, RATE_LINE_MAX_CHARS)}` };
 }
 
-/** stdout 里出现的 result 对象：取 num_turns / is_error / result（result 字段统一成字符串）。 */
+/**
+ * stdout 里出现的 result 对象：取 num_turns / is_error / result（result 字段统一成
+ * 字符串，超过 RETAIN_MAX_CHARS 先截断——判定与 summary 最多用 2000 字符，不值得为
+ * 一条超长 result 把整段留在内存里）。
+ */
 function noteResult(state, obj) {
   if (obj === null || typeof obj !== 'object' || obj.type !== 'result') return;
   const rawResult = obj.result;
+  const text = typeof rawResult === 'string' ? rawResult
+    : rawResult === undefined || rawResult === null ? null : String(rawResult);
   state.result = {
     numTurns: obj.num_turns,
     isError: obj.is_error,
-    text: typeof rawResult === 'string' ? rawResult
-      : rawResult === undefined || rawResult === null ? null : String(rawResult),
+    text: text === null ? null : truncateByCodePoints(text, RETAIN_MAX_CHARS),
   };
 }
 
 /**
  * 字节流 → 行：按 \n 切（\r\n 也归一成一行），StringDecoder 兜住跨 chunk 的 UTF-8
- * 半字符。flush 在流结束时补写没有换行符的最后一行。
+ * 半字符。flush 在流结束时补写没有换行符的最后一行。缓冲只保存当前未完的一行，且到
+ * LINE_BUFFER_MAX_CHARS 就强制切出——内存占用与输出总量无关。
  */
 function makeLineSink(onLine) {
   const decoder = new StringDecoder('utf8');
@@ -418,6 +510,11 @@ function makeLineSink(onLine) {
         const line = buffer.slice(0, nl);
         buffer = buffer.slice(nl + 1);
         emit(line);
+      }
+      if (buffer.length > LINE_BUFFER_MAX_CHARS) {
+        const forced = buffer; // 无尽长行的极端情况：按一行切出，日志里表现为拆行
+        buffer = '';
+        emit(forced);
       }
     },
     flush() {

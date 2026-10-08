@@ -58,6 +58,18 @@ function runRow(db, runId) {
   return listRuns(db, {}).find((run) => run.id === runId);
 }
 
+/**
+ * 在临时目录里写一个迷你假 claude（无扩展名 + shebang；临时目录里没有 package.json，
+ * 按 CommonJS 解析，body 里要用 require）。测试专用的假替身，不碰真实 claude。
+ */
+function writeMiniClaude(t, body) {
+  const dir = makeTempHome(t);
+  const script = path.join(dir, 'mini-claude');
+  fs.writeFileSync(script, `#!/usr/bin/env node\n${body}\n`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+
 // ---------------------------------------------------------------- buildPrompt
 
 test('验收: buildPrompt 包含任务 prompt、仓库名、testCommand 与「不要 git push」', () => {
@@ -158,6 +170,10 @@ test('验收: success 场景结果、runs 行、NIGHT_SHIFT_FAKE.md 与日志格
   assert.equal(row.logPath, expectedLog, 'log_path 即返回的 logPath');
   assert.equal(row.error, null);
 
+  const [entry] = readArgsLog(ctx.home);
+  assert.equal(entry.env.MAX_THINKING_TOKENS, '8000', 'medium → 8000');
+  assert.throws(() => process.kill(entry.pid, 0), (err) => err.code === 'ESRCH', '正常结束后子进程应已不在');
+
   const lines = readLogLines(expectedLog);
   assert.ok(lines.length > 0);
   for (const line of lines) assert.match(line, LOG_LINE_PATTERN);
@@ -241,6 +257,8 @@ test('验收: hang + timeoutMs=500：1.5 秒内返回 timeout', async (t) => {
   assert.equal(result.status, 'timeout');
   assert.match(result.error, /^超时（.+ 分钟）$/);
   assert.equal(runRow(ctx.db, result.runId).status, 'timeout');
+  const [entry] = readArgsLog(ctx.home);
+  assert.throws(() => process.kill(entry.pid, 0), (err) => err.code === 'ESRCH', '超时击杀后子进程应已不在');
 });
 
 test('验收: stubborn + timeoutMs=300, killGraceMs=300：1.5 秒内 timeout，且假 claude 进程已不存在', async (t) => {
@@ -379,29 +397,135 @@ test('验收: FAKE_CLAUDE_SEQUENCE=fail,success 连续跑：先 failed 后 succe
 test('跨 chunk 的 UTF-8 半字符能拼回，无换行的最后一行在进程结束时补写', async (t) => {
   // 本用例不用 fake-claude（它的输出都以换行结尾）：在临时目录里放一个迷你假脚本，
   // 把最后一行按字节切开、延后再写、且不带换行。同样是假替身，不碰真实 claude。
-  const dir = makeTempHome(t);
-  const script = path.join(dir, 'mini-claude');
-  const tail = '中文尾巴'.repeat(3);
-  fs.writeFileSync(script, [
-    '#!/usr/bin/env node',
-    `const line = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, result: '尾巴完整' });`,
-    `process.stdout.write(line + '\\n');`,
-    `process.stderr.write('半路 stderr\\n');`,
-    `const tail = Buffer.from(${JSON.stringify(tail)}, 'utf8');`,
-    'process.stdout.write(tail.subarray(0, 5)); // 切在多字节字符中间',
-    'setTimeout(() => process.stdout.write(tail.subarray(5)), 50); // 不带换行',
-    '',
-  ].join('\n'));
-  fs.chmodSync(script, 0o755);
-
+  const script = writeMiniClaude(t, `
+    const tail = ${JSON.stringify('中文尾巴'.repeat(3))};
+    const line = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, result: '尾巴完整' });
+    process.stdout.write(line + '\\n');
+    process.stderr.write('半路 stderr\\n');
+    const buf = Buffer.from(tail, 'utf8');
+    process.stdout.write(buf.subarray(0, 5)); // 切在多字节字符中间
+    setTimeout(() => process.stdout.write(buf.subarray(5)), 50); // 不带换行
+  `);
   const ctx = setup(t);
   const result = await runTask({ ...ctx, config: { ...ctx.config, claudeBin: script } });
   assert.equal(result.status, 'succeeded');
   assert.equal(result.numTurns, 2);
   assert.equal(result.summary, '尾巴完整');
   const lines = readLogLines(result.logPath);
-  assert.ok(lines.some((line) => line.endsWith(`[stdout] ${tail}`)), '补写的最后一行应完整且无替换字符');
+  assert.ok(lines.some((line) => line.endsWith(`[stdout] ${'中文尾巴'.repeat(3)}`)), '补写的最后一行应完整且无替换字符');
   assert.ok(lines.some((line) => line.endsWith('[stderr] 半路 stderr')));
+});
+
+// ---------------------------------------------------------------- 孤儿进程清场
+
+test('孙进程抱着 stdout 不放：子进程 exit 后 SIGTERM 清场，及时按 exit 结果结算，孙进程被清掉', async (t) => {
+  const script = writeMiniClaude(t, `
+    const { spawn } = require('node:child_process');
+    const { appendFileSync } = require('node:fs');
+    // 后台 sleep 继承 stdout/stderr：子进程退出后管道仍被它抱着，close 不会自己来
+    const sleep = spawn('sleep', ['30'], { stdio: ['ignore', process.stdout, process.stderr] });
+    sleep.unref(); // 让本进程能退出，sleep 留在进程组里
+    appendFileSync(process.env.PIDS_FILE, JSON.stringify({ holder: sleep.pid }) + '\\n');
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'orphan' }) + '\\n');
+  `);
+  const ctx = setup(t);
+  const pidsFile = path.join(ctx.home, 'pids.jsonl');
+  const startedAt = Date.now();
+  const result = await runTask({
+    ...ctx,
+    config: { ...ctx.config, claudeBin: script },
+    env: { ...ctx.env, PIDS_FILE: pidsFile },
+    killGraceMs: 800,
+  });
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 1500, `不应拖到超时，实际 ${elapsed}ms`);
+  assert.equal(result.status, 'succeeded', '按 exit 时的退出码 0 + result 行判定');
+  assert.equal(result.summary, 'orphan');
+  const lines = readLogLines(result.logPath);
+  assert.ok(lines.some((line) => line.includes('进程组仍有成员')), '清场动作要记进日志');
+  const { holder } = JSON.parse(fs.readFileSync(pidsFile, 'utf8').trim());
+  assert.throws(() => process.kill(holder, 0), (err) => err.code === 'ESRCH', '抱管道的孙进程应被清掉');
+});
+
+test('无视 SIGTERM 的孙进程抱着管道：短宽限后 SIGKILL 清场，仍按 exit 结果结算', async (t) => {
+  // holder 先落一个「信号处理器已就绪」的文件再让父进程退出：否则执行器在子进程
+  // exit 时发的 SIGTERM 可能赶在 holder 注册处理器之前把它打死，测不到升级路径。
+  const script = writeMiniClaude(t, `
+    const { spawn } = require('node:child_process');
+    const { appendFileSync, existsSync } = require('node:fs');
+    const holder = spawn(process.execPath, ['-e', 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); process.on("SIGINT", () => {}); fs.writeFileSync(process.env.READY_FILE, "1"); setInterval(() => {}, 60000);'], { stdio: ['ignore', 'inherit', 'inherit'] });
+    holder.unref();
+    appendFileSync(process.env.PIDS_FILE, JSON.stringify({ holder: holder.pid }) + '\\n');
+    const waitReady = () => {
+      if (existsSync(process.env.READY_FILE)) {
+        process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'stubborn-holder' }) + '\\n');
+        return; // 没有别的活儿了，事件循环一空本进程自然退出
+      }
+      setTimeout(waitReady, 5);
+    };
+    waitReady();
+  `);
+  const ctx = setup(t);
+  const pidsFile = path.join(ctx.home, 'pids.jsonl');
+  const startedAt = Date.now();
+  const result = await runTask({
+    ...ctx,
+    config: { ...ctx.config, claudeBin: script },
+    env: { ...ctx.env, PIDS_FILE: pidsFile, READY_FILE: path.join(ctx.home, 'holder-ready') },
+    killGraceMs: 300, // stdio 宽限 = min(2000, 300) = 300ms，之后 SIGKILL
+    timeoutMs: 150, // 子进程约 60ms 就退了：超时定时器到点时它已退出，不许改写成 timeout
+  });
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 1500, `SIGKILL 兜底后应及时返回，实际 ${elapsed}ms`);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.summary, 'stubborn-holder');
+  const lines = readLogLines(result.logPath);
+  assert.ok(lines.some((line) => line.includes('对进程组发 SIGKILL')), '升级到 SIGKILL 要记进日志');
+  assert.ok(!lines.some((line) => line.includes('超时')), '子进程赶在超时前退出，不应记超时');
+  const { holder } = JSON.parse(fs.readFileSync(pidsFile, 'utf8').trim());
+  assert.throws(() => process.kill(holder, 0), (err) => err.code === 'ESRCH');
+});
+
+// ---------------------------------------------------------------- 内存与健壮性
+
+test('大输出流式处理：2 万行 + 2MB 单行全部进日志，不整段驻留内存', async (t) => {
+  const script = writeMiniClaude(t, `
+    for (let i = 0; i < 20000; i++) process.stdout.write(JSON.stringify({ type: 'assistant', n: i }) + '\\n');
+    process.stdout.write('{"type":"note","blob":"' + 'x'.repeat(2 * 1024 * 1024) + '"}\\n');
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, result: 'big' }) + '\\n');
+  `);
+  const ctx = setup(t);
+  const result = await runTask({ ...ctx, config: { ...ctx.config, claudeBin: script } });
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.summary, 'big');
+  const lines = readLogLines(result.logPath);
+  const stdoutLines = lines.filter((line) => line.includes(' [stdout] '));
+  assert.equal(stdoutLines.length, 20002, '2 万 assistant + 2MB 单行 + result 各一行');
+  assert.ok(stdoutLines.some((line) => line.includes('[stdout] {"type":"note"')), '超长单行也完整入日志');
+});
+
+test('runEvents 监听器抛错：不影响运行结果与结束记录，错误记进日志', async (t) => {
+  const ctx = setup(t);
+  const boom = () => { throw new Error('listener bug'); };
+  for (const name of ['start', 'log', 'finish']) runEvents.on(name, boom);
+  t.after(() => {
+    for (const name of ['start', 'log', 'finish']) runEvents.off(name, boom);
+  });
+  const result = await runTask(ctx);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(runRow(ctx.db, result.runId).status, 'succeeded');
+  assert.ok(readLogLines(result.logPath).some((line) => line.includes('监听器抛错')));
+});
+
+test('日志写不进去（路径被目录占位）：仍正常结算，runTask 不炸', async (t) => {
+  const ctx = setup(t); // 全新库，本次 run 的 id 必为 1
+  const logDir = path.join(ctx.home, 'logs', `task-${ctx.task.id}`);
+  fs.mkdirSync(path.join(logDir, 'run-1.log'), { recursive: true }); // 占住日志文件路径
+  const result = await runTask(ctx);
+  assert.equal(result.runId, 1);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(result.logPath, path.join(logDir, 'run-1.log'));
+  assert.equal(runRow(ctx.db, 1).status, 'succeeded', '写不了日志也要 finishRun');
 });
 
 // ---------------------------------------------------------------- 边界：参数校验
