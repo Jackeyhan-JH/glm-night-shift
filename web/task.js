@@ -426,19 +426,40 @@ export function createPage(options = {}) {
 
   /**
    * 取消 / 重试：调对应 API（空 JSON 体——服务端的 POST 防护要求 JSON Content-Type），
-   * 成功后整页刷新信息；失败把后端的 error 文本显示在按钮旁。
+   * 成功后整页刷新信息；失败把后端的 error 文本显示在按钮旁。#106：重试的响应比任务
+   * 对象多一个 requeued（被连带重新排队的下游），刷新完交给 renderRetryRequeued 写说明
+   * ——按路径区分，取消的响应即使带 requeued 也不写。
    */
   async function runAction(btn, path) {
     btn.disabled = true;
     actionMsg.textContent = '';
     try {
-      await api(path, { method: 'POST', body: {} });
+      const result = await api(path, { method: 'POST', body: {} });
       await doRefresh();
+      if (path.endsWith('/retry')) renderRetryRequeued(result);
     } catch (err) {
       actionMsg.textContent = err?.message ?? String(err);
     } finally {
       btn.disabled = false;
     }
+  }
+
+  /**
+   * 重试成功的连带说明（#106）：requeued 是被连带重新排队的下游 id，只在 POST
+   * /api/tasks/:id/retry 的返回上（GET /api/tasks/:id 没有这个字段），不含被重试的
+   * 任务自己——这里不自作主张追加或筛选，服务端给什么显示什么。非空数组才写一句
+   * 「连带 #2、#3 重新排队」到 actionMsg（与跟进 / 取消失败同一处）：复制后按数字
+   * 升序排（接口给 [3, 2] 也显示 #2、#3；10 排在 2 后面；不原地 sort 改掉响应对象），
+   * 顿号分隔、两侧无空格，整句一个 textContent、没有子元素。空数组 / 缺字段 / 非数组
+   * （对象、字符串、数字、null）不写，也不另做成功提示——成功路径上 actionMsg 保持
+   * 开头清空后的空。与跟进 201 同一顺序：调用方先 doRefresh 再调这里，句子不会被
+   * 后续重画清掉。
+   */
+  function renderRetryRequeued(result) {
+    const requeued = result?.requeued;
+    if (!Array.isArray(requeued) || requeued.length === 0) return;
+    const ids = [...requeued].sort((a, b) => a - b);
+    actionMsg.textContent = `连带 ${ids.map((id) => `#${id}`).join('、')} 重新排队`;
   }
 
   /**

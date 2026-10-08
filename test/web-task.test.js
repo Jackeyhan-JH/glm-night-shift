@@ -832,6 +832,25 @@ test('验收: 点「取消」「重试」后状态变化正确；非法操作显
     `应显示后端错误，实际：${page.refs.actionMsg.textContent}`);
 });
 
+test('验收: 单任务（没有下游）取消后重试：徽章回「排队中」，requeued 为空不出现「连带」「重新排队」（#106）', async (t) => {
+  const { db, base } = await startServer(t);
+  const task = createTask(db, { repo: 'a/b', prompt: 'x' });
+  const { page } = makePage(t, base, `?id=${task.id}`);
+  await page.busy;
+
+  page.refs.cancelBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.headBadge.textContent, '已取消');
+
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.headBadge.textContent, '排队中');
+  // 没有被连带重新排队的下游（requeued 是空数组）：不写连带句，也不另做成功提示
+  assert.equal(page.refs.actionMsg.textContent, '');
+  assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+  assert.ok(!page.refs.actionMsg.textContent.includes('重新排队'));
+});
+
 test('running 时每 5 秒刷新任务信息（日志由 SSE 负责）；离开 running 停止定时器', async (t) => {
   const { db, base } = await startServer(t);
   const task = createTask(db, { repo: 'a/b', prompt: 'x' });
