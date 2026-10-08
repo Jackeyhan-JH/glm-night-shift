@@ -5,8 +5,8 @@
 // 指向的日志文件每行一条」的约定（见 #7），不依赖执行器。
 //
 // 安全模型（没有登录，靠这三条 + 只听 127.0.0.1）：
-// - 所有 POST 必须 Content-Type: application/json（浏览器跨站表单无法伪造该头）→ 415；
-// - 带 Origin 且其 host:port 与 Host 头不一致的 POST → 403（拦跨站 fetch/iframe）；
+// - 所有 POST / PATCH 必须 Content-Type: application/json（浏览器跨站表单无法伪造该头）→ 415；
+// - 带 Origin 且其 host:port 与 Host 头不一致的 POST / PATCH → 403（拦跨站 fetch/iframe）；
 // - 请求体超过 1MB → 413，停止读取不无限缓冲。
 import fs from 'node:fs';
 import http from 'node:http';
@@ -29,6 +29,7 @@ import {
   listTasks,
   retryTask,
   setUserPaused,
+  updateTask,
 } from './tasks.js';
 import { listTemplates, loadTemplate, renderTemplate } from './templates.js';
 
@@ -63,6 +64,12 @@ const MIME_TYPES = new Map([
 const TASK_BODY_FIELDS = new Set([
   'repo', 'prompt', 'title', 'difficulty', 'priority', 'testCommand', 'allowPeak', 'maxAttempts',
   'dependsOn', 'template', 'vars',
+]);
+
+/** PATCH /api/tasks/:id 允许的请求体字段（#46，updateTask 的可改字段；repo / source /
+ * status / attempts / branch / prUrl 及未知字段 → 400 点名字段，任务不动）。 */
+const TASK_EDIT_FIELDS = new Set([
+  'title', 'prompt', 'difficulty', 'priority', 'testCommand', 'allowPeak', 'maxAttempts', 'dependsOn',
 ]);
 
 /**
@@ -169,6 +176,17 @@ function buildRoutes(deps, bumpSse) {
       const task = getTask(deps.db, id);
       if (task === null) throw new NotFoundError(id);
       sendJson(ctx.res, 200, { ...task, runs: listRuns(deps.db, { taskId: id, limit: HUGE_LIMIT }) });
+    } },
+    // 修改排队中的任务（#46）：字段白名单外的键 → 400 点名字段；非 queued → 409
+    // （updateTask 抛 InvalidTransitionError）；不存在 → 404。只收 JSON、Origin 与
+    // Host 对齐、1MB 上限——与其他带请求体的接口同一套防护（见 handleRequest）。
+    { method: 'PATCH', pattern: /^\/api\/tasks\/(\d+)$/, handler: (ctx) => {
+      for (const key of Object.keys(ctx.body)) {
+        if (!TASK_EDIT_FIELDS.has(key)) {
+          throw new HttpError(400, `未知字段：${key}（允许：${[...TASK_EDIT_FIELDS].join(' | ')}）`, key);
+        }
+      }
+      sendJson(ctx.res, 200, updateTask(deps.db, parseId(ctx.params[0], '任务'), ctx.body));
     } },
     { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/cancel$/, handler: (ctx) => {
       sendJson(ctx.res, 200, cancelTask(deps.db, parseId(ctx.params[0], '任务')));
@@ -316,8 +334,8 @@ async function handleRequest(req, res, routes) {
       req, res, query: url.searchParams,
       params: pathname.match(route.pattern).slice(1),
     };
-    if (req.method === 'POST') {
-      if (!guardPost(req, res)) return;
+    if (req.method === 'POST' || req.method === 'PATCH') {
+      if (!guardJsonBody(req, res)) return;
       ctx.body = await readJsonBody(req, res); // 已应答（413/400）时为 null
       if (ctx.body === null) return;
     }
@@ -337,12 +355,13 @@ async function handleRequest(req, res, routes) {
 
 // ---------------------------------------------------------------- POST 防护与请求体
 
-/** 所有 POST 的前置检查：Content-Type 必须 application/json（415），Origin 与 Host 不一致拒绝（403）。 */
-function guardPost(req, res) {
+/** 所有带请求体的接口（POST / PATCH）的前置检查：Content-Type 必须 application/json
+ * （415），Origin 与 Host 不一致拒绝（403）——跨站表单伪造不出这两个头。 */
+function guardJsonBody(req, res) {
   const contentType = req.headers['content-type'] ?? '';
   const mediaType = contentType.split(';')[0].trim().toLowerCase();
   if (mediaType !== 'application/json') {
-    sendJson(res, 415, { error: 'POST 请求必须带 Content-Type: application/json' });
+    sendJson(res, 415, { error: 'POST/PATCH 请求必须带 Content-Type: application/json' });
     return false;
   }
   const origin = req.headers.origin;
@@ -388,7 +407,7 @@ function readBody(req) {
 }
 
 /**
- * POST 请求体 → JSON 对象。已应答时返回 null（调用方直接 return）。
+ * POST / PATCH 请求体 → JSON 对象。已应答时返回 null（调用方直接 return）。
  * 空请求体按 {} 处理（cancel / retry 这类操作型 POST 不需要体）。
  */
 async function readJsonBody(req, res) {

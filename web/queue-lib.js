@@ -1,7 +1,9 @@
 // 队列页的纯函数库（issue #15）：按状态分组、依赖提示文本、状态条文案、表单数据 →
-// POST /api/tasks 请求体、HTML 转义、lastError 第一行。全部是无副作用纯函数——不碰
-// DOM、不发请求，import 时不依赖浏览器环境，node:test 直接单测（见
-// test/web-queue-lib.test.js）；DOM 与网络逻辑在 queue.js。
+// POST /api/tasks 请求体、HTML 转义、lastError 第一行；#46 增加编辑排队中任务的
+// 纯函数（行操作按钮、表单模式视图、任务 → 表单值、表单 → PATCH 请求体）。全部是
+// 无副作用纯函数——不碰 DOM、不发请求，import 时不依赖浏览器环境，node:test 直接
+// 单测（见 test/web-queue-lib.test.js / test/web-queue-edit.test.js）；DOM 与网络
+// 逻辑在 queue.js。
 
 /** 历史标签最多展示的条数（issue 规格：最近 100 条）。 */
 export const HISTORY_LIMIT = 100;
@@ -167,5 +169,91 @@ export function formToBody(form) {
     .map((id) => Number(id))
     .filter((id) => Number.isSafeInteger(id) && id >= 1);
   if (dependsOn.length > 0) body.dependsOn = dependsOn;
+  return body;
+}
+
+// ---------------------------------------------------------------- 编辑排队中的任务（#46）
+
+/**
+ * 任务行的操作单元格 HTML：排队中 = 「取消」+「修改」（修改走现有新增表单，见
+ * queue.js 的 enterEdit）；运行中只能取消（改不了的，要改先等它跑完或取消）；历史
+ * （终态）是「重试」。按钮由 queue.js 的事件委托统一处理（表格每 5 秒重绘）。
+ * @param {object} task TaskRow（用到 id / status）
+ * @returns {string} HTML 片段
+ */
+export function taskRowActions(task) {
+  const button = (action, label) =>
+    `<button type="button" class="row-action" data-action="${action}" data-id="${task.id}">${label}</button>`;
+  if (task.status === 'queued') return `${button('cancel', '取消')}${button('edit', '修改')}`;
+  if (task.status === 'running') return button('cancel', '取消');
+  return button('retry', '重试');
+}
+
+/**
+ * 表单的模式视图（#46）：编辑哪个任务，还是「新增」。
+ * - 编辑：标题「修改任务 #N」、提交按钮「保存修改」、「取消编辑」按钮可见；
+ * - 新增（editingTask 为 null/undefined）：标题与按钮都是「新增任务」。
+ * @param {?object} editingTask 正在编辑的任务（至少有 id）；null = 新增模式
+ * @returns {{ editing: boolean, heading: string, submitLabel: string, cancelEditVisible: boolean }}
+ */
+export function formModeView(editingTask) {
+  const editing = editingTask !== null && editingTask !== undefined;
+  return {
+    editing,
+    heading: editing ? `修改任务 #${editingTask.id}` : '新增任务',
+    submitLabel: editing ? '保存修改' : '新增任务',
+    cancelEditVisible: editing,
+  };
+}
+
+/**
+ * 任务 → 新增表单的原始数据（形状与 queue.js 的 collectForm 一致），进入编辑模式时
+ * 装进现有表单用。编辑不用模板（模板是建任务时渲染提示词的，改提示词直接改文本框），
+ * template 固定 ''；依赖多选的值是字符串（与 <option value> 一致）。
+ * @param {object} task TaskRow
+ * @returns {object} 表单原始数据
+ */
+export function taskToForm(task) {
+  return {
+    repo: String(task.repo ?? ''),
+    template: '',
+    vars: {},
+    prompt: String(task.prompt ?? ''),
+    title: String(task.title ?? ''),
+    difficulty: ['easy', 'medium', 'hard'].includes(task.difficulty) ? task.difficulty : 'medium',
+    priority: Number.isSafeInteger(task.priority) ? task.priority : '',
+    testCommand: task.testCommand === null || task.testCommand === undefined ? '' : String(task.testCommand),
+    allowPeak: task.allowPeak === true,
+    maxAttempts: Number.isSafeInteger(task.maxAttempts) ? task.maxAttempts : '',
+    dependsOn: (Array.isArray(task.dependsOn) ? task.dependsOn : []).map((id) => String(id)),
+  };
+}
+
+/**
+ * 编辑模式的表单数据 → PATCH /api/tasks/:id 请求体（#46）。与 formToBody 的关键差别：
+ * - **绝不带 repo**（repo / source / status 等是禁改字段，服务端 400 点名），也不带
+ *   template / vars（编辑不用模板）；
+ * - 空的可选字段不进请求体 = **保持原值**（PATCH 语义：不出现就不改），所以页面上
+ *   清空测试命令不会清掉它——要清空用 CLI 的 edit --no-test；
+ * - dependsOn 不发：依赖下拉只列排队中/运行中的任务，已经 succeeded 的依赖选不中，
+ *   发出去会把它们悄悄丢掉；改依赖用 deps --set / edit --depends-on。
+ * @param {object} form 表单原始数据（queue.js 从 DOM 收集）
+ * @returns {object} 请求体（键只会在 updateTask 的白名单里）
+ */
+export function editBody(form) {
+  const body = {};
+  const prompt = String(form.prompt ?? '').trim();
+  if (prompt !== '') body.prompt = prompt;
+  const title = String(form.title ?? '').trim();
+  if (title !== '') body.title = title;
+  const difficulty = String(form.difficulty ?? '').trim();
+  if (difficulty !== '') body.difficulty = difficulty;
+  const priority = toSafeInt(form.priority);
+  if (priority !== null) body.priority = priority;
+  const testCommand = String(form.testCommand ?? '').trim();
+  if (testCommand !== '') body.testCommand = testCommand;
+  body.allowPeak = form.allowPeak === true; // 复选框恒为布尔，总是发
+  const maxAttempts = toSafeInt(form.maxAttempts);
+  if (maxAttempts !== null && maxAttempts >= 1) body.maxAttempts = maxAttempts;
   return body;
 }

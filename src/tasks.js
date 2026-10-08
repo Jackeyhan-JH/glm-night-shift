@@ -540,6 +540,136 @@ export function retryTask(db, id) {
   return hydrateTasks(db, [row])[0];
 }
 
+/** updateTask 允许出现的 patch 字段（#46）。其余键（repo / source / status / attempts /
+ * branch / prUrl / 未知字段）带了就是校验错误，点名该字段。 */
+const UPDATABLE_FIELDS = [
+  'title', 'prompt', 'difficulty', 'priority', 'testCommand', 'allowPeak', 'maxAttempts', 'dependsOn',
+];
+
+/**
+ * 修改排队中的任务（#46）。patch 里出现哪个字段才改哪个，不出现的保持原值：
+ * - `title` / `prompt`：trim 后必须非空；
+ * - `difficulty`：`easy | medium | hard`；
+ * - `priority`：整数（负数合法，同 createTask）；
+ * - `testCommand`：非空字符串，或 `null` 表示清掉；
+ * - `allowPeak`：布尔；
+ * - `maxAttempts`：正整数；
+ * - `dependsOn`：出现就整组替换（规则与 setDependencies 相同：目标必须存在、不能是
+ *   failed / canceled、不能成环），不出现则依赖不动。
+ * repo / source / status / attempts / branch / prUrl 与任何未知字段不允许出现在
+ * patch 里，带了抛 ValidationError 点名字段，任务原样不动（什么都不写）。一个
+ * 可改字段都没给也是校验错误（field='patch'）。字段更新与依赖替换在同一个保存点
+ * 事务里：dependsOn 校验失败时，本次的其他字段更新一并回滚。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @param {object} patch 要修改的字段（出现才改）
+ * @returns {TaskRow} 更新后的任务（updated_at 已前进；repo / source / status /
+ *   attempts / branch / prUrl / createdAt / id 不变，领取顺序规则也不受影响）
+ * @throws {ValidationError} id 非正整数、patch 为空、带了不可修改的字段，或任一
+ *   字段不合法（err.field 指明字段）
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 任务当前不是 queued（message 为
+ *   「只有排队中的任务可以修改…」并点名当前状态；仍是 InvalidTransitionError，
+ *   HTTP 层照常映射 409）
+ */
+export function updateTask(db, id, patch = {}) {
+  assertPositiveInt(id, 'id');
+  const input = patch ?? {};
+  const updatable = new Set(UPDATABLE_FIELDS);
+  for (const key of Object.keys(input)) {
+    if (!updatable.has(key)) {
+      throw new ValidationError(key, `不能修改（updateTask 只接受：${UPDATABLE_FIELDS.join(' | ')}）`);
+    }
+  }
+  const has = (key) => input[key] !== undefined;
+  const fields = {}; // 归一化后的普通字段值（dependsOn 单独处理）
+  if (has('title')) fields.title = requiredTrimmed(input.title, 'title');
+  if (has('prompt')) fields.prompt = requiredTrimmed(input.prompt, 'prompt');
+  if (has('difficulty')) {
+    if (!DIFFICULTIES.includes(input.difficulty)) {
+      throw new ValidationError('difficulty', `必须是 ${DIFFICULTIES.join(' | ')} 之一（当前值：${input.difficulty}）`);
+    }
+    fields.difficulty = input.difficulty;
+  }
+  if (has('priority')) {
+    if (!Number.isInteger(input.priority)) {
+      throw new ValidationError('priority', `必须是整数（当前值：${input.priority}）`);
+    }
+    fields.priority = input.priority;
+  }
+  if (has('testCommand')) {
+    fields.testCommand = input.testCommand === null
+      ? null // null = 清掉
+      : requiredTrimmed(input.testCommand, 'testCommand');
+  }
+  if (has('allowPeak')) {
+    if (typeof input.allowPeak !== 'boolean') {
+      throw new ValidationError('allowPeak', `必须是布尔值（当前值：${input.allowPeak}）`);
+    }
+    fields.allowPeak = input.allowPeak;
+  }
+  if (has('maxAttempts')) {
+    if (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1) {
+      throw new ValidationError('maxAttempts', `必须是正整数（当前值：${input.maxAttempts}）`);
+    }
+    fields.maxAttempts = input.maxAttempts;
+  }
+  const dependsOn = has('dependsOn') ? normalizeDependsOn(input.dependsOn) : undefined;
+  if (Object.keys(fields).length === 0 && dependsOn === undefined) {
+    throw new ValidationError('patch', `至少给一个要修改的字段（${UPDATABLE_FIELDS.join(' | ')}）`);
+  }
+
+  // patch 字段名 → tasks 列名（驼峰转蛇形，allowPeak 顺手转 0/1）。
+  const COLUMN_OF = new Map([
+    ['title', 'title'],
+    ['prompt', 'prompt'],
+    ['difficulty', 'difficulty'],
+    ['priority', 'priority'],
+    ['testCommand', 'test_command'],
+    ['allowPeak', 'allow_peak'],
+    ['maxAttempts', 'max_attempts'],
+  ]);
+  const now = nowIso();
+  return inSavepoint(db, () => {
+    const current = taskRow(db, id); // 不存在 → NotFoundError
+    if (current.status !== 'queued') throw notEditableError(id, current.status);
+    const sets = ['updated_at = ?'];
+    const params = [now];
+    for (const [field, column] of COLUMN_OF) {
+      if (fields[field] === undefined) continue;
+      sets.push(`${column} = ?`);
+      params.push(field === 'allowPeak' ? (fields.allowPeak ? 1 : 0) : fields[field]);
+    }
+    params.push(id);
+    // 与其他状态流转同样带 status = 'queued' 守卫：读与写之间被并发领取/取消时
+    // 未命中，重读现状报错，不覆盖别人的结果。
+    const updated = db.prepare(
+      `UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'queued' RETURNING *`,
+    ).get(...params);
+    if (updated === undefined) {
+      throw notEditableError(id, taskRow(db, id).status);
+    }
+    if (dependsOn !== undefined) {
+      // 整组替换依赖，复用 deps --set 的全部规则与报错文案；它在自己的保存点里，
+      // 失败会连同上面的字段更新一起回滚（本函数的外层保存点）。
+      return setDependencies(db, id, dependsOn);
+    }
+    return hydrateTasks(db, [updated])[0];
+  });
+}
+
+/**
+ * updateTask 对非 queued 任务的报错：沿用 InvalidTransitionError（调用方按状态冲突
+ * 处理：HTTP 409、命令行退出码 1），但 message 换成「只有排队中的任务可以修改」并
+ * 点名当前状态——构造器的默认文案是给状态流转（cancel / retry / claim）用的，别处
+ * 有测试断言，不能改，这里只在实例上覆盖 message。from 仍是库里实际的当前状态。
+ */
+function notEditableError(id, status) {
+  const err = new InvalidTransitionError(status, 'queued');
+  err.message = `只有排队中的任务可以修改（任务 #${id} 当前是 ${status}）`;
+  return err;
+}
+
 // ---------------------------------------------------------------- 依赖
 
 /**
