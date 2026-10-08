@@ -153,6 +153,20 @@ const MIGRATIONS = [
       CREATE INDEX idx_tasks_not_before ON tasks (not_before);
     `);
   },
+  // 版本 3：任务依赖表 task_deps（issue #11；与 #9 并行开发，合并时顺延到 not_before 之后）。
+  // task_id 的任务要等 depends_on 的任务全部 succeeded 才能被领取；依赖失败 / 取消会沿边级联（见 src/tasks.js）。
+  // PRIMARY KEY (task_id, depends_on) 天然去重并覆盖「按任务查它依赖谁」的正向扫描；
+  // idx_task_deps_depends_on 覆盖反向扫描「谁依赖了它」（级联失败、blockedBy 统计）。
+  (db) => {
+    db.exec(`
+      CREATE TABLE task_deps (
+        task_id    INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+        depends_on INTEGER REFERENCES tasks(id),
+        PRIMARY KEY (task_id, depends_on)
+      );
+      CREATE INDEX idx_task_deps_depends_on ON task_deps (depends_on);
+    `);
+  },
 ];
 
 /**

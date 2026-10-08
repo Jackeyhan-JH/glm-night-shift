@@ -7,7 +7,9 @@
 // UPDATE … WHERE id = ? AND status IN (…) RETURNING」——先到者的更新生效；后到者
 // 未命中时重读库里的当前状态，抛 NotFoundError / InvalidTransitionError，绝不静默
 // 覆盖别人的结果（例：看板刚取消了一个 running 任务，调度器再报成功会抛错而不是
-// 把 canceled 改回 succeeded）。
+// 把 canceled 改回 succeeded）。需要多步写入的操作（建任务 + 写依赖边、终态变更 +
+// 级联失败、重试前的依赖检查）在这些原子 UPDATE 外面再套一层 SAVEPOINT，
+// 整体一起提交或回滚（见 inSavepoint）。
 import { DEFAULT_CONFIG } from './config.js';
 
 /** tasks.status 的全部合法值。 */
@@ -72,6 +74,28 @@ export class InvalidTransitionError extends Error {
 }
 
 /**
+ * 任务还在等依赖（#11）：claimTaskById 点名领取一个依赖未全部 succeeded 的 queued 任务。
+ * 是 InvalidTransitionError（queued → running 不允许）的子类，所以按状态冲突处理
+ * （HTTP 409、命令行退出码 1）的调用方无需改动；需要区分时看 err.blockedBy。
+ * @property {number} id 被点名的任务
+ * @property {number[]} blockedBy 还没 succeeded 的依赖 id（升序）
+ */
+export class DependencyBlockedError extends InvalidTransitionError {
+  /**
+   * @param {number} id 被点名的任务
+   * @param {{id: number, status: string}[]} blockers 未完成的依赖（id 升序）
+   */
+  constructor(id, blockers) {
+    super('queued', 'running');
+    this.name = 'DependencyBlockedError';
+    this.id = id;
+    this.blockedBy = blockers.map((b) => b.id);
+    this.message = `任务 #${id} 还在等依赖 ${blockers.map((b) => `#${b.id}（${b.status}）`).join('，')}，`
+      + '依赖全部成功后才能运行';
+  }
+}
+
+/**
  * @typedef {object} TaskRow 对外返回的任务对象（驼峰字段，布尔是真布尔，NULL 保持 null）。
  * @property {number} id
  * @property {string} repo `owner/name`
@@ -93,6 +117,8 @@ export class InvalidTransitionError extends Error {
  * @property {string} updatedAt UTC ISO
  * @property {?string} startedAt UTC ISO，最近一次领取时间（重试再领会覆盖）
  * @property {?string} finishedAt UTC ISO，终态（含 canceled）达成时间；重试回排队时为 null
+ * @property {number[]} dependsOn 依赖的任务 id（升序去重）；全部 succeeded 前不可领取
+ * @property {number[]} blockedBy dependsOn 里还没 succeeded 的任务 id（升序）
  */
 
 /**
@@ -130,6 +156,9 @@ export class InvalidTransitionError extends Error {
  * @param {?string} [input.testCommand=null] null 或非空字符串
  * @param {boolean} [input.allowPeak=false]
  * @param {number} [input.maxAttempts=DEFAULT_CONFIG.maxAttempts] 正整数（当前默认 2）
+ * @param {number[]} [input.dependsOn=[]] 依赖的任务 id：每个都必须存在且不是
+ *   failed / canceled；重复 id 去重。校验失败抛 ValidationError（field='dependsOn'，
+ *   message 点名是哪个 id、什么原因）
  * @returns {TaskRow} 新建的任务
  * @throws {ValidationError} 任一字段不合法（err.field 指明字段，message 点名）
  */
@@ -159,15 +188,22 @@ export function createTask(db, input = {}) {
   const title = input.title === undefined || input.title === null
     ? [...prompt].slice(0, TITLE_MAX_CODE_POINTS).join('')
     : requiredTrimmed(input.title, 'title');
+  // 先校验依赖再插任务：新任务的 id 尚不存在，把「依赖自己」自然归并进「不存在」。
+  const dependsOn = normalizeDependsOn(input.dependsOn ?? []);
+  validateDependencyTargets(db, null, dependsOn);
 
   const now = nowIso();
-  const row = db.prepare(`
-    INSERT INTO tasks (repo, title, prompt, difficulty, priority, test_command, allow_peak,
-                       status, attempts, max_attempts, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-    RETURNING *
-  `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, now, now);
-  return rowToTask(row);
+  const row = inSavepoint(db, () => {
+    const inserted = db.prepare(`
+      INSERT INTO tasks (repo, title, prompt, difficulty, priority, test_command, allow_peak,
+                         status, attempts, max_attempts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+      RETURNING *
+    `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, now, now);
+    insertTaskDeps(db, inserted.id, dependsOn);
+    return inserted;
+  });
+  return hydrateTasks(db, [row])[0];
 }
 
 /**
@@ -179,7 +215,8 @@ export function createTask(db, input = {}) {
  */
 export function getTask(db, id) {
   assertPositiveInt(id, 'id');
-  return rowToTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(id));
+  const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+  return row === undefined ? null : hydrateTasks(db, [row])[0];
 }
 
 /**
@@ -203,15 +240,16 @@ export function listTasks(db, { status, limit = 100 } = {}) {
     ? 'priority DESC, created_at ASC, id ASC'
     : 'created_at DESC, id DESC';
   const params = status === undefined ? [limit] : [status, limit];
-  return db.prepare(`SELECT * FROM tasks ${where} ORDER BY ${order} LIMIT ?`)
-    .all(...params)
-    .map(rowToTask);
+  return hydrateTasks(db, db.prepare(`SELECT * FROM tasks ${where} ORDER BY ${order} LIMIT ?`)
+    .all(...params));
 }
 
 /**
  * 原子领取下一个排队任务：单条 UPDATE（子查询选 id + `AND status = 'queued'` 双保险，
  * SQLite 写语句串行执行），两个连接 / 进程绝不会领到同一个任务。改为 running、
  * attempts + 1、写 started_at / updated_at。
+ * 依赖未满足（dependsOn 里有还没 succeeded 的）任务被 NOT EXISTS 子查询排除，
+ * 排序规则不变，仍是单条原子语句。
  *
  * not_before（限流退避，#9）：`not_before > now` 的任务跳过。now 接受 Date 或 ISO
  * 字符串（比较前规范化成 UTC ISO，与写入方 finishTask 的格式一致，字典序即时间序），
@@ -238,23 +276,35 @@ export function claimNextTask(db, { allowPeakOnly = false, now } = {}) {
       SELECT id FROM tasks
       WHERE status = 'queued' ${allowPeakOnly ? 'AND allow_peak = 1' : ''}
         AND (not_before IS NULL OR not_before <= ?)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
+          WHERE d.task_id = tasks.id AND dep.status != 'succeeded'
+        )
       ORDER BY priority DESC, created_at ASC, id ASC
       LIMIT 1
     ) AND status = 'queued'
     RETURNING *
   `).get(currentIso, currentIso, readyIso ?? currentIso);
-  return rowToTask(row);
+  return row === undefined ? null : hydrateTasks(db, [row])[0];
 }
 
 /**
  * 按 id 领取任务（#9 的 runNow 用）：只领 queued，语义同 claimNextTask（原子 UPDATE
  * 带状态守卫、attempts + 1、覆盖 started_at）。与 claimNextTask 不同：不排序、不看
  * not_before / allow_peak——runNow 是用户点名「现在就跑」，无视一切退避与高峰限制。
+ *
+ * 但**不绕过依赖门**（#11）：依赖里还有没 succeeded 的任务时不领取，抛
+ * DependencyBlockedError（InvalidTransitionError 的子类，HTTP 映射 409、命令行退出 1）。
+ * 理由：退避 / 高峰是「什么时候跑划算」的策略，用户可以拍板无视；依赖没完成则是
+ * 「上游产出还不存在」，此时硬跑只会白花额度做无用功。门与状态守卫在同一条 UPDATE 里，
+ * 原子：判定与领取之间不会有上游状态变化的窗口。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @returns {TaskRow} 被领取的任务
  * @throws {ValidationError} id 非正整数
  * @throws {NotFoundError} 任务不存在
+ * @throws {DependencyBlockedError} 任务是 queued 但依赖未全部 succeeded（err.blockedBy 列出 id）
  * @throws {InvalidTransitionError} 任务当前不是 queued（err.from 是库里实际的当前状态）
  */
 export function claimTaskById(db, id) {
@@ -264,10 +314,27 @@ export function claimTaskById(db, id) {
     UPDATE tasks
     SET status = 'running', attempts = attempts + 1, started_at = ?, updated_at = ?
     WHERE id = ? AND status = 'queued'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
+        WHERE d.task_id = tasks.id AND dep.status != 'succeeded'
+      )
     RETURNING *
   `).get(now, now, id);
-  if (row === undefined) throw staleTransitionError(db, id, 'running');
-  return rowToTask(row);
+  if (row === undefined) {
+    const current = db.prepare('SELECT status FROM tasks WHERE id = ?').get(id);
+    if (current?.status === 'queued') {
+      const blockers = db.prepare(`
+        SELECT d.depends_on AS id, dep.status AS status
+        FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
+        WHERE d.task_id = ? AND dep.status != 'succeeded'
+        ORDER BY d.depends_on ASC
+      `).all(id);
+      if (blockers.length > 0) throw new DependencyBlockedError(id, blockers);
+    }
+    throw staleTransitionError(db, id, 'running');
+  }
+  return hydrateTasks(db, [row])[0];
 }
 
 // ---------------------------------------------------------------- 任务状态流转
@@ -336,16 +403,22 @@ export function finishTask(db, id, { status, lastError, prUrl, branch, notBefore
   appendOptionalColumn(sets, params, ['branch', branch]);
   appendOptionalColumn(sets, params, ['not_before', notBeforeIso]);
   params.push(id);
-  const row = db.prepare(
-    `UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'running' RETURNING *`,
-  ).get(...params);
-  if (row === undefined) throw staleTransitionError(db, id, status);
-  return rowToTask(row);
+  const row = inSavepoint(db, () => {
+    const updated = db.prepare(
+      `UPDATE tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'running' RETURNING *`,
+    ).get(...params);
+    if (updated === undefined) throw staleTransitionError(db, id, status);
+    // 级联失败与本次状态变更同一事务（保存点）：要么都生效，要么都不留痕。
+    if (status === 'failed') cascadeFailDependents(db, id, now, '失败');
+    return updated;
+  });
+  return hydrateTasks(db, [row])[0];
 }
 
 /**
  * 取消任务：queued | running → canceled（终态，写 finished_at）。
- * 原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
+ * 原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖；取消与级联失败
+ * （把还排着队的下游任务标为 failed）在同一个保存点事务里完成。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @returns {TaskRow} 更新后的任务
@@ -356,39 +429,116 @@ export function finishTask(db, id, { status, lastError, prUrl, branch, notBefore
 export function cancelTask(db, id) {
   assertPositiveInt(id, 'id');
   const now = nowIso();
-  const row = db.prepare(`
-    UPDATE tasks
-    SET status = 'canceled', finished_at = ?, updated_at = ?
-    WHERE id = ? AND status IN ('queued', 'running')
-    RETURNING *
-  `).get(now, now, id);
-  if (row === undefined) throw staleTransitionError(db, id, 'canceled');
-  return rowToTask(row);
+  const row = inSavepoint(db, () => {
+    const updated = db.prepare(`
+      UPDATE tasks
+      SET status = 'canceled', finished_at = ?, updated_at = ?
+      WHERE id = ? AND status IN ('queued', 'running')
+      RETURNING *
+    `).get(now, now, id);
+    if (updated === undefined) throw staleTransitionError(db, id, 'canceled');
+    cascadeFailDependents(db, id, now, '已取消');
+    return updated;
+  });
+  return hydrateTasks(db, [row])[0];
 }
 
 /**
  * 重新排队：failed | canceled → queued；attempts 归零、last_error / finished_at /
  * not_before 清空；started_at 保留（下次领取时覆盖），branch / pr_url 也保留
- * （接着上次的开 PR 结果）。原子：UPDATE 带源状态守卫，并发下后到者抛错而不是覆盖。
+ * （接着上次的开 PR 结果）。
+ * 依赖里还有 failed / canceled 的不能重试（要按顺序先重试上游）；重试上游也**不会**
+ * 自动恢复因它级联失败的下游——下游要单独 retry。读依赖 + 更新在同一个保存点事务里，
+ * 并发下不会出现「校验时依赖还失败、更新时已被别人重试」的窗口。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @returns {TaskRow} 更新后的任务
- * @throws {ValidationError} id 非正整数
+ * @throws {ValidationError} id 非正整数，或依赖里还有 failed / canceled 的任务
+ *   （field='dependsOn'，message 点名是哪个 id、什么状态）
  * @throws {NotFoundError} 任务不存在
  * @throws {InvalidTransitionError} 当前状态不是 failed / canceled
  */
 export function retryTask(db, id) {
   assertPositiveInt(id, 'id');
   const now = nowIso();
-  const row = db.prepare(`
-    UPDATE tasks
-    SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL,
-        not_before = NULL, updated_at = ?
-    WHERE id = ? AND status IN ('failed', 'canceled')
-    RETURNING *
-  `).get(now, id);
-  if (row === undefined) throw staleTransitionError(db, id, 'queued');
-  return rowToTask(row);
+  const row = inSavepoint(db, () => {
+    const blocker = db.prepare(`
+      SELECT d.depends_on AS id, t.status AS status
+      FROM task_deps d JOIN tasks t ON t.id = d.depends_on
+      WHERE d.task_id = ? AND t.status IN ('failed', 'canceled')
+      ORDER BY d.depends_on ASC
+      LIMIT 1
+    `).get(id);
+    if (blocker !== undefined) {
+      throw new ValidationError('dependsOn', `依赖 #${blocker.id} 仍是 ${blocker.status}，请先重试它`);
+    }
+    const updated = db.prepare(`
+      UPDATE tasks
+      SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL,
+          not_before = NULL, updated_at = ?
+      WHERE id = ? AND status IN ('failed', 'canceled')
+      RETURNING *
+    `).get(now, id);
+    if (updated === undefined) throw staleTransitionError(db, id, 'queued');
+    return updated;
+  });
+  return hydrateTasks(db, [row])[0];
+}
+
+// ---------------------------------------------------------------- 依赖
+
+/**
+ * 修改任务的依赖（整体替换）。只允许 queued 任务；每个依赖 id 必须存在、不能是自己、
+ * 不能是 failed / canceled；新依赖与已有依赖边合在一起不能成环。
+ * 替换（删旧插新）在同一个保存点事务里完成。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} taskId 正整数
+ * @param {number[]} ids 新的依赖 id 列表（[] = 清空依赖）；重复 id 去重
+ * @returns {TaskRow} 更新后的任务（dependsOn 已是 新值）
+ * @throws {ValidationError} taskId 非正整数；ids 形状不对、含不存在 / 自己 /
+ *   failed / canceled 的 id，或会形成依赖环（field='dependsOn'，环信息如 #1 → #2 → #1）
+ * @throws {NotFoundError} 任务不存在
+ * @throws {InvalidTransitionError} 任务当前不是 queued
+ */
+export function setDependencies(db, taskId, ids = []) {
+  assertPositiveInt(taskId, 'id');
+  const deps = normalizeDependsOn(ids);
+  taskRow(db, taskId); // 不存在时抛 NotFoundError
+  return inSavepoint(db, () => {
+    // 状态检查、目标校验、写边、查环都在同一保存点里，任何一步失败整体回滚；
+    // 环检测在**写入后**的完整图上做（从新依赖出发找回到自己的路径），即使别的
+    // 连接同时加边也逃不过。要完全串行得 BEGIN IMMEDIATE，但那会与调用方自己的
+    // 事务冲突——遵循 #3 的原子更新模型，窗口到事务内为止。
+    const { status } = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId);
+    if (status !== 'queued') {
+      throw new InvalidTransitionError(status, 'queued');
+    }
+    db.prepare('DELETE FROM task_deps WHERE task_id = ?').run(taskId);
+    validateDependencyTargets(db, taskId, deps);
+    insertTaskDeps(db, taskId, deps);
+    const cycle = findDependencyCycle(db, taskId, deps);
+    if (cycle !== null) {
+      throw new ValidationError('dependsOn', `会形成依赖环：${cycle.map((id) => `#${id}`).join(' → ')}`);
+    }
+    return hydrateTasks(db, [taskRow(db, taskId)])[0];
+  });
+}
+
+/**
+ * 某任务依赖的各任务（id + 当前状态），id 升序；给 deps / show 展示用。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} taskId 正整数
+ * @returns {{id: number, status: string}[]}
+ * @throws {ValidationError} taskId 非正整数
+ */
+export function listDependencies(db, taskId) {
+  assertPositiveInt(taskId, 'taskId');
+  return db.prepare(`
+    SELECT d.depends_on AS id, t.status AS status
+    FROM task_deps d JOIN tasks t ON t.id = d.depends_on
+    WHERE d.task_id = ?
+    ORDER BY d.depends_on ASC
+  `).all(taskId).map((row) => ({ id: row.id, status: row.status }));
 }
 
 /**
@@ -609,6 +759,198 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+/**
+ * 在保存点里执行 fn：调用方自己开着事务时是内嵌局部回滚，没开时（常态）SAVEPOINT
+ * 会隐式开一个事务、RELEASE 时提交——两种情况下 fn 都原子。node:sqlite（22.13）没有
+ * 可靠的 isTransaction 探测，所以统一用 SAVEPOINT 而不是 BEGIN/COMMIT。
+ * @template T
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {() => T} fn
+ * @returns {T}
+ */
+function inSavepoint(db, fn) {
+  db.exec('SAVEPOINT night_shift_task');
+  try {
+    const result = fn();
+    db.exec('RELEASE SAVEPOINT night_shift_task');
+    return result;
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK TO SAVEPOINT night_shift_task');
+      db.exec('RELEASE SAVEPOINT night_shift_task');
+    } catch {
+      // 保存点已不在（连接级回滚）：保留原始错误，别让清理的报错盖住它
+    }
+    throw err;
+  }
+}
+
+/** dependsOn 入参形状校验：必须是正整数 id 的数组（安全整数）；去重 + 升序后返回。 */
+function normalizeDependsOn(ids) {
+  if (!Array.isArray(ids)) {
+    throw new ValidationError('dependsOn', `必须是 id 数组（当前值：${ids}）`);
+  }
+  const out = [];
+  for (const id of ids) {
+    if (!Number.isSafeInteger(id) || id < 1) {
+      throw new ValidationError('dependsOn', `id 必须是正整数（当前值：${id}）`);
+    }
+    if (!out.includes(id)) out.push(id);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/**
+ * 逐个校验依赖目标：存在、不是 self、不是 failed / canceled。
+ * 不满足抛 ValidationError（field='dependsOn'），message 点名哪个 id、什么原因。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {?number} self 自己的 id（createTask 还没有 id，传 null）
+ * @param {number[]} deps 已归一化的依赖 id
+ */
+function validateDependencyTargets(db, self, deps) {
+  const select = db.prepare('SELECT status FROM tasks WHERE id = ?');
+  for (const id of deps) {
+    if (id === self) {
+      throw new ValidationError('dependsOn', `#${id} 不能依赖自己`);
+    }
+    const row = select.get(id);
+    if (row === undefined) {
+      throw new ValidationError('dependsOn', `#${id} 不存在`);
+    }
+    if (row.status === 'failed' || row.status === 'canceled') {
+      throw new ValidationError('dependsOn', `#${id} 已是 ${row.status}，不能作为依赖`);
+    }
+  }
+}
+
+/**
+ * 从每个新依赖出发沿「X 依赖 Y」的已有边找环：能走回 taskId 就成环。
+ * 返回环路径（首尾都是 taskId，如 [1, 2, 1]），无环返回 null。
+ * 只需检查穿过 taskId 的环——不改别人的边，别的环不会被创建。
+ *
+ * 迭代 DFS（显式栈）而不是递归：几万级的长依赖链（每个任务依赖前一个）造得出来，
+ * 递归会撑爆 JS 调用栈（SQLite 侧的级联 CTE 是队列实现，不受此限）。parent 记录
+ * 「从谁走到这个节点」，走到 taskId 后沿 parent 链回溯即得完整环路径。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} taskId 要改依赖的任务
+ * @param {number[]} deps 归一化后的新依赖 id
+ * @returns {?number[]}
+ */
+function findDependencyCycle(db, taskId, deps) {
+  if (deps.length === 0) return null;
+  const selectDeps = db.prepare(
+    'SELECT depends_on FROM task_deps WHERE task_id = ? ORDER BY depends_on ASC',
+  );
+  const parent = new Map(); // 节点 → 从哪个节点走到它；种子依赖的父是 taskId
+  const stack = [];
+  for (const dep of deps) {
+    parent.set(dep, taskId);
+    stack.push(dep);
+  }
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === taskId) {
+      // 沿 parent 链取回 taskId ← … ← 种子，反转就是正向路径，首尾都是 taskId
+      const back = [];
+      for (let cur = parent.get(taskId); cur !== taskId; cur = parent.get(cur)) {
+        back.push(cur);
+      }
+      return [taskId, ...back.reverse(), taskId];
+    }
+    for (const row of selectDeps.all(node)) {
+      if (!parent.has(row.depends_on)) {
+        parent.set(row.depends_on, node);
+        stack.push(row.depends_on);
+      }
+    }
+  }
+  return null;
+}
+
+/** 写入依赖边（调用方已校验）。 */
+function insertTaskDeps(db, taskId, deps) {
+  if (deps.length === 0) return;
+  const insert = db.prepare('INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)');
+  for (const dep of deps) insert.run(taskId, dep);
+}
+
+/**
+ * 给查询出来的任务行补上 dependsOn / blockedBy：一次 IN 查询取回这批任务的全部
+ * 依赖边（不是每任务一查），依赖里还没 succeeded 的进 blockedBy。两边都升序。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object[]} rows SELECT/RETURNING 出的任务行
+ * @returns {TaskRow[]}
+ */
+function hydrateTasks(db, rows) {
+  if (rows.length === 0) return rows;
+  // 分批查依赖边：批大小远小于 SQLite 的绑定变量上限，任务再多也不会撞上；
+  // 批数是 rows.length / 批大小，仍然不是每任务一查。
+  const BATCH = 500;
+  const edges = [];
+  for (let start = 0; start < rows.length; start += BATCH) {
+    const ids = rows.slice(start, start + BATCH).map((row) => row.id);
+    edges.push(...db.prepare(`
+      SELECT d.task_id AS taskId, d.depends_on AS depId, t.status AS status
+      FROM task_deps d JOIN tasks t ON t.id = d.depends_on
+      WHERE d.task_id IN (${ids.map(() => '?').join(', ')})
+    `).all(...ids));
+  }
+  const byTask = new Map();
+  for (const edge of edges) {
+    let entry = byTask.get(edge.taskId);
+    if (entry === undefined) {
+      entry = { dependsOn: [], blockedBy: [] };
+      byTask.set(edge.taskId, entry);
+    }
+    entry.dependsOn.push(edge.depId);
+    if (edge.status !== 'succeeded') entry.blockedBy.push(edge.depId);
+  }
+  for (const entry of byTask.values()) {
+    entry.dependsOn.sort((a, b) => a - b);
+    entry.blockedBy.sort((a, b) => a - b);
+  }
+  return rows.map((row) => {
+    const entry = byTask.get(row.id) ?? { dependsOn: [], blockedBy: [] };
+    return rowToTask(row, entry.dependsOn, entry.blockedBy);
+  });
+}
+
+/**
+ * 级联失败：把所有直接或间接依赖 triggerId、且还在 queued 的任务改为 failed，
+ * last_error 指名各自**直接**依赖的那个（`依赖 #<n> 失败` / `依赖 #<n> 已取消`，
+ * 由 failureText 决定），并写 finished_at / updated_at。
+ *
+ * 单条语句完成：递归 CTE 找出（task_id, blocker）对——blocker 是该任务直接依赖的、
+ * 正被这次变更干掉的依赖（对间接依赖者来说是级联失败的那个直接依赖）。同一任务有
+ * 多个 blocker 时取 MIN，报错确定。注意不能用 SET 里的相关子查询取 blocker：递归
+ * CTE 物化后没有索引，每行更新都全扫一遍，几万级长链是 O(n²)（实测 2 万链约 13 秒）；
+ * UPDATE…FROM 先按 task_id GROUP BY 成小表再等值连接，整体 O(n)（实测毫秒级）。
+ * 只碰 queued 任务（领取门已保证运行中的下游依赖都已 succeeded，正常流程到不了
+ * 这里，守住即可）。必须与触发它的 finishTask / cancelTask 在同一事务（保存点）里调用。
+ */
+function cascadeFailDependents(db, triggerId, now, failureText) {
+  db.prepare(`
+    WITH RECURSIVE dependents(task_id, blocker) AS (
+      SELECT d.task_id, d.depends_on
+      FROM task_deps d
+      WHERE d.depends_on = ?
+        AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = d.task_id AND t.status = 'queued')
+      UNION
+      SELECT d.task_id, d.depends_on
+      FROM task_deps d
+      JOIN dependents p ON d.depends_on = p.task_id
+      WHERE EXISTS (SELECT 1 FROM tasks t WHERE t.id = d.task_id AND t.status = 'queued')
+    )
+    UPDATE tasks
+    SET status = 'failed',
+        last_error = '依赖 #' || m.blocker || ?,
+        finished_at = ?,
+        updated_at = ?
+    FROM (SELECT task_id, MIN(blocker) AS blocker FROM dependents GROUP BY task_id) AS m
+    WHERE tasks.id = m.task_id AND tasks.status = 'queued'
+  `).run(triggerId, ` ${failureText}`, now, now);
+}
+
 /** Date 或 ISO 字符串 → 规范化的 UTC ISO 字符串；两者都不是则抛 ValidationError。 */
 function toIso(value, field) {
   if (value instanceof Date) {
@@ -661,7 +1003,7 @@ function staleTransitionError(db, id, to) {
   return new InvalidTransitionError(taskRow(db, id).status, to);
 }
 
-function rowToTask(row) {
+function rowToTask(row, dependsOn = [], blockedBy = []) {
   if (row === undefined) return null;
   return {
     id: row.id,
@@ -683,6 +1025,8 @@ function rowToTask(row) {
     updatedAt: row.updated_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
+    dependsOn,
+    blockedBy,
   };
 }
 

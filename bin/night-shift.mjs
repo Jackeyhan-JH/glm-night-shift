@@ -18,6 +18,7 @@ import {
   retryCommand,
   showCommand,
 } from '../src/cli/task-commands.js';
+import { depsCommand } from '../src/cli/deps-command.js';
 import { configCommand } from '../src/cli/config-command.js';
 import { templatesCommand } from '../src/cli/template-commands.js';
 import { serveCommand } from '../src/cli/serve-command.js';
@@ -45,6 +46,7 @@ const COMMANDS = {
   show: showCommand,
   cancel: cancelCommand,
   retry: retryCommand,
+  deps: depsCommand,
   config: configCommand,
   templates: templatesCommand,
   'serve-api': serveCommand,
@@ -86,8 +88,9 @@ function usageText() {
     ...details,
     '',
     '--prompt-file 的文件内容原样作为提示词（只去掉末尾一个换行符）；--max-attempts 缺省',
-    '取配置的 maxAttempts；list / show 的时间按本地时区显示到分钟。数据目录：',
-    '$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
+    '取配置的 maxAttempts；list / show 的时间按本地时区显示到分钟。--depends-on 与',
+    'deps --set 的 id 列表逗号分隔、容忍空格，空串表示无依赖（--set "" 即清空）。',
+    '数据目录：$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
     '',
     'start / peak / logs / serve（调度器一键启动）等命令将在后续版本加入；',
     '看板服务见 serve-api。',
