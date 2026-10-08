@@ -370,6 +370,36 @@ test('验收: 先打开 /stream 再创建日志文件，也能收到后写入的
   );
 });
 
+test('SSE：log_path 还是空串时等待，路径补写后（#7 的 setRunLogPath 流程）照常跟踪', async (t) => {
+  const { server, db, home, base } = await startServer(t);
+  const task = createTask(db, { repo: 'a/b', prompt: 'x' });
+  const logPath = path.join(home, 'logs', 'late-path.log');
+  // 模拟 #7 的 runTask：startRun 先拿 id、随后才补写真实日志路径。
+  // 本分支的 startRun 还不接受空串，用 SQL 直接置空（schema 只要求 NOT NULL，'' 合法；
+  // rebase 到带 setRunLogPath 的 main 后此测试同样成立）。
+  const run = startRun(db, {
+    taskId: task.id, attempt: 1, model: 'glm-5.3', effort: 'low', peak: false,
+    logPath: '/tmp/placeholder-then-emptied.log',
+  });
+  db.prepare("UPDATE runs SET log_path = '' WHERE id = ?").run(run.id);
+
+  const controller = new AbortController();
+  const streamRes = await fetch(`${base}/api/runs/${run.id}/stream`, { signal: controller.signal });
+  const client = new SseClient(streamRes, controller);
+  await waitUntil(() => server.sseConnections === 1, { what: 'SSE 连接建立' });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(client.queue.length, 0, 'log_path 未定时不该发出任何日志事件');
+
+  db.prepare('UPDATE runs SET log_path = ? WHERE id = ?').run(logPath, run.id);
+  fs.writeFileSync(logPath, '补写路径后的行\n');
+  const event = await client.next();
+  assert.equal(event.event, 'log');
+  assert.equal(event.data, '补写路径后的行');
+
+  client.abort();
+  await waitUntil(() => server.sseConnections === 0, { what: '断开后 SSE 计数回到 0' });
+});
+
 test('SSE：多字节 UTF-8 字符跨读取不被劈坏；结束时末尾不完整的一行也发出', async (t) => {
   const { db, home, base } = await startServer(t);
   const task = createTask(db, { repo: 'a/b', prompt: 'x' });
