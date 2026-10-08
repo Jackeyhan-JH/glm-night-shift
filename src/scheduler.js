@@ -291,7 +291,8 @@ export function createScheduler({
         now: nowEach,
       });
       if (task === null) {
-        if (!peakOnly) setBlocked(null); // 队列空：不是被拦，是没事干
+        // 队列空，或（#47）剩下的都是「等同仓库正在跑的」任务：都不是被拦，按 pollSeconds 再等
+        if (!peakOnly) setBlocked(null);
         break;
       }
       // 闸门按任务实际模型再确认一次；不通过就放回队列（不扣次数）并停止本轮。
