@@ -21,6 +21,10 @@
 //   FAKE_GH_PR_VIEW_JSON    pr view 输出该 JSON 字符串（补一个换行）
 //                          ——三个都没设置时 pr view 不被接管：落到末尾的静默成功
 //                          （现有端到端测试依赖这个默认，不要发明默认 JSON）
+//   FAKE_GH_REVIEW_COMMENTS_FAIL=1  api（行内评审评论）报错退出 1（优先于下面的 JSON）
+//   FAKE_GH_REVIEW_COMMENTS_JSON    api（行内评审评论）输出该字符串并补一个换行；
+//                          变量存在于环境即接管（空字符串也算，输出就是一个换行）
+//                          ——两个都没设置时 api 不被接管：落到末尾的静默成功
 // 重要：不带任何参数被调用时（例如被 `node --test` 误当测试文件执行）静默退出 0，
 // 且 FAKE_GH_LOG 未设置时不写任何文件。
 import { appendFileSync, copyFileSync, readFileSync } from 'node:fs';
@@ -182,6 +186,25 @@ function prView() {
   return false;
 }
 
+// `api --paginate repos/<repo>/pulls/<n>/comments`（issue #60 的行内评审评论用）。只在
+// 设置了 FAKE_GH_REVIEW_COMMENTS_FAIL / FAKE_GH_REVIEW_COMMENTS_JSON 之一时接管（返回
+// true）；都没设置时返回 false，调用方落到文件末尾的静默成功。FAIL 优先级最高（stderr
+// 一行错误、退出 1、不打印 JSON）；JSON 变量只要存在于环境就接管（哪怕是空字符串——
+// 输出空串加换行，不是 JSON 数组，调用方按「没有行内评论」处理），输出补一个换行。
+function apiComments() {
+  if (process.env.FAKE_GH_REVIEW_COMMENTS_FAIL === '1') {
+    process.stderr.write('fake gh api failure (FAKE_GH_REVIEW_COMMENTS_FAIL=1)\n');
+    process.exitCode = 1;
+    return true;
+  }
+  const json = process.env.FAKE_GH_REVIEW_COMMENTS_JSON;
+  if (json !== undefined) {
+    process.stdout.write(`${json}\n`);
+    return true;
+  }
+  return false;
+}
+
 function main() {
   writeLog();
   const sub = argv[0];
@@ -232,7 +255,12 @@ function main() {
     return;
   }
 
-  // 其他子命令（auth status、未设 PR_VIEW_* 变量的 pr view、无参数……）：静默成功。
+  if (sub === 'api' && apiComments()) {
+    return;
+  }
+
+  // 其他子命令（auth status、未设 PR_VIEW_* 变量的 pr view、未设 REVIEW_COMMENTS_*
+  // 变量的 api、无参数……）：静默成功。
 }
 
 try {

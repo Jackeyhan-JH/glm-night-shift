@@ -22,6 +22,7 @@ import {
   listTasks,
 } from '../src/tasks.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
+import { followTask, scanFollowReviews } from '../src/follow.js';
 import { branchName, createWorktree, ensureRepoCache, repoCacheDir } from '../src/git.js';
 import { createScheduler } from '../src/scheduler.js';
 import { fakeEnv, fixturePath, makeTempHome } from './helpers.js';
@@ -110,9 +111,11 @@ async function run(args, home, envOverrides = {}) {
   return { code, stdout: stdout.text(), stderr: stderr.text() };
 }
 
-/** gh pr view 的标准 JSON 输出（fake gh 原样回吐）。 */
-function prViewJson({ reviewDecision = 'CHANGES_REQUESTED', reviews = [], url = 'https://github.com/a/b/pull/9' } = {}) {
-  return JSON.stringify({ reviewDecision, reviews, url, headRefName: 'night-shift/1-fix-login-bug' });
+/** gh pr view 的标准 JSON 输出（fake gh 原样回吐）；state / mergeable 不传就不带（#60）。 */
+function prViewJson({
+  reviewDecision = 'CHANGES_REQUESTED', reviews = [], url = 'https://github.com/a/b/pull/9', state, mergeable,
+} = {}) {
+  return JSON.stringify({ reviewDecision, reviews, url, headRefName: 'night-shift/1-fix-login-bug', state, mergeable });
 }
 
 /**
@@ -455,6 +458,250 @@ test('用法错误：缺 id、id 与 --all 同时给、--json 没有 --all、id 
     assert.ok(res.stderr.includes(needle), `${JSON.stringify(args)} 应提到 ${needle}：${res.stderr}`);
     assert.ok(res.stderr.includes('用法：night-shift follow'), res.stderr);
   }
+});
+
+// ---------------------------------------------------------------- #60：跳过已结束的 PR、行内评论、冲突提示
+
+test('验收: pr view 返回 state MERGED / CLOSED 时即使 reviewDecision 是 CHANGES_REQUESTED 也不入队：输出 PR 已合并 / PR 已关闭，退出 0', async (t) => {
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const parent = seedSucceeded(db);
+  db.close();
+  const reviews = [{ id: 99, state: 'CHANGES_REQUESTED', body: '请把变量名改清楚' }];
+
+  const merged = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews, state: 'MERGED' }),
+  });
+  assert.equal(merged.code, 0, merged.stderr);
+  assert.equal(merged.stderr, '');
+  assert.equal(merged.stdout, 'PR 已合并\n');
+
+  const closed = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews, state: 'CLOSED' }),
+  });
+  assert.equal(closed.code, 0, closed.stderr);
+  assert.equal(closed.stdout, 'PR 已关闭\n');
+
+  const db2 = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db2.close());
+  assert.equal(listTasks(db2, { limit: 1000 }).length, 1, '两次都没有建跟进任务');
+});
+
+test('验收: 父任务对象 prOutcome=merged/closed 直接跳过、假 gh 一次都没被调用；open/null/缺字段/大写不当作已结束照常入队', async (t) => {
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db.close());
+  const ghLog = path.join(home, 'gh-log.jsonl');
+  const base = seedSucceeded(db);
+  const skipEnv = fakeEnv({ FAKE_GH_LOG: ghLog });
+
+  const merged = await followTask(db, { ...base, prOutcome: 'merged' }, { ghBin: FAKE_GH, env: skipEnv, config: DEFAULT_CONFIG });
+  assert.equal(merged.kind, 'skipped');
+  assert.equal(merged.message, 'PR 已合并');
+
+  const closed = await followTask(db, { ...base, prOutcome: 'closed' }, { ghBin: FAKE_GH, env: skipEnv, config: DEFAULT_CONFIG });
+  assert.equal(closed.kind, 'skipped');
+  assert.equal(closed.message, 'PR 已关闭');
+
+  assert.equal(fs.existsSync(ghLog), false, '一次 gh 都没调用（连日志文件都没建）');
+
+  // 不是已结束的取值：open、null、缺字段、大写 MERGED——都照常走到 gh pr view 并入队
+  const viewEnv = fakeEnv({
+    FAKE_GH_LOG: ghLog,
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 5, state: 'CHANGES_REQUESTED', body: '照常改' }] }),
+  });
+  let pr = 20;
+  for (const parent of [
+    { ...base, prOutcome: 'open' },
+    { ...base, prOutcome: null },
+    { ...base },                      // 缺字段
+    { ...base, prOutcome: 'MERGED' }, // 大写不当作已结束
+  ]) {
+    parent.prUrl = `https://github.com/a/b/pull/${pr}`; // 换编号避开 source 去重
+    pr += 1;
+    const result = await followTask(db, parent, { ghBin: FAKE_GH, env: viewEnv, config: DEFAULT_CONFIG });
+    assert.equal(result.kind, 'created', JSON.stringify(result));
+  }
+  assert.equal(listTasks(db, { limit: 1000 }).length, 5, 'base + 四条跟进任务');
+});
+
+test('验收: pr view 的 JSON 没有 state 字段、结论是 CHANGES_REQUESTED：仍入队，source / gitRef 与原来一致', async (t) => {
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const parent = seedSucceeded(db);
+  db.close();
+  const res = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 9, state: 'CHANGES_REQUESTED', body: '照常改' }] }),
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stdout, `已入队 #2，在分支 ${parent.branch} 上改\n`);
+  const db2 = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db2.close());
+  const follow = getTask(db2, 2);
+  assert.equal(follow.source, 'pr-review:a/b#9:9');
+  assert.equal(follow.gitRef, parent.branch, 'gitRef 等于父任务的 branch');
+  assert.equal(follow.status, 'queued');
+});
+
+test('验收: 行内评论带 path/line/body 进说明；没有 line 用 original_line；都没有行号就只写 path；空 body 不出现；仍有「不要开新的 PR」', async (t) => {
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const parent = seedSucceeded(db);
+  db.close();
+  const comments = JSON.stringify([
+    { path: 'src/app.js', line: 42, body: '  变量名改清楚  ' },
+    { path: 'src/old.js', original_line: 7, body: '旧位置也要改' },
+    { path: 'src/empty.js', line: 3, body: '   ' },
+    { path: 'README.md', body: '没有行号的评论' },
+  ]);
+  const res = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 3, state: 'CHANGES_REQUESTED', body: '总体意见' }] }),
+    FAKE_GH_REVIEW_COMMENTS_JSON: comments,
+  });
+  assert.equal(res.code, 0, res.stderr);
+  const db2 = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db2.close());
+  const follow = getTask(db2, 2);
+  assert.ok(follow.prompt.includes('- src/app.js:42 变量名改清楚'), follow.prompt);
+  assert.ok(follow.prompt.includes('- src/old.js:7 旧位置也要改'), follow.prompt);
+  assert.ok(follow.prompt.includes('- README.md 没有行号的评论'), follow.prompt);
+  assert.equal(follow.prompt.includes('src/empty.js'), false, '空 body 的评论不出现');
+  assert.ok(follow.prompt.includes('总体意见'), '评审正文仍在');
+  assert.ok(
+    follow.prompt.indexOf('总体意见') < follow.prompt.indexOf('- src/app.js:42'),
+    '正文在前，行内评论接在后面',
+  );
+  assert.ok(follow.prompt.includes('不要开新的 PR'));
+  assert.ok(follow.prompt.includes(`只在当前分支 ${parent.branch} 上提交并推送，不要开新分支，不要开新的 PR。`));
+});
+
+test('验收: FAKE_GH_REVIEW_COMMENTS_FAIL=1 仍入队、说明里没有行内评论行、退出 0；scanFollowReviews 不因此停下（ghError=null、两条都 created）', async (t) => {
+  // 命令行：评论 api 失败按「没有行内评论」处理，照常入队，退出码是 0 不是 1
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const parent = seedSucceeded(db);
+  db.close();
+  const res = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 3, state: 'CHANGES_REQUESTED', body: '正文意见' }] }),
+    FAKE_GH_REVIEW_COMMENTS_FAIL: '1',
+  });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(res.stderr, '');
+  assert.equal(res.stdout, `已入队 #2，在分支 ${parent.branch} 上改\n`);
+  const db2 = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db2.close());
+  const follow = getTask(db2, 2);
+  assert.equal(follow.status, 'queued');
+  assert.ok(follow.prompt.includes('正文意见'));
+  assert.ok(
+    follow.prompt.split('\n').every((line) => !line.startsWith('- ')),
+    `说明里没有以「- 」开头的行内评论行：${follow.prompt}`,
+  );
+
+  // 自动扫描：两个都会跟进的父任务，评论 api 失败不影响扫描继续，也不设 ghError
+  const home2 = makeTempHome(t);
+  const db3 = openDb(path.join(home2, 'night-shift.db'));
+  t.after(() => db3.close());
+  seedSucceeded(db3, { title: 'a', prUrl: 'https://github.com/a/b/pull/9' });
+  seedSucceeded(db3, { title: 'b', prUrl: 'https://github.com/a/b/pull/12' });
+  const outcome = await scanFollowReviews(db3, {
+    ghBin: FAKE_GH,
+    env: fakeEnv({
+      FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 99, state: 'CHANGES_REQUESTED', body: '改' }] }),
+      FAKE_GH_REVIEW_COMMENTS_FAIL: '1',
+    }),
+    config: DEFAULT_CONFIG,
+  });
+  assert.equal(outcome.ghError, null, '评论 api 失败不是 gh 失败，扫描没停');
+  assert.deepEqual(outcome.failed, []);
+  assert.deepEqual(outcome.skipped, []);
+  assert.equal(outcome.created.length, 2, '两条都入队了');
+  assert.deepEqual(
+    outcome.created.map((item) => item.source).sort(),
+    ['pr-review:a/b#12:99', 'pr-review:a/b#9:99'],
+  );
+});
+
+test('验收: mergeable=CONFLICTING 时说明含「先把默认分支合进当前分支」且在「只在当前分支」之前；字段缺失或其他值不加这句', async (t) => {
+  const conflictLine = '这个 PR 和默认分支有冲突，先把默认分支合进当前分支，再按评审改。';
+  const home = makeTempHome(t);
+  const db = openDb(path.join(home, 'night-shift.db'));
+  const parent = seedSucceeded(db);
+  db.close();
+  const requested = prViewJson({ reviews: [{ id: 4, state: 'CHANGES_REQUESTED', body: '按意见改' }] });
+
+  const conflictRun = await run(['follow', String(parent.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 4, state: 'CHANGES_REQUESTED', body: '按意见改' }], mergeable: 'CONFLICTING' }),
+  });
+  assert.equal(conflictRun.code, 0, conflictRun.stderr);
+  const db2 = openDb(path.join(home, 'night-shift.db'));
+  t.after(() => db2.close());
+  const withConflict = getTask(db2, 2);
+  assert.ok(withConflict.prompt.includes('先把默认分支合进当前分支'), withConflict.prompt);
+  assert.ok(
+    withConflict.prompt.indexOf(conflictLine) < withConflict.prompt.indexOf(`只在当前分支 ${parent.branch}`),
+    '冲突提示在分支那句之前',
+  );
+  assert.equal(
+    withConflict.prompt,
+    `按意见改\n${conflictLine}\n只在当前分支 ${parent.branch} 上提交并推送，不要开新分支，不要开新的 PR。`,
+  );
+
+  // 没有 mergeable 字段、以及别的值（MERGEABLE）：说明就是「正文 + 分支句」
+  const plain = seedSucceeded(db2, { title: '第二条', prUrl: 'https://github.com/a/b/pull/31' });
+  const noField = await run(['follow', String(plain.id)], home, { FAKE_GH_PR_VIEW_JSON: requested });
+  assert.equal(noField.code, 0, noField.stderr);
+  const other = seedSucceeded(db2, { title: '第三条', prUrl: 'https://github.com/a/b/pull/32' });
+  const mergeableRun = await run(['follow', String(other.id)], home, {
+    FAKE_GH_PR_VIEW_JSON: prViewJson({ reviews: [{ id: 4, state: 'CHANGES_REQUESTED', body: '按意见改' }], mergeable: 'MERGEABLE' }),
+  });
+  assert.equal(mergeableRun.code, 0, mergeableRun.stderr);
+  for (const id of [plain.id + 1, other.id + 1]) {
+    const follow = getTask(db2, id);
+    assert.equal(follow.prompt.includes('先把默认分支合进当前分支'), false, `#${id} 不加冲突句：${follow.prompt}`);
+  }
+  assert.equal(
+    getTask(db2, plain.id + 1).prompt,
+    `按意见改\n只在当前分支 ${plain.branch} 上提交并推送，不要开新分支，不要开新的 PR。`,
+  );
+});
+
+// ---------------------------------------------------------------- 假 gh 的 api
+
+test('验收: 未设 FAKE_GH_REVIEW_COMMENTS_FAIL / JSON 时 api --paginate …/comments 静默成功；设置后输出字符串加换行 / 失败退出非 0（FAIL 优先）', (t) => {
+  const apiArgs = ['api', '--paginate', 'repos/a/b/pulls/9/comments'];
+  const runFakeGh = (envOverrides = {}) => {
+    const res = spawnSync(process.execPath, [FAKE_GH, ...apiArgs], {
+      cwd: makeTempHome(t),
+      env: fakeEnv(envOverrides),
+      encoding: 'utf8',
+    });
+    assert.ok(!res.error, `假 gh 启动失败：${res.error}`);
+    return { code: res.status, stdout: res.stdout, stderr: res.stderr };
+  };
+
+  const silent = runFakeGh();
+  assert.equal(silent.code, 0, '未设变量时 api 不被接管：静默成功');
+  assert.equal(silent.stdout, '');
+  assert.equal(silent.stderr, '');
+
+  const payload = JSON.stringify([{ path: 'src/app.js', line: 42, body: '改这里' }]);
+  const withJson = runFakeGh({ FAKE_GH_REVIEW_COMMENTS_JSON: payload });
+  assert.equal(withJson.code, 0);
+  assert.equal(withJson.stdout, `${payload}\n`, '字符串 + 一个换行');
+
+  const empty = runFakeGh({ FAKE_GH_REVIEW_COMMENTS_JSON: '' });
+  assert.equal(empty.code, 0, '空字符串也算设置');
+  assert.equal(empty.stdout, '\n', '输出空串加一个换行');
+
+  const fail = runFakeGh({ FAKE_GH_REVIEW_COMMENTS_FAIL: '1' });
+  assert.notEqual(fail.code, 0);
+  assert.equal(fail.stdout, '');
+  assert.ok(fail.stderr.trim() !== '');
+
+  const failWins = runFakeGh({ FAKE_GH_REVIEW_COMMENTS_FAIL: '1', FAKE_GH_REVIEW_COMMENTS_JSON: payload });
+  assert.notEqual(failWins.code, 0, 'FAIL 优先于 JSON');
+  assert.equal(failWins.stdout, '');
 });
 
 // ---------------------------------------------------------------- follow --all
