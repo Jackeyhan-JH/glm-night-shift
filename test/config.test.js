@@ -36,6 +36,7 @@ const EXPECTED_DEFAULTS = {
   diagnoseModel: 'glm-5.3-flash',
   diagnoseTimeoutMinutes: 5,
   systemctlBin: 'systemctl',
+  oneTaskPerRepo: true,
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {

@@ -394,7 +394,8 @@ test('keepFailedWorktrees: true 时失败的 worktree 保留，成功的仍清�
 test('git 某步抛错 → git: 前缀普通失败；同轮的下一个任务照常处理', async (t) => {
   const ctx = setup(t, {
     taskCount: 2,
-    config: { concurrency: 2 },
+    // #47 的 oneTaskPerRepo 默认 true 会挡住同仓库的第二条；本条要验证的就是同轮两条
+    config: { concurrency: 2, oneTaskPerRepo: false },
     git: { createWorktree: [() => { throw new Error('worktree boom'); }, null] },
   });
   const claimed = await ctx.scheduler.tick();
@@ -545,7 +546,9 @@ test('blocked 事件按 (reason, retryAt) 去重：连续多轮只发一次', as
 // ---------------------------------------------------------------- 并发与重入
 
 test('单元·并发：concurrency 2 + 300ms 假 runner + 3 个任务 → 峰值恰为 2，最终 3 个都成功', async (t) => {
-  const ctx = setup(t, { taskCount: 3, config: { concurrency: 2 }, runner: { delayMs: 300 } });
+  // 3 个任务同仓库（setup 固定 repo a/b）：#47 的默认 oneTaskPerRepo 会把它们串成一条条跑，
+  // 本条验证的是并发上限本身，显式关掉该锁
+  const ctx = setup(t, { taskCount: 3, config: { concurrency: 2, oneTaskPerRepo: false }, runner: { delayMs: 300 } });
   assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id, ctx.tasks[1].id]);
   // 流水线异步启动：等两个 runner 真正同时挂起在 300ms 延迟上
   await waitUntil(() => ctx.fakeRunner.maxActive() === 2, { message: '两个 runner 应同时运行' });

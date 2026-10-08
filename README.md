@@ -107,6 +107,7 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `diagnoseModel` | `"glm-5.3-flash"` | 失败诊断用的模型（只读，不开思考） | — |
 | `diagnoseTimeoutMinutes` | `5` | 单次诊断的超时（分钟） | — |
 | `systemctlBin` | `"systemctl"` | install-service / uninstall-service 调用的 systemctl | `NIGHT_SHIFT_SYSTEMCTL_BIN` |
+| `oneTaskPerRepo` | `true` | 某仓库已有 running 任务时先不领它的其他排队任务（只在 concurrency > 1 时看得到；`false` 允许同一仓库并行，但它们都往同一默认分支开 PR，容易打架；不限制排队条数，同一仓库不分分支算同一把锁） | — |
 
 环境变量总览（详情见 [docs/configuration.md](docs/configuration.md)）：`NIGHT_SHIFT_HOME`
 （数据目录）、`NIGHT_SHIFT_CLAUDE_BIN`、`NIGHT_SHIFT_GH_BIN`、`NIGHT_SHIFT_SYSTEMCTL_BIN`、
