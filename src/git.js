@@ -384,8 +384,16 @@ async function recordedBaseSha(worktree) {
 }
 
 /**
- * 为任务建 worktree：路径 <home>/worktrees/task-<id>，分支 night-shift/<id>-<slug>，
- * 从 origin/<baseBranch> 检出（-B：重试时分支已存在就强制重置到最新基线）。
+ * 为任务建 worktree：路径 <home>/worktrees/task-<id>，从 origin/<baseBranch> 检出，
+ * 分支 night-shift/<id>-<slug>（-B：重试时分支已存在就强制重置到最新基线）。
+ *
+ * task.gitRef 有值时（#48 跟进任务）改为从 origin/<gitRef> 检出，本地分支用 -B 对齐
+ * 到**这条远程分支的尖端**（不是默认分支），返回的 branch 也是 gitRef 本身——调度器
+ * 已有的 push / createPr 用 worktree.branch，于是改动推回原分支、复用原来的 PR；
+ * baseBranch 仍是调用方传入的默认分支（PR 的 base 不变），baseSha 是检出后的 HEAD。
+ * origin/<gitRef> 在缓存里不存在时直接抛错（信息带分支名原文），**不**退回默认分支、
+ * **不**新建其他分支（worktree add 尚未执行，任何本地分支都不会多出来）。
+ * gitRef 为 null / 未设置时行为与原来完全一致。
  *
  * 只在**已存在的**缓存上干活，自己不克隆、不 fetch、不改 origin 地址——按规格，
  * #9 以 ensureRepoCache → defaultBranch → createWorktree 的顺序调用；缓存不可用
@@ -397,14 +405,34 @@ async function recordedBaseSha(worktree) {
  * @returns {{ path: string, branch: string, baseBranch: string, baseSha: string }}
  */
 export async function createWorktree({ home, repo, task, baseBranch } = {}) {
-  const branch = branchName(task); // 一并校验 task.id 为正整数
+  branchName(task); // 一并校验 task.id 为正整数（worktree 路径要用）
   assertNonEmptyString(baseBranch, 'createWorktree 的 baseBranch');
   const cacheDir = repoCacheDir(home, repo); // 一并校验 home / repo
   const worktreePath = path.join(home, 'worktrees', `task-${task.id}`);
   const worktreesRoot = path.join(home, 'worktrees');
+  // 空白 / null / 未设置都按「没有 gitRef」走原有路径。
+  const gitRef = typeof task.gitRef === 'string' && task.gitRef.trim() !== ''
+    ? task.gitRef.trim()
+    : null;
   return withLock(lockKey(cacheDir), async () => {
     if (!(await isUsableCache(cacheDir))) {
       throw new Error(`仓库缓存不存在或不可用：${cacheDir}（请先调用 ensureRepoCache）`);
+    }
+    let branch = branchName(task);
+    let startPoint = `origin/${baseBranch}`;
+    if (gitRef !== null) {
+      // 远程分支先确认存在，再动任何现场：不存在就抛错，绝不拿 worktree add 去建别的分支。
+      const remoteRef = `refs/remotes/origin/${gitRef}`;
+      try {
+        await runGit(['rev-parse', '--verify', '--quiet', remoteRef], { cwd: cacheDir });
+      } catch {
+        throw new Error(
+          `远端分支 origin/${gitRef} 不存在（缓存仓库里没有 ${remoteRef}），无法在其上跟进；`
+            + `不退回默认分支 ${baseBranch}，也不新建其他分支`,
+        );
+      }
+      branch = gitRef;
+      startPoint = `origin/${gitRef}`;
     }
     await runGit(['worktree', 'prune'], { cwd: cacheDir });
     if (fs.existsSync(worktreePath)) {
@@ -418,7 +446,7 @@ export async function createWorktree({ home, repo, task, baseBranch } = {}) {
         await runGit(['worktree', 'prune'], { cwd: cacheDir });
       }
     }
-    await runGit(['worktree', 'add', '-B', branch, worktreePath, `origin/${baseBranch}`], { cwd: cacheDir });
+    await runGit(['worktree', 'add', '-B', branch, worktreePath, startPoint], { cwd: cacheDir });
     const baseSha = (await runGit(['rev-parse', 'HEAD'], { cwd: worktreePath })).stdout.trim();
     await recordBaseSha(worktreePath, baseSha);
     return { path: worktreePath, branch, baseBranch, baseSha };

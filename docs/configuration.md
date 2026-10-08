@@ -338,6 +338,24 @@ prompt 也一样（渲染后压缩连续空行并 trim）。
 「第二次信号才强制」的处理器，Ctrl-C 就是停掉这个跟随进程（Node 的默认 SIGINT），不是
 `start` / `serve` 那套优雅再强制的协议。
 
+## follow：按 PR 评审在原分支上跟进
+
+任务成功开出 PR 之后，评审要求修改（`CHANGES_REQUESTED`）时，用 `night-shift follow <id>`
+（或 `follow --all` 扫全部已成功任务）在**原来的 night-shift 分支**上入队一条跟进任务：
+`gh pr view` 读最新评审，新任务的 `gitRef` 指向父任务成功时推送的分支，worktree 从
+`origin/<gitRef>` 检出，提交推回原分支并**复用原来那个 PR**，不新开第二个。评审正文
+（trim 后按码点截到 8000）加上「只在当前分支 `<branch>` 上提交并推送，不要开新分支，
+不要开新的 PR」作为任务说明；`difficulty` / `priority` / `testCommand` / `allowPeak`
+照抄父任务，`maxAttempts` 用默认值。
+
+结论不是 `CHANGES_REQUESTED`（APPROVED / COMMENTED / 空）时输出「没有待处理的修改请求」
+退出 0、不建任务；同一来源（`pr-review:<repo>#<PR编号>:<评审id>`）已有任务时输出
+「已经入队 #<id>（状态）」退出 0。`--all` 下某条 `gh` 失败会记下来继续，有任何失败
+退出码 1、已入队的保留；`--json` 输出 `{created, skipped, failed}`。
+
+**这批不会自动轮询 PR**：调度器（`serve` / `start`）不会自己去看评审，也没有
+`autoFollowReviews` 这样的配置键——发现评审要求修改后要手动跑 `follow`。
+
 ## 两个页面同时取消
 
 取消是带状态守卫的：只有 `queued` 或 `running` 能变成 `canceled`。两个看板页同时取消同一个

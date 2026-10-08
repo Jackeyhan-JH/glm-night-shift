@@ -16,6 +16,11 @@
 //   FAKE_GH_ISSUE_LIST_FAIL=1 issue list 报错退出 1（优先于下面两个；不影响 issue view）
 //   FAKE_GH_ISSUE_LIST_FILE  issue list 输出该文件的内容（原样，不补换行）
 //   FAKE_GH_ISSUE_LIST_JSON  issue list 输出该 JSON 字符串（原样，不补换行）
+//   FAKE_GH_PR_VIEW_FAIL=1  pr view 报错退出 1（优先于下面两个）
+//   FAKE_GH_PR_VIEW_FILE    pr view 输出该文件的内容（原样，不补换行）
+//   FAKE_GH_PR_VIEW_JSON    pr view 输出该 JSON 字符串（补一个换行）
+//                          ——三个都没设置时 pr view 不被接管：落到末尾的静默成功
+//                          （现有端到端测试依赖这个默认，不要发明默认 JSON）
 // 重要：不带任何参数被调用时（例如被 `node --test` 误当测试文件执行）静默退出 0，
 // 且 FAKE_GH_LOG 未设置时不写任何文件。
 import { appendFileSync, copyFileSync, readFileSync } from 'node:fs';
@@ -153,6 +158,30 @@ function issueList() {
   process.stdout.write('[]\n');
 }
 
+// `pr view <n> [--repo <r>] --json reviewDecision,reviews,url,headRefName`（issue #48 的
+// follow 用）。只在设置了 FAKE_GH_PR_VIEW_FAIL / FAKE_GH_PR_VIEW_FILE / FAKE_GH_PR_VIEW_JSON
+// 之一时接管（返回 true）；三者都没设置时返回 false，调用方落到文件末尾的静默成功——
+// 现有端到端测试依赖这个默认，不能改。FAKE_GH_PR_VIEW_JSON 与 FAKE_GH_ISSUE_JSON 一致
+// 补一个换行；FILE 与 FAKE_GH_ISSUE_FILE 一致原样输出；FAIL 优先级最高。
+function prView() {
+  if (process.env.FAKE_GH_PR_VIEW_FAIL === '1') {
+    process.stderr.write('fake gh pr view failure (FAKE_GH_PR_VIEW_FAIL=1)\n');
+    process.exitCode = 1;
+    return true;
+  }
+  const file = process.env.FAKE_GH_PR_VIEW_FILE;
+  if (file) {
+    process.stdout.write(readFileSync(file, 'utf8')); // 原样输出，不补换行
+    return true;
+  }
+  const json = process.env.FAKE_GH_PR_VIEW_JSON;
+  if (json) {
+    process.stdout.write(`${json}\n`);
+    return true;
+  }
+  return false;
+}
+
 function main() {
   writeLog();
   const sub = argv[0];
@@ -183,6 +212,10 @@ function main() {
     return;
   }
 
+  if (sub === 'pr' && subSub === 'view' && prView()) {
+    return;
+  }
+
   if (sub === 'repo' && subSub === 'view') {
     const name = process.env.FAKE_GH_DEFAULT_BRANCH || 'main';
     process.stdout.write(`${JSON.stringify({ defaultBranchRef: { name } })}\n`);
@@ -199,7 +232,7 @@ function main() {
     return;
   }
 
-  // 其他子命令（auth status、pr view、无参数……）：静默成功。
+  // 其他子命令（auth status、未设 PR_VIEW_* 变量的 pr view、无参数……）：静默成功。
 }
 
 try {

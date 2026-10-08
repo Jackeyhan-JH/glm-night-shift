@@ -20,6 +20,7 @@ import {
   showCommand,
 } from '../src/cli/task-commands.js';
 import { depsCommand } from '../src/cli/deps-command.js';
+import { followCommand } from '../src/cli/follow-command.js';
 import { pauseCommand, resumeCommand } from '../src/cli/pause-commands.js';
 import { configCommand } from '../src/cli/config-command.js';
 import { templatesCommand } from '../src/cli/template-commands.js';
@@ -59,6 +60,7 @@ const COMMANDS = {
   import: importCommand,
   cancel: cancelCommand,
   retry: retryCommand,
+  follow: followCommand,
   start: startCommand,
   peak: peakCommand,
   usage: usageCommand,
