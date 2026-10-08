@@ -12,7 +12,7 @@ import {
   padEndDisplay,
   truncateDisplay,
 } from '../src/format.js';
-import { TITLE_MAX_COLUMNS, renderTaskDetail, renderTasksTable } from '../src/cli/render.js';
+import { REPO_MAX_COLUMNS, TITLE_MAX_COLUMNS, renderTaskDetail, renderTasksTable } from '../src/cli/render.js';
 
 test('displayWidth：ASCII 1 列，CJK/全角/emoji 2 列，组合附标与零宽 0 列', () => {
   assert.equal(displayWidth('abc'), 3);
@@ -141,6 +141,26 @@ test('renderTasksTable：超长标题截断加 …，截断后仍与短标题行
   assert.equal(timeStart(lines[1]), timeStart(lines[2]));
 });
 
+test('renderTasksTable：超长仓库截断加 …；标题/仓库里的控制字符换成空格', () => {
+  const longRepo = `o${'o'.repeat(60)}/r`; // 63 列，远超仓库列上限
+  const weird = taskFixture({ id: 1, repo: longRepo, title: 'a\nb\tc\x1b[31m红' });
+  const normal = taskFixture({ id: 2, repo: 'a/b', title: '正常' });
+  const lines = renderTasksTable([weird, normal]).trimEnd().split('\n');
+  assert.equal(lines.length, 3, '控制字符压平后行数不变');
+  assert.ok(lines[1].includes('…'), '仓库列应截断');
+  const expectedRepo = truncateDisplay(longRepo, REPO_MAX_COLUMNS);
+  assert.ok(lines[1].includes(expectedRepo), '仓库列是截断后的值');
+  assert.ok(!lines[1].includes(longRepo), '完整的超长仓库不应出现在表格里');
+  // 换行/制表/ANSI 转义都换成空格，数据行里不再有任何控制字符
+  const hasControl = (text) => [...text].some((ch) => {
+    const cp = ch.codePointAt(0);
+    return cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
+  });
+  assert.ok(!hasControl(lines[1]), `数据行不应再含控制字符：${JSON.stringify(lines[1])}`);
+  const timeStart = (line) => displayWidth(line.slice(0, line.indexOf('2026-10-08 15:30')));
+  assert.equal(timeStart(lines[1]), timeStart(lines[2]), '清理后对齐不受影响');
+});
+
 test('renderTaskDetail：字段列表、提示词缩进、运行记录表（尝试/模型/状态/耗时/额度/日志）', () => {
   const task = taskFixture({
     id: 7,
@@ -220,6 +240,20 @@ test('renderTaskDetail：没有运行记录时明确说无', () => {
   const out = renderTaskDetail(taskFixture(), []);
   assert.ok(out.includes('运行记录：无'));
   assert.ok(!out.includes('尝试次数  模型'));
+});
+
+test('renderTaskDetail：提示词 CR/CRLF 归一成 LF、其余控制字符换空格、逐行缩进', () => {
+  // \x07（BEL）、\x1b（ESC，ANSI 转义开头）必须被清掉；\r\n 和单独 \r 都归一成换行
+  const task = taskFixture({ title: '标\x07题', prompt: '第一行\r\n第二行\r第三行\x1b[31m红' });
+  const out = renderTaskDetail(task, []);
+  assert.ok(out.includes('任务 #1：标 题'), '详情标题行里的控制字符换成空格');
+  assert.ok(out.includes('提示词：\n  第一行\n  第二行\n  第三行 [31m红'), '提示词按 LF 切行、逐行缩进、ESC 清除');
+  const promptBlock = out.slice(out.indexOf('提示词：'));
+  const hasControl = (text) => [...text].some((ch) => {
+    const cp = ch.codePointAt(0);
+    return cp < 0x20 && ch !== '\n';
+  });
+  assert.ok(!hasControl(promptBlock));
 });
 
 function dirname() {

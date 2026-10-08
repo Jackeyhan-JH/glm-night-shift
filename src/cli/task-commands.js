@@ -26,11 +26,46 @@ import { renderTaskDetail, renderTasksTable } from './render.js';
 const USAGE_CONT = ' '.repeat(15);
 
 /**
+ * util.parseArgs 把紧跟在选项后面的负数（`--priority -2` 里的 -2）当成未知选项；
+ * 解析前先把「已知取整数的选项 + 紧随其后的纯数字」合并成 `--opt=value`
+ * （`--priority=2` / `--priority 2` 两种写法照旧支持）。只动这几个选项，
+ * 其他选项值以 - 开头（如标题）不受影响，仍按 parseArgs 的规则报用法错误。
+ */
+const NUMBER_VALUE_OPTIONS = new Set(['priority', 'max-attempts', 'limit']);
+
+function normalizeNumericOptions(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') { // 其后全是位置参数，不再改写
+      out.push(...args.slice(i));
+      break;
+    }
+    const name = arg.startsWith('--') && !arg.includes('=') ? arg.slice(2) : null;
+    if (name !== null && NUMBER_VALUE_OPTIONS.has(name)
+        && i + 1 < args.length && /^[+-]?\d+$/.test(args[i + 1])) {
+      out.push(`${arg}=${args[i + 1]}`);
+      i += 1;
+    } else {
+      out.push(arg);
+    }
+  }
+  return out;
+}
+
+/**
  * 打开 <home>/night-shift.db（不存在则自动创建）执行 fn，用完无论成败都关闭连接。
+ * 打不开（NIGHT_SHIFT_HOME 指到普通文件、目录不可写……）时抛中文原因带路径的错。
  */
 async function withDb(ctx, fn) {
   const { openDb } = await import('../db.js'); // 动态 import：给警告过滤留出安装时间
-  const db = openDb(path.join(resolveHome(ctx.env), 'night-shift.db'));
+  const dbPath = path.join(resolveHome(ctx.env), 'night-shift.db');
+  let db;
+  try {
+    db = openDb(dbPath);
+  } catch (err) {
+    throw new Error(`无法打开数据库 ${dbPath}：${err.message}`);
+  }
   try {
     return await fn(db);
   } finally {
@@ -83,7 +118,7 @@ export const addCommand = {
   ].join('\n'),
   async run(args, ctx) {
     const { values } = parseArgs({
-      args,
+      args: normalizeNumericOptions(args),
       options: {
         repo: { type: 'string' },
         prompt: { type: 'string' },
@@ -161,7 +196,7 @@ export const listCommand = {
   usage: '用法：night-shift list [--status <queued|running|succeeded|failed|canceled>] [--limit <条数>] [--json]',
   async run(args, ctx) {
     const { values } = parseArgs({
-      args,
+      args: normalizeNumericOptions(args),
       options: {
         status: { type: 'string' },
         limit: { type: 'string' },

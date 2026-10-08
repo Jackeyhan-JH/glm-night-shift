@@ -59,6 +59,38 @@ test('幂等：同一 target 重复安装不会叠加包装', () => {
   assert.equal(p.forwarded.length, 1);
 });
 
+test('Node 22.13～22.x 的消息变体都能命中：只要 ExperimentalWarning 且提到 SQLite', () => {
+  const p = fakeProcess();
+  installSqliteWarningFilter(p);
+  // 22.13 实测原文
+  assert.equal(p.emitWarning(SQLITE_MESSAGE, 'ExperimentalWarning'), undefined);
+  // 假设的变体措辞（换冠词/加模块名/大小写），类型与主题都对得上就该吞
+  assert.equal(p.emitWarning('The SQLite module is an experimental feature and might change at any time', 'ExperimentalWarning'), undefined);
+  assert.equal(p.emitWarning('sqlite 是实验性功能', 'ExperimentalWarning'), undefined);
+  assert.equal(p.forwarded.length, 0, '以上都应被吞掉');
+});
+
+test('非 SQLite 警告一字不差地转发：Error 实例、带 code 的 options、三参形态', () => {
+  const p = fakeProcess();
+  installSqliteWarningFilter(p);
+  const asError = new Error('普通错误');
+  const options = { type: 'DeprecationWarning', code: 'DEP0097', detail: '详情' };
+  assert.equal(p.emitWarning(asError), 'ok'); // Error 实例整体转发
+  assert.equal(p.emitWarning('带选项的警告', options), 'ok'); // options 对象形态
+  assert.equal(p.emitWarning('三参形态', 'DeprecationWarning', 'DEP0001'), 'ok');
+  // 名字是 ExperimentalWarning 但内容与 SQLite 无关的 Error：不受影响
+  const otherExperimental = new Error('别的实验特性');
+  otherExperimental.name = 'ExperimentalWarning';
+  assert.equal(p.emitWarning(otherExperimental), 'ok');
+
+  assert.equal(p.forwarded.length, 4);
+  assert.equal(p.forwarded[0].warning, asError, 'Error 实例应原样转发');
+  assert.deepEqual(p.forwarded[0].rest, []);
+  assert.deepEqual(p.forwarded[1].rest, [options], 'options 对象应原样转发');
+  assert.deepEqual(p.forwarded[2].rest, ['DeprecationWarning', 'DEP0001']);
+  assert.equal(p.forwarded[3].warning, otherExperimental);
+});
+
 test('没有 emitWarning 的 target：安装是安全的空操作', () => {
   const p = {};
   installSqliteWarningFilter(p);

@@ -16,15 +16,20 @@ const binPath = fileURLToPath(new URL('../bin/night-shift.mjs', import.meta.url)
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const srcPath = (rel) => fileURLToPath(new URL(`../src/${rel}`, import.meta.url));
 
+// 「无堆栈」断言用：报错文案里合法出现 "at position 1"（JSON 解析错误）不是堆栈，
+// 只有另起一行、缩进后的 "at xxx (file:1:1)" 才是堆栈帧。
+const hasStackTrace = (text) => /(^\s*at )|(\n\s*at )/.test(text);
+
 // 作为独立进程跑 bin（端到端）；进程内直接调用 bin 的 runCli/main 见文件后半部分。
 // 默认把 NIGHT_SHIFT_HOME 指到临时目录、TZ 固定 UTC（时间输出可断言）；
-// exec 可换成别的 node（Node 22.13 的警告测试）。
-function spawnCli(t, args, { cwd, env: envOverrides = {}, exec = process.execPath } = {}) {
+// exec 可换成别的 node（Node 22.13 的警告测试），bin 可换成符号链接（npm link 场景），
+// home 单独指定时与 cwd 解耦。
+function spawnCli(t, args, { cwd, home, env: envOverrides = {}, exec = process.execPath, bin = binPath } = {}) {
   const dir = cwd ?? makeTempHome(t);
   return new Promise((resolve, reject) => {
-    const child = spawn(exec, [binPath, ...args], {
+    const child = spawn(exec, [bin, ...args], {
       cwd: dir,
-      env: fakeEnv({ NIGHT_SHIFT_HOME: dir, TZ: 'UTC', ...envOverrides }),
+      env: fakeEnv({ NIGHT_SHIFT_HOME: home ?? dir, TZ: 'UTC', ...envOverrides }),
     });
     let stdout = '';
     let stderr = '';
@@ -243,12 +248,25 @@ test('home 里的 config.json 被 config 与 add 采纳（--max-attempts 缺省�
   assert.equal(JSON.parse(explicit.stdout).maxAttempts, 7, '--max-attempts 显式给定时优先');
 });
 
-test('config.json 不合法：退出 1，stderr 带文件路径', async (t) => {
+test('config.json 不合法：config 与 add 都退出 1，「错误：」+ 文件路径，无堆栈', async (t) => {
   const home = makeTempHome(t);
   fs.writeFileSync(path.join(home, 'config.json'), '{oops');
-  const res = await spawnCli(t, ['config'], { cwd: home });
-  assert.equal(res.code, 1);
-  assert.ok(res.stderr.includes(path.join(home, 'config.json')), res.stderr);
+  const results = await Promise.all([
+    spawnCli(t, ['config'], { cwd: home }),
+    spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: home }),
+  ]);
+  for (const res of results) {
+    assert.equal(res.code, 1);
+    assert.ok(res.stderr.startsWith('错误：'), res.stderr);
+    assert.ok(res.stderr.includes(path.join(home, 'config.json')), res.stderr);
+    assert.ok(!hasStackTrace(res.stderr), '不应打印堆栈');
+  }
+});
+
+test('验收: 不引入依赖（package.json 无 dependencies / devDependencies）', () => {
+  // 「npm test 全部通过」由测试套件自身证明；这里锁住零依赖这半句（#1 约定）。
+  assert.ok(!('dependencies' in pkg), '不应有 dependencies');
+  assert.ok(!('devDependencies' in pkg), '不应有 devDependencies');
 });
 
 test('NIGHT_SHIFT_PORT 环境变量覆盖 config 输出', async (t) => {
@@ -333,16 +351,34 @@ test('show 展示运行记录（尝试次数/模型/状态/耗时/额度/日志�
   const res = await spawnCli(t, ['show', '1'], { cwd: home });
   assert.equal(res.code, 0);
   assert.ok(res.stdout.includes('运行记录（1 条）'));
+  for (const column of ['尝试次数', '模型', '状态', '耗时', '额度', '日志路径']) {
+    assert.ok(res.stdout.includes(column), `运行记录表头缺「${column}」`);
+  }
   assert.ok(res.stdout.includes('glm-5.3'));
   assert.ok(res.stdout.includes('succeeded'));
+  assert.ok(res.stdout.includes('2')); // 额度 quotaUnits
   assert.ok(res.stdout.includes('/tmp/logs/task-1-run-1.log'));
 
   const json = await spawnCli(t, ['show', '1', '--json'], { cwd: home });
   const parsed = JSON.parse(json.stdout);
+  assert.ok(Array.isArray(parsed.runs));
   assert.equal(parsed.runs.length, 1);
-  assert.equal(parsed.runs[0].model, 'glm-5.3');
-  assert.equal(parsed.runs[0].quotaUnits, 2);
-  assert.equal(parsed.runs[0].numTurns, 3);
+  const run = parsed.runs[0];
+  // 驼峰字段逐一核对（run 的全部对外字段）
+  assert.equal(run.taskId, 1);
+  assert.equal(run.attempt, 1);
+  assert.equal(run.model, 'glm-5.3');
+  assert.equal(run.effort, 'high');
+  assert.equal(run.peak, false);
+  assert.equal(run.status, 'succeeded');
+  assert.equal(run.exitCode, 0);
+  assert.equal(run.numTurns, 3);
+  assert.equal(run.prompts, 2);
+  assert.equal(run.quotaUnits, 2);
+  assert.equal(run.logPath, '/tmp/logs/task-1-run-1.log');
+  assert.equal(run.error, null);
+  assert.ok(typeof run.durationMs === 'number' && run.durationMs >= 1, '耗时毫秒数');
+  assert.ok(typeof run.startedAt === 'string' && typeof run.finishedAt === 'string');
 });
 
 test('cancel 已是终态的任务：退出 1（非法状态转换，中文原因）', async (t) => {
@@ -392,15 +428,159 @@ test('list --limit 控制条数（store 排序：最新在前）', async (t) => 
   assert.deepEqual(arr.map((task) => task.title), ['丙', '乙']); // created_at DESC
 });
 
-test('help 列出全部子命令与关键选项', async (t) => {
-  const res = await spawnCli(t, ['--help']);
+// —— 加固：负数选项、管道提前关闭、坏数据目录、符号链接、控制字符 ——
+
+test('负数选项：--priority -2 与 --priority=-2 等价；--limit/--max-attempts 负数报整数错误', async (t) => {
+  const home = makeTempHome(t);
+  const spaceForm = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x', '--priority', '-2', '--json'], { cwd: home });
+  assert.equal(spaceForm.code, 0, spaceForm.stderr);
+  assert.equal(JSON.parse(spaceForm.stdout).priority, -2);
+
+  const eqForm = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x', '--priority=-3', '--json'], { cwd: home });
+  assert.equal(eqForm.code, 0, eqForm.stderr);
+  assert.equal(JSON.parse(eqForm.stdout).priority, -3);
+
+  const limit = await spawnCli(t, ['list', '--limit', '-5'], { cwd: home });
+  assert.equal(limit.code, 2);
+  assert.ok(limit.stderr.includes('--limit 必须是不小于 1 的整数'), limit.stderr);
+  assert.ok(!limit.stderr.includes('未知选项'), '负数不该被当成未知选项');
+
+  const maxAttempts = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x', '--max-attempts', '-1'], { cwd: home });
+  assert.equal(maxAttempts.code, 2);
+  assert.ok(maxAttempts.stderr.includes('--max-attempts 必须是不小于 1 的整数'), maxAttempts.stderr);
+  assert.ok(!maxAttempts.stderr.includes('未知选项'));
+});
+
+test('list | head 提前关管道：静默退出，不打堆栈（EPIPE）', async (t) => {
+  const home = makeTempHome(t);
+  // 本进程直接批量造任务（比逐条 CLI 快得多），让 list 输出远超管道缓冲区（64KB）
+  const { openDb } = await import('../src/db.js');
+  const { createTask } = await import('../src/tasks.js');
+  {
+    const db = openDb(path.join(home, 'night-shift.db'));
+    const title = '很长的标题'.repeat(12); // 60 个汉字，展示时截到 40 列
+    for (let i = 0; i < 1200; i++) {
+      createTask(db, { repo: 'a/b', prompt: 'x', title: `${title}${i}` });
+    }
+    db.close();
+  }
+  const result = await new Promise((resolve, reject) => {
+    const child = spawn('/bin/sh', ['-c',
+      `${JSON.stringify(process.execPath)} ${JSON.stringify(binPath)} list --limit 2000 | head -2`], {
+      cwd: home,
+      env: fakeEnv({ NIGHT_SHIFT_HOME: home, TZ: 'UTC' }),
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+  assert.equal(result.code, 0, `管道应静默成功，stderr：${result.stderr}`);
+  assert.ok(result.stdout.includes('ID'), 'head 应能看到表头');
+  assert.ok(!result.stderr.includes('EPIPE'), `不应出现 EPIPE 报错：${result.stderr}`);
+  assert.ok(!result.stderr.includes('at '), '不应打印堆栈');
+});
+
+test('NIGHT_SHIFT_HOME 指到普通文件：退出 1，中文原因带路径，无堆栈', async (t) => {
+  const home = makeTempHome(t);
+  const notADir = path.join(home, 'not-a-dir');
+  fs.writeFileSync(notADir, 'x');
+  const cases = [
+    { args: ['list'], needle: '无法打开数据库' },
+    { args: ['add', '--repo', 'a/b', '--prompt', 'x'], needle: '无法读取配置文件' },
+    { args: ['config'], needle: '无法读取配置文件' },
+  ];
+  for (const { args, needle } of cases) {
+    const res = await spawnCli(t, args, { home: notADir, cwd: home });
+    assert.equal(res.code, 1, JSON.stringify(args));
+    assert.ok(res.stderr.startsWith('错误：'), res.stderr);
+    assert.ok(res.stderr.includes(needle), `${JSON.stringify(args)} 应含「${needle}」：${res.stderr}`);
+    assert.ok(res.stderr.includes(notADir), res.stderr);
+    assert.ok(!hasStackTrace(res.stderr), '不应打印堆栈');
+  }
+});
+
+test('通过符号链接调用（npm link 场景）：动态 import 的 db.js 按真实路径解析', async (t) => {
+  const dir = makeTempHome(t); // 放符号链接的目录（也是 cwd）
+  const home = makeTempHome(t); // 数据目录另放，验证 NIGHT_SHIFT_HOME 与 cwd 解耦
+  const link = path.join(dir, 'night-shift');
+  fs.symlinkSync(binPath, link);
+
+  const addRes = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'x'], { cwd: dir, home, bin: link });
+  assert.equal(addRes.code, 0, addRes.stderr);
+  assert.equal(addRes.stdout, '已加入队列：#1 x\n');
+  const listRes = await spawnCli(t, ['list'], { cwd: dir, home, bin: link });
+  assert.equal(listRes.code, 0, listRes.stderr);
+  assert.equal(listRes.stdout.trimEnd().split('\n').length, 2, '表头 + 1 行，能读回数据');
+  assert.ok(fs.existsSync(path.join(home, 'night-shift.db')), '数据库建在 NIGHT_SHIFT_HOME 而不是链接目录');
+});
+
+test('标题/提示词带换行、制表、控制字符：list 表格不被破坏，show 提示词缩进多行', async (t) => {
+  const home = makeTempHome(t);
+  await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', '第一行\n第二行\t带制表\x07', '--title', '标\n题\x1b'], { cwd: home });
+  await spawnCli(t, ['add', '--repo', 'c/d', '--prompt', 'x', '--title', '正常标题'], { cwd: home });
+
+  const listRes = await spawnCli(t, ['list'], { cwd: home });
+  assert.equal(listRes.code, 0);
+  const lines = listRes.stdout.trimEnd().split('\n');
+  assert.equal(lines.length, 3, '控制字符换成空格后，行数仍是表头 + 2 行');
+  const timeStart = (line) => displayWidth(line.slice(0, line.indexOf('2026-')));
+  assert.equal(timeStart(lines[1]), timeStart(lines[2]), '对齐不受影响');
+  const dataLines = listRes.stdout.split('\n').slice(1);
+  assert.ok(dataLines.every((line) => !/[\x00-\x1f]/.test(line)), '数据行里不该再有任何控制字符');
+
+  const showRes = await spawnCli(t, ['show', '1'], { cwd: home });
+  assert.equal(showRes.code, 0);
+  assert.ok(showRes.stdout.includes('任务 #1：标 题 '), '详情标题行压平成一行');
+  assert.ok(showRes.stdout.includes('提示词：\n  第一行\n  第二行 带制表 '), '提示词逐行缩进，制表/控制字符换空格');
+});
+
+test('help 列出全部子命令与每个命令的每个选项', async (t) => {
+  const res = await spawnCli(t, ['help']);
   assert.equal(res.code, 0);
+  assert.equal(res.stderr, '');
   for (const name of ['add', 'list', 'show', 'cancel', 'retry', 'config', 'help']) {
     assert.ok(res.stdout.includes(name), `帮助应提到 ${name}`);
   }
-  for (const opt of ['--repo', '--prompt-file', '--difficulty', '--max-attempts', '--status', '--json']) {
+  // add 的全部选项
+  for (const opt of ['--repo', '--prompt', '--prompt-file', '--title', '--difficulty',
+    '--priority', '--test', '--allow-peak', '--max-attempts', '--json']) {
     assert.ok(res.stdout.includes(opt), `帮助应提到 ${opt}`);
   }
+  // list / show / config 的选项
+  for (const opt of ['--status', '--limit', '--json']) {
+    assert.ok(res.stdout.includes(opt), `帮助应提到 ${opt}`);
+  }
+  // 每个命令都有自己的一条用法
+  for (const name of ['add', 'list', 'show', 'cancel', 'retry', 'config']) {
+    assert.ok(res.stdout.includes(`night-shift ${name}`), `帮助应含 ${name} 的用法行`);
+  }
+});
+
+test('<命令> --help / -h：退出 0，打印该命令自己的用法（含全部选项）', async (t) => {
+  const results = await Promise.all([
+    spawnCli(t, ['add', '--help']),
+    spawnCli(t, ['add', '-h']),
+    spawnCli(t, ['list', '--help']),
+    spawnCli(t, ['show', '--help']),
+    spawnCli(t, ['cancel', '--help']),
+    spawnCli(t, ['retry', '--help']),
+    spawnCli(t, ['config', '--help']),
+  ]);
+  for (const res of results) {
+    assert.equal(res.code, 0, res.stderr);
+    assert.equal(res.stderr, '');
+    assert.ok(res.stdout.startsWith('用法：night-shift '), res.stdout);
+    assert.ok(res.stdout.trimEnd().length > 0);
+  }
+  assert.ok(results[0].stdout.includes('--allow-peak'));
+  assert.ok(results[0].stdout.includes('--prompt-file'));
+  assert.ok(results[2].stdout.includes('--status'));
+  assert.ok(results[2].stdout.includes('--limit'));
 });
 
 test('COMMANDS 表包含 #5 的全部子命令（供后续 issue 在进程内扩展）', () => {
@@ -436,7 +616,7 @@ test('验收: Node 24 下各命令 stderr 没有 SQLite 实验性警告', async 
 
 const NODE22 = '/tmp/node-v22.13.0-linux-x64/bin/node';
 
-test('Node 22：add/list 的 stderr 完全干净（SQLite 警告被过滤）', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, async (t) => {
+test('验收: Node 22 只屏蔽 SQLite 警告——add/list 的 stderr 完全干净', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, async (t) => {
   const home = makeTempHome(t);
   const addRes = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', '修复登录 bug'], { cwd: home, exec: NODE22 });
   assert.equal(addRes.code, 0, addRes.stderr);
@@ -447,7 +627,7 @@ test('Node 22：add/list 的 stderr 完全干净（SQLite 警告被过滤）', {
   assert.equal(listRes.stderr, '', `Node 22 下 stderr 应为空：${listRes.stderr}`);
 });
 
-test('Node 22：过滤只吞 SQLite 那条，其他警告照常输出', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, () => {
+test('验收: Node 22 下其他警告照常输出（过滤只吞 SQLite 那一条）', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, () => {
   // 子进程脚本：装过滤 → 动态加载 db.js 并真的打开库（触发 SQLite 警告，应被吞）→
   // 发两条自定义警告（一条同为 ExperimentalWarning），它们必须照常打印。
   const script = `

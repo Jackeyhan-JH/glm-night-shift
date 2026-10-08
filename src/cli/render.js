@@ -1,5 +1,5 @@
 // list / show 的人类可读输出：对齐表格与字段列表。列宽按「显示宽度」算（中文两列，
-// 见 src/format.js），时间转本地时区到分钟，标题超宽截断。纯拼装，不含命令逻辑；
+// 见 src/format.js），时间转本地时区到分钟，标题/仓库超宽截断。纯拼装，不含命令逻辑；
 // 单测（含对齐断言）见 test/format.test.js。
 import {
   displayWidth,
@@ -11,10 +11,25 @@ import {
 
 /** list 标题列的最大显示列数，超过则截断加 …。 */
 export const TITLE_MAX_COLUMNS = 40;
+/** list 仓库列的最大显示列数（owner/name 可以很长；完整值看 show）。 */
+export const REPO_MAX_COLUMNS = 40;
 
-/** 换行/制表符换成空格，避免用户输入破坏表格对齐。 */
+/**
+ * 控制字符（换行、制表、退格、ANSI 转义……C0/C1 全部，即 Unicode Cc 类）换成一个
+ * 空格：单元格里只要混进这些，表格行就会断开、错位或在终端上乱写，一概压平成一行。
+ */
 function singleLine(text) {
-  return String(text).replace(/[\r\n\t]/g, ' ');
+  return String(text).replace(/\p{Cc}/gu, ' ');
+}
+
+/**
+ * 提示词展示前的清理：CR / CRLF 归一成 LF（多行结构保留、逐行缩进），其余控制字符
+ * （含 ANSI 转义）换成空格——既保住多行提示词的可读性，又不让控制字符乱写终端。
+ */
+function cleanPrompt(text) {
+  return String(text)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\p{Cc}/gu, (ch) => (ch === '\n' ? ch : ' '));
 }
 
 /**
@@ -28,7 +43,7 @@ export function renderTasksTable(tasks) {
     t.status,
     t.difficulty,
     String(t.priority),
-    t.repo,
+    truncateDisplay(singleLine(t.repo), REPO_MAX_COLUMNS),
     truncateDisplay(singleLine(t.title), TITLE_MAX_COLUMNS),
     formatLocalMinute(t.createdAt),
   ]);
@@ -62,7 +77,7 @@ export function renderTaskDetail(task, runs) {
     ...fields.map(([label, value]) => `${padEndDisplay(label, labelWidth)}  ${value}`),
     '',
     '提示词：',
-    ...String(task.prompt).split('\n').map((line) => `  ${line}`),
+    ...cleanPrompt(task.prompt).split('\n').map((line) => `  ${line}`),
   ];
   if (runs.length === 0) {
     lines.push('', '运行记录：无');

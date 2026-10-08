@@ -124,6 +124,11 @@ async function runMain(argv, ctx) {
   }
   const cmd = COMMANDS[command];
   if (!cmd) throw new UsageError(`未知命令：${command}`);
+  // `night-shift <命令> --help` / `-h`：打印该命令自己的用法（顶层 --help 在前面已处理）。
+  if (rest.length === 1 && (rest[0] === '--help' || rest[0] === '-h')) {
+    ctx.stdout.write(`${cmd.usage}\n`);
+    return 0;
+  }
   try {
     return await cmd.run(rest, ctx);
   } catch (err) {
@@ -163,9 +168,23 @@ async function runCli(argv, {
 
 /** 入口用：执行 CLI 并把退出码写回 process.exitCode。 */
 async function main(argv = process.argv.slice(2), options) {
+  if (!options) suppressPipeErrors(); // 真实入口才处理管道；测试传的是收集输出的 sink
   const code = await runCli(argv, options);
   if (code !== 0) process.exitCode = code;
   return code;
+}
+
+// `night-shift list | head -1` 这类用法里读者提前退出，后续 write 抛 EPIPE，Node 默认
+// 会打印堆栈崩溃——这里挂上监听把 EPIPE 静默吞掉（进程随后带着 CLI 的退出码正常结束），
+// 其他错误照常抛。只在真实入口安装；测试里 runCli 的 stdout 是普通 sink，没有 .on。
+function suppressPipeErrors() {
+  for (const stream of [process.stdout, process.stderr]) {
+    if (stream && typeof stream.on === 'function') {
+      stream.on('error', (err) => {
+        if (err?.code !== 'EPIPE') throw err;
+      });
+    }
+  }
 }
 
 // 只有本文件就是入口脚本时才自动执行（npm link 的符号链接也能正确识别），被 import 时不跑。
