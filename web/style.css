@@ -156,6 +156,11 @@ pre.log {
 
 /* —— 队列与操作页（issue #15）：状态条、标签页、任务表、新增任务表单（只增不改） —— */
 
+/* 全局兜底：作者样式一旦给元素设了 display（如下面的 .field），会按优先级压过
+   UA 样式表的 [hidden]{display:none}，hidden 属性就失效了（切模板时提示词框
+   藏不住、多出空的「模板变量」标题）。显式补 !important 恢复其语义。 */
+[hidden] { display: none !important; }
+
 /* 状态条：导航下面的一行小字 */
 .statusbar {
   color: var(--text-muted);
