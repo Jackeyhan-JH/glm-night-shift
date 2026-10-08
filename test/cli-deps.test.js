@@ -260,6 +260,8 @@ test('help 与 deps --help：列出 deps 命令与 --depends-on 选项', async (
   assert.ok(res.stdout.includes('deps'), '帮助应提到 deps 命令');
   assert.ok(res.stdout.includes('--depends-on'), '帮助应提到 --depends-on');
   assert.ok(res.stdout.includes('night-shift deps'), '帮助应含 deps 的用法行');
+  assert.ok(res.stdout.includes('容忍空格'), '帮助尾注应说明 id 列表容忍空格');
+  assert.ok(res.stdout.includes('空串表示无依赖'), '帮助尾注应说明空串 = 无依赖');
 
   const cmdHelp = await spawnCli(t, ['deps', '--help'], { cwd: home });
   assert.equal(cmdHelp.code, 0, cmdHelp.stderr);
@@ -268,4 +270,49 @@ test('help 与 deps --help：列出 deps 命令与 --depends-on 选项', async (
 
   const addHelp = await spawnCli(t, ['add', '--help'], { cwd: home });
   assert.ok(addHelp.stdout.includes('--depends-on'), 'add 的用法应含 --depends-on');
+});
+
+// ---------------------------------------------------------------- 加固（复查轮）
+
+test('复查: --depends-on 容忍空格、空串=无依赖（有意设计，帮助里有说明）；deps --set 同样容忍空格', async (t) => {
+  const home = makeTempHome(t);
+  for (const prompt of ['x', 'y', 'z']) {
+    await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', prompt], { cwd: home });
+  }
+
+  const spaced = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'w', '--depends-on', ' 1 , 2 '], { cwd: home });
+  assert.equal(spaced.code, 0, spaced.stderr);
+  assert.equal(spaced.stdout, '已加入队列：#4 w\n');
+  const task4 = JSON.parse((await spawnCli(t, ['show', '4', '--json'], { cwd: home })).stdout);
+  assert.deepEqual(task4.dependsOn, [1, 2], '空格被容忍，id 升序');
+  assert.deepEqual(task4.blockedBy, [1, 2]);
+
+  const empty = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'v', '--depends-on', ''], { cwd: home });
+  assert.equal(empty.code, 0, empty.stderr);
+  assert.equal(empty.stdout, '已加入队列：#5 v\n');
+  assert.deepEqual(JSON.parse((await spawnCli(t, ['show', '5', '--json'], { cwd: home })).stdout).dependsOn, []);
+
+  const setSpaced = await spawnCli(t, ['deps', '5', '--set', ' 3 , 1 '], { cwd: home });
+  assert.equal(setSpaced.code, 0, setSpaced.stderr);
+  assert.equal(setSpaced.stdout, '#5 依赖已更新：#1 queued，#3 queued\n');
+});
+
+test('复查: add --json 也带 dependsOn/blockedBy（升序）；deps 99 退出 1、deps abc 退出 2', async (t) => {
+  const home = makeTempHome(t);
+  for (const prompt of ['x', 'y', 'z']) {
+    await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', prompt], { cwd: home });
+  }
+  const res = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', 'w', '--depends-on', '3,1,2', '--json'], { cwd: home });
+  assert.equal(res.code, 0, res.stderr);
+  const task = JSON.parse(res.stdout);
+  assert.deepEqual(task.dependsOn, [1, 2, 3], '倒序传入也升序返回');
+  assert.deepEqual(task.blockedBy, [1, 2, 3]);
+
+  const missing = await spawnCli(t, ['deps', '99'], { cwd: home });
+  assert.equal(missing.code, 1);
+  assert.ok(missing.stderr.includes('任务 99 不存在'), missing.stderr);
+  const badId = await spawnCli(t, ['deps', 'abc'], { cwd: home });
+  assert.equal(badId.code, 2);
+  assert.ok(badId.stderr.includes('<id> 必须是正整数'), badId.stderr);
+  assert.ok(badId.stderr.includes('用法：night-shift deps'), badId.stderr);
 });

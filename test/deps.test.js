@@ -490,3 +490,178 @@ test('两连接：A 连接把上游失败，B 连接看到的下游级联结果�
   assert.equal(seen.status, 'failed');
   assert.equal(seen.lastError, `依赖 #${a.id} 失败`, '级联与状态变更一起提交，另一连接不会看到半个');
 });
+
+// ---------------------------------------------------------------- 加固（复查轮）
+
+/**
+ * 直插 n 个任务与 n-1 条依赖边（t_i 依赖 t_{i-1}，同 created_at），绕开 API 的逐条
+ * 校验，专供长链的栈深 / 性能测试。返回链里最后一个任务的 id。
+ */
+function buildChain(db, n) {
+  const now = new Date().toISOString();
+  db.exec('BEGIN');
+  try {
+    const insertTask = db.prepare(`
+      INSERT INTO tasks (repo, title, prompt, priority, max_attempts, created_at, updated_at)
+      VALUES ('a/b', '链', 'p', 0, 2, ?, ?)
+    `);
+    const insertDep = db.prepare('INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)');
+    let prev = null;
+    for (let i = 1; i <= n; i++) {
+      insertTask.run(now, now);
+      if (prev !== null) insertDep.run(i, prev);
+      prev = i;
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+  return n;
+}
+
+test('复查: 2 万级长链的环检测不爆栈（迭代 DFS），路径仍完整列出首尾', (t) => {
+  const db = openMemory(t);
+  const N = buildChain(db, 20000); // t1 ← t2 ← … ← t20000
+  // 把链闭合成环（t1 依赖 t20000）：期望路径 #1 → #20000 → #19999 → … → #2 → #1
+  assert.throws(
+    () => setDependencies(db, 1, [N]),
+    (err) => err instanceof ValidationError && err.field === 'dependsOn'
+      && err.message.includes(`会形成依赖环：#1 → #${N} → #${N - 1} →`)
+      && err.message.endsWith('#2 → #1')
+      && err.message.match(/#/g).length === N + 1,
+    `递归实现会先爆栈；迭代实现应报出含全部 ${N + 1} 个节点的环`,
+  );
+  assert.equal(getTask(db, 1).dependsOn.length, 0, '被拒后 t1 仍是链头、没有新边');
+});
+
+test('复查: 2 万级长链的级联失败：同一事务全部标失败，两端 last_error 正确，秒级完成', (t) => {
+  const db = openMemory(t);
+  const N = buildChain(db, 20000);
+  assert.equal(claimNextTask(db).id, 1, '同 created_at → 按 id 升序先领链头');
+  const startedAt = performance.now();
+  finishTask(db, 1, { status: 'failed', lastError: 'boom' });
+  const elapsed = performance.now() - startedAt;
+  t.diagnostic(`2 万长链级联耗时 ${Math.round(elapsed)}ms`);
+
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE status = 'failed'").get().n, N);
+  assert.equal(getTask(db, 2).lastError, '依赖 #1 失败', '直接依赖者点名链头');
+  assert.equal(getTask(db, N).lastError, `依赖 #${N - 1} 失败`, '链尾点名其直接依赖');
+  assert.ok(getTask(db, N).finishedAt, '级联也写 finished_at');
+  assert.equal(claimNextTask(db), null, '没有漏网的排队任务');
+  assert.ok(elapsed < 5000, `级联应秒级完成，实际 ${Math.round(elapsed)}ms`);
+});
+
+test('复查: 菱形 C 依赖 A、B——A 失败后 B 再取消，C 保留第一次的错误不被二次改写；D 的 blocker 是直接依赖 C', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID, prompt: 'A' }); // 1
+  const b = createTask(db, { ...VALID, prompt: 'B' }); // 2
+  const c = createTask(db, { ...VALID, prompt: 'C', dependsOn: [a.id, b.id] }); // 3
+  const d = createTask(db, { ...VALID, prompt: 'D', dependsOn: [c.id] }); // 4
+
+  failTask(db, a.id); // C、D 级联失败；B 不依赖 A，仍在队列
+  assert.equal(getTask(db, b.id).status, 'queued');
+  assert.equal(getTask(db, c.id).lastError, `依赖 #${a.id} 失败`, 'C 的 blocker 是直接依赖 A');
+  assert.equal(getTask(db, d.id).lastError, `依赖 #${c.id} 失败`, 'D 的 blocker 是直接依赖 C，不是间接的 A');
+
+  cancelTask(db, b.id); // 第二次触发：C 已 failed（非 queued），不能也不需要再动
+  assert.equal(getTask(db, c.id).status, 'failed');
+  assert.equal(getTask(db, c.id).lastError, `依赖 #${a.id} 失败`, '保留第一次的错误');
+  assert.equal(getTask(db, d.id).lastError, `依赖 #${c.id} 失败`);
+});
+
+test('复查: 级联不碰 running / succeeded 的下游（直插依赖边构造领取门外的状态）', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID, prompt: 'A' });
+  // running 下游：API 只许给 queued 任务设依赖，这里先领走再直插边，模拟历史数据 / 并发残留
+  const runner = createTask(db, { ...VALID, prompt: 'R', priority: 5 });
+  assert.equal(claimNextTask(db).id, runner.id);
+  db.prepare('INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)').run(runner.id, a.id);
+  // succeeded 下游：跑完再直插边
+  const done = createTask(db, { ...VALID, prompt: 'D', priority: 4 });
+  assert.equal(claimNextTask(db).id, done.id);
+  finishTask(db, done.id, { status: 'succeeded' });
+  db.prepare('INSERT INTO task_deps (task_id, depends_on) VALUES (?, ?)').run(done.id, a.id);
+
+  claimNextTask(db); // 领走 A（此时只剩它排队）
+  finishTask(db, a.id, { status: 'failed', lastError: 'boom' });
+  assert.equal(getTask(db, runner.id).status, 'running', 'running 下游不被级联改写');
+  assert.equal(getTask(db, runner.id).lastError, null);
+  assert.equal(getTask(db, done.id).status, 'succeeded', 'succeeded 下游不被级联改写');
+  assert.equal(getTask(db, done.id).lastError, null);
+});
+
+test('复查: 当前依赖里有已失败的任务（直插状态构造）：替换为合法依赖 / 清空都可用，清空后可领取', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID, prompt: 'A' });
+  const b = createTask(db, { ...VALID, prompt: 'B' });
+  const target = createTask(db, { ...VALID, prompt: 'T', dependsOn: [a.id, b.id], priority: 5 });
+  db.prepare("UPDATE tasks SET status = 'failed', last_error = 'x' WHERE id = ?").run(a.id);
+
+  const stale = getTask(db, target.id);
+  assert.equal(stale.status, 'queued', '直插不触发级联，目标仍在队列');
+  assert.deepEqual(stale.blockedBy, [a.id, b.id], '失败依赖同样算未满足');
+
+  const replaced = setDependencies(db, target.id, [b.id]);
+  assert.deepEqual(replaced.dependsOn, [b.id], '可以去掉已失败的依赖');
+  assert.deepEqual(getTask(db, target.id).blockedBy, [b.id]);
+
+  const cleared = setDependencies(db, target.id, []);
+  assert.deepEqual(cleared.dependsOn, []);
+  assert.deepEqual(cleared.blockedBy, []);
+  assert.equal(claimNextTask(db).id, target.id, '清掉失败依赖后立即可领取');
+});
+
+test('复查: setDependencies 对非 queued 目标逐字报 InvalidTransitionError（running/succeeded/failed/canceled）', (t) => {
+  const db = openMemory(t);
+  // 用优先级控制领取顺序，一个测试里造齐四种非 queued 状态
+  const running = createTask(db, { ...VALID, prompt: 'run', priority: 40 });
+  claimNextTask(db);
+  const succeeded = createTask(db, { ...VALID, prompt: 'ok', priority: 30 });
+  claimNextTask(db);
+  finishTask(db, succeeded.id, { status: 'succeeded' });
+  const failed = createTask(db, { ...VALID, prompt: 'bad', priority: 20 });
+  claimNextTask(db);
+  finishTask(db, failed.id, { status: 'failed', lastError: 'x' });
+  const canceled = createTask(db, { ...VALID, prompt: 'cxl', priority: 10 });
+  cancelTask(db, canceled.id);
+
+  const cases = [
+    [running.id, 'running'],
+    [succeeded.id, 'succeeded'],
+    [failed.id, 'failed'],
+    [canceled.id, 'canceled'],
+  ];
+  for (const [id, from] of cases) {
+    assert.throws(
+      () => setDependencies(db, id, []),
+      (err) => err instanceof InvalidTransitionError && err.from === from
+        && err.message === `任务状态不能从 ${from} 转为 queued`,
+      `${from} 状态的目标应被逐字拒绝`,
+    );
+  }
+});
+
+test('复查: dependsOn/blockedBy 在各出口都升序；上游 succeeded 后 blockedBy 即时更新', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID, prompt: 'A' });
+  const b = createTask(db, { ...VALID, prompt: 'B' });
+  const c = createTask(db, { ...VALID, prompt: 'C' });
+  const target = createTask(db, { ...VALID, prompt: 'T', dependsOn: [c.id, a.id, b.id] }); // 倒序传入
+  assert.deepEqual(target.dependsOn, [a.id, b.id, c.id], 'createTask 返回升序');
+  assert.deepEqual(target.blockedBy, [a.id, b.id, c.id]);
+  assert.deepEqual(getTask(db, target.id).blockedBy, [a.id, b.id, c.id]);
+
+  succeedTask(db, a.id);
+  assert.deepEqual(getTask(db, target.id).blockedBy, [b.id, c.id], 'A 成功后即时移出 blockedBy');
+  assert.deepEqual(getTask(db, target.id).dependsOn, [a.id, b.id, c.id], 'dependsOn 不随状态变');
+  const [listed] = listTasks(db, { status: 'queued' }).filter((task) => task.id === target.id);
+  assert.deepEqual(listed.blockedBy, [b.id, c.id], 'listTasks 同步');
+
+  succeedTask(db, b.id);
+  succeedTask(db, c.id);
+  const claimed = claimNextTask(db);
+  assert.equal(claimed.id, target.id);
+  assert.deepEqual(claimed.dependsOn, [a.id, b.id, c.id], 'claimNextTask 返回值也带');
+  assert.deepEqual(claimed.blockedBy, [], '依赖全部成功后不再被挡');
+});

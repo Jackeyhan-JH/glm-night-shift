@@ -703,35 +703,47 @@ function validateDependencyTargets(db, self, deps) {
 }
 
 /**
- * 从每个新依赖出发沿「X 依赖 Y」的已有边做 DFS：能走回 taskId 就成环。
+ * 从每个新依赖出发沿「X 依赖 Y」的已有边找环：能走回 taskId 就成环。
  * 返回环路径（首尾都是 taskId，如 [1, 2, 1]），无环返回 null。
  * 只需检查穿过 taskId 的环——不改别人的边，别的环不会被创建。
+ *
+ * 迭代 DFS（显式栈）而不是递归：几万级的长依赖链（每个任务依赖前一个）造得出来，
+ * 递归会撑爆 JS 调用栈（SQLite 侧的级联 CTE 是队列实现，不受此限）。parent 记录
+ * 「从谁走到这个节点」，走到 taskId 后沿 parent 链回溯即得完整环路径。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} taskId 要改依赖的任务
  * @param {number[]} deps 归一化后的新依赖 id
  * @returns {?number[]}
  */
 function findDependencyCycle(db, taskId, deps) {
-  const selectDeps = db.prepare('SELECT depends_on FROM task_deps WHERE task_id = ?');
-  const path = [taskId];
-  const seen = new Set();
-  let cycle = null;
-  const visit = (node) => {
-    if (node === taskId) {
-      cycle = [...path, taskId];
-      return;
-    }
-    if (seen.has(node)) return;
-    seen.add(node);
-    path.push(node);
-    for (const row of selectDeps.all(node)) visit(row.depends_on);
-    path.pop();
-  };
+  if (deps.length === 0) return null;
+  const selectDeps = db.prepare(
+    'SELECT depends_on FROM task_deps WHERE task_id = ? ORDER BY depends_on ASC',
+  );
+  const parent = new Map(); // 节点 → 从哪个节点走到它；种子依赖的父是 taskId
+  const stack = [];
   for (const dep of deps) {
-    visit(dep);
-    if (cycle !== null) break;
+    parent.set(dep, taskId);
+    stack.push(dep);
   }
-  return cycle;
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node === taskId) {
+      // 沿 parent 链取回 taskId ← … ← 种子，反转就是正向路径，首尾都是 taskId
+      const back = [];
+      for (let cur = parent.get(taskId); cur !== taskId; cur = parent.get(cur)) {
+        back.push(cur);
+      }
+      return [taskId, ...back.reverse(), taskId];
+    }
+    for (const row of selectDeps.all(node)) {
+      if (!parent.has(row.depends_on)) {
+        parent.set(row.depends_on, node);
+        stack.push(row.depends_on);
+      }
+    }
+  }
+  return null;
 }
 
 /** 写入依赖边（调用方已校验）。 */
@@ -788,10 +800,12 @@ function hydrateTasks(db, rows) {
  * 由 failureText 决定），并写 finished_at / updated_at。
  *
  * 单条语句完成：递归 CTE 找出（task_id, blocker）对——blocker 是该任务直接依赖的、
- * 正被这次变更干掉的依赖（对间接依赖者来说是级联失败的那个直接依赖）；同一任务有
- * 多个 blocker 时取最小 id，报错确定。只碰 queued 任务（领取门已保证运行中的下游
- * 依赖都已 succeeded，正常流程到不了这里，守住即可）。必须与触发它的 finishTask /
- * cancelTask 在同一事务（保存点）里调用。
+ * 正被这次变更干掉的依赖（对间接依赖者来说是级联失败的那个直接依赖）。同一任务有
+ * 多个 blocker 时取 MIN，报错确定。注意不能用 SET 里的相关子查询取 blocker：递归
+ * CTE 物化后没有索引，每行更新都全扫一遍，几万级长链是 O(n²)（实测 2 万链约 13 秒）；
+ * UPDATE…FROM 先按 task_id GROUP BY 成小表再等值连接，整体 O(n)（实测毫秒级）。
+ * 只碰 queued 任务（领取门已保证运行中的下游依赖都已 succeeded，正常流程到不了
+ * 这里，守住即可）。必须与触发它的 finishTask / cancelTask 在同一事务（保存点）里调用。
  */
 function cascadeFailDependents(db, triggerId, now, failureText) {
   db.prepare(`
@@ -808,13 +822,11 @@ function cascadeFailDependents(db, triggerId, now, failureText) {
     )
     UPDATE tasks
     SET status = 'failed',
-        last_error = '依赖 #' || (
-          SELECT x.blocker FROM dependents x WHERE x.task_id = tasks.id ORDER BY x.blocker LIMIT 1
-        ) || ?,
+        last_error = '依赖 #' || m.blocker || ?,
         finished_at = ?,
         updated_at = ?
-    WHERE status = 'queued'
-      AND id IN (SELECT task_id FROM dependents)
+    FROM (SELECT task_id, MIN(blocker) AS blocker FROM dependents GROUP BY task_id) AS m
+    WHERE tasks.id = m.task_id AND tasks.status = 'queued'
   `).run(triggerId, ` ${failureText}`, now, now);
 }
 

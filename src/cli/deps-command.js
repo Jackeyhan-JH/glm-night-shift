@@ -48,9 +48,12 @@ function parseIdPositional(ctx, positionals, usage) {
 }
 
 /**
- * 解析 --depends-on / --set 的值：逗号分隔的任务 id，容忍空格（"1, 2"），空串 = 无依赖。
- * 任何一段不是正整数（abc、1,,x、0、-1）都是该命令的用法错误（退出码 2）；
- * id 是否存在 / 能不能依赖（退出码 1）留给存储层判断。
+ * 解析 --depends-on / --set 的值。两个**有意为之**的宽容（usage 与帮助里都写明了）：
+ * - 容忍空格："1, 2"、" 1 ,2 " 都合法——每段 trim 后再校验（"abc"、"1,,x"、"0"、
+ *   "-1"、小数、超长数字串仍是用法错误，退出码 2）。
+ * - 空串 = 无依赖："--depends-on ''" 等于不给该选项的依赖效果，"--set ''" 清空依赖。
+ *   它与「没给选项」区分开（deps 不带 --set 是只读展示）。
+ * id 是否存在 / 能不能依赖（不存在、已失败、成环）是存储层的事，退出码 1。
  * @returns {number[]} id 数组（保留原顺序，去重由存储层负责）
  */
 export function parseIdListOption(ctx, raw, label, usage) {
@@ -79,7 +82,8 @@ export const depsCommand = {
   summary: '查看或修改任务依赖',
   usage: [
     '用法：night-shift deps <id> [--set <id,id,…>]',
-    `${USAGE_CONT}--set "" 清空依赖；不加 --set 只显示依赖和各自状态`,
+    `${USAGE_CONT}--set 的 id 逗号分隔、容忍空格；--set "" 清空依赖；`,
+    `${USAGE_CONT}不加 --set 只显示依赖和各自状态`,
   ].join('\n'),
   async run(args, ctx) {
     const { values, positionals } = parseArgs({
