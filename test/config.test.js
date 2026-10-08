@@ -9,6 +9,7 @@ import { makeTempHome } from './helpers.js';
 const EXPECTED_DEFAULTS = {
   concurrency: 1,
   timeoutMinutes: 60,
+  killGraceSeconds: 10,
   maxAttempts: 2,
   pollSeconds: 30,
   port: 7788,

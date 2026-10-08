@@ -6,7 +6,7 @@ import path from 'node:path';
 import { openDb, MIGRATIONS } from '../src/db.js';
 import {
   createTask, getTask, listTasks, claimNextTask, finishTask, cancelTask, retryTask,
-  recoverStaleRunning, startRun, finishRun, listRuns,
+  recoverStaleRunning, startRun, setRunLogPath, finishRun, listRuns,
   ValidationError, NotFoundError, InvalidTransitionError,
 } from '../src/tasks.js';
 import { makeTempHome } from './helpers.js';
@@ -507,6 +507,24 @@ test('startRun 参数校验：缺字段 / 类型不对报 ValidationError，任�
       `${field} 缺失或非法应报 ValidationError`,
     );
   }
+  // #7：logPath 允许空串（runTask 先 startRun 拿 id，再 setRunLogPath 补真实路径）
+  assert.equal(startRun(db, { ...base, logPath: '' }).logPath, '');
+});
+
+test('setRunLogPath：更新 run 的日志路径；id / logPath 非法或 run 不存在时报错', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  claimNextTask(db);
+  const run = startRun(db, { taskId: task.id, attempt: 1, model: 'm', effort: 'low', peak: false, logPath: '' });
+  const updated = setRunLogPath(db, run.id, ` /home/logs/task-${task.id}/run-${run.id}.log `);
+  assert.equal(updated.logPath, `/home/logs/task-${task.id}/run-${run.id}.log`, 'trim 后入库');
+  assert.equal(updated.status, 'running', '只改路径，不动其他字段');
+
+  assert.throws(() => setRunLogPath(db, run.id, ''), (err) => err.field === 'logPath');
+  assert.throws(() => setRunLogPath(db, run.id, '  '), (err) => err.field === 'logPath');
+  assert.throws(() => setRunLogPath(db, run.id, 42), (err) => err.field === 'logPath');
+  assert.throws(() => setRunLogPath(db, 0, '/l'), (err) => err.field === 'runId');
+  assert.throws(() => setRunLogPath(db, 999, '/l'), (err) => err instanceof NotFoundError && err.id === 999);
 });
 
 test('listRuns：taskId / since / limit 过滤，started_at DESC → id DESC，since 接受 Date 或 ISO 串', (t) => {

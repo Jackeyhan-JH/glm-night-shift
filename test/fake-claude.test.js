@@ -79,7 +79,11 @@ test('验收：-p hi --model … --output-format stream-json --verbose', async (
   assert.equal(fs.readFileSync(path.join(res.dir, 'NIGHT_SHIFT_FAKE.md'), 'utf8'), 'hi\n');
 
   const logged = fs.readFileSync(argsLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.deepEqual(logged, [{
+  assert.equal(logged.length, 1);
+  const [entry] = logged;
+  assert.ok(Number.isInteger(entry.pid) && entry.pid > 0, 'args log 应记录本次调用的 pid');
+  delete entry.pid; // pid 每次不同，单独断言类型后剔除再比对整体形状
+  assert.deepEqual([entry], [{
     argv: ['-p', 'hi', '--model', 'glm-5.3', '--output-format', 'stream-json', '--verbose'],
     cwd: res.dir,
     env: { MAX_THINKING_TOKENS: '8000' },
@@ -153,6 +157,90 @@ test('slow：FAKE_CLAUDE_DELAY_MS=600，约 0.6 秒后成功退出，期间输�
   assert.equal(result.type, 'result');
   assert.equal(result.is_error, false);
   assert.equal(fs.readFileSync(path.join(res.dir, 'NIGHT_SHIFT_FAKE.md'), 'utf8'), 'slow\n');
+});
+
+test('rate-limit：只有 init 行，stderr 是 429 rate limit，无 result 行，退出 1', async (t) => {
+  const res = await runFakeClaude(t, ['-p', 'hi'], { env: { FAKE_CLAUDE_SCENARIO: 'rate-limit' } });
+  assert.equal(res.code, 1);
+  assert.equal(stdoutLines(res).length, 1, '只有 init 行');
+  assert.ok(res.stderr.includes('429'), 'stderr 提到 429');
+  assert.ok(/rate[ _-]?limit/i.test(res.stderr), 'stderr 提到 rate limit');
+  assert.equal(fs.existsSync(path.join(res.dir, 'NIGHT_SHIFT_FAKE.md')), false);
+});
+
+test('truncated：init + 2 行 assistant 后退出 1，没有 result 行，stderr 不含限流字样', async (t) => {
+  const res = await runFakeClaude(t, ['-p', 'hi'], { env: { FAKE_CLAUDE_SCENARIO: 'truncated' } });
+  assert.equal(res.code, 1);
+  const lines = stdoutLines(res);
+  assert.equal(lines.filter((line) => line.type === 'assistant').length, 2);
+  assert.equal(lines.some((line) => line.type === 'result'), false, '没有 result 行');
+  assert.ok(!/\b429\b|rate[ _-]?limit|too many requests/i.test(res.stderr), 'stderr 不能带限流字样');
+  assert.equal(fs.existsSync(path.join(res.dir, 'NIGHT_SHIFT_FAKE.md')), false);
+});
+
+test('stubborn：SIGTERM 后 1 秒仍存活，只有 SIGKILL 能结束', async (t) => {
+  const dir = makeTempHome(t);
+  const child = spawn(process.execPath, [fixturePath('fake-claude.mjs'), '-p', 'x'], {
+    cwd: dir,
+    env: fakeEnv({ FAKE_CLAUDE_SCENARIO: 'stubborn' }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const firstLine = withTimeout(new Promise((resolve, reject) => {
+    child.stdout.setEncoding('utf8');
+    child.stdout.once('data', resolve);
+    child.once('error', reject);
+  }), 5000, '没有等到 init 行');
+  JSON.parse((await firstLine).toString().split('\n')[0]);
+
+  const closed = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
+  child.kill('SIGTERM');
+  await sleep(1000);
+  assert.equal(child.exitCode, null, 'SIGTERM 后 1 秒仍应存活');
+  child.kill('SIGKILL');
+  const outcome = await withTimeout(closed, 2000, 'SIGKILL 后未退出');
+  assert.equal(outcome.signal, 'SIGKILL');
+});
+
+test('验收: FAKE_CLAUDE_SEQUENCE=fail,success 且 FAKE_CLAUDE_STATE_FILE=<f>：连续调用 3 次，退出码依次为 1、0、0', async (t) => {
+  const dir = makeTempHome(t);
+  const stateFile = path.join(dir, 'state.txt');
+  const env = { FAKE_CLAUDE_SEQUENCE: 'fail,success', FAKE_CLAUDE_STATE_FILE: stateFile };
+  const codes = [];
+  for (let i = 0; i < 3; i++) {
+    const res = await runFakeClaude(t, ['-p', 'hi'], { env, cwd: dir });
+    codes.push(res.code);
+  }
+  assert.deepEqual(codes, [1, 0, 0]);
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), '3', '计数 = 调用次数');
+});
+
+test('FAKE_CLAUDE_SEQUENCE 优先于 FAKE_CLAUDE_SCENARIO；缺 STATE_FILE 或有未知场景时退出 2', async (t) => {
+  const dir = makeTempHome(t);
+  const stateFile = path.join(dir, 'state.txt');
+  // SCENARIO=success 会被序列覆盖：第 1 次是 fail（退出 1）
+  const res = await runFakeClaude(t, ['-p', 'hi'], {
+    env: {
+      FAKE_CLAUDE_SCENARIO: 'success',
+      FAKE_CLAUDE_SEQUENCE: 'fail,success',
+      FAKE_CLAUDE_STATE_FILE: stateFile,
+    },
+    cwd: dir,
+  });
+  assert.equal(res.code, 1);
+
+  const noState = await runFakeClaude(t, ['-p', 'hi'], {
+    env: { FAKE_CLAUDE_SEQUENCE: 'success' },
+    cwd: dir,
+  });
+  assert.equal(noState.code, 2);
+  assert.ok(noState.stderr.includes('FAKE_CLAUDE_STATE_FILE'));
+
+  const bogus = await runFakeClaude(t, ['-p', 'hi'], {
+    env: { FAKE_CLAUDE_SEQUENCE: 'wat', FAKE_CLAUDE_STATE_FILE: stateFile },
+    cwd: dir,
+  });
+  assert.equal(bogus.code, 2);
+  assert.ok(bogus.stderr.includes('wat'));
 });
 
 test('noop：输出与 success 相同但不写任何文件', async (t) => {
