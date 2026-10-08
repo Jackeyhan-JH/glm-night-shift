@@ -1,14 +1,31 @@
 #!/usr/bin/env node
-// night-shift 命令行入口。目前只有 --version 和 help；后续 issue 在 COMMANDS 表里加子命令。
+// night-shift 命令行入口。子命令（issue #5）：add / list / show / cancel / retry / config；
+// start / peak / logs / serve 等命令留给后续 issue 在 COMMANDS 表里继续加。
 // 子命令签名：run(args, ctx)，可以返回数字退出码（或 Promise<number>）；
 // 用法错误抛 ctx.UsageError（可带该命令的 usage），或直接让 util.parseArgs 抛
-// （ERR_PARSE_ARGS_* 会被映射成该命令的用法错误，退出码 2）。
+// （ERR_PARSE_ARGS_* 会被映射成该命令的用法错误，退出码 2）；运行时错误（校验失败、
+// 任务不存在、非法状态转换）→ 中文原因到 stderr，退出码 1。
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+// 顺序关键：先静态引入警告模块，装好过滤再（间接）碰 node:sqlite——src/cli/* 只动态
+// import src/db.js，本身不加载 sqlite，所以这里的静态引入是安全的（见 src/warnings.js）。
+import { installSqliteWarningFilter } from '../src/warnings.js';
+import {
+  addCommand,
+  cancelCommand,
+  listCommand,
+  retryCommand,
+  showCommand,
+} from '../src/cli/task-commands.js';
+import { configCommand } from '../src/cli/config-command.js';
 
 // 通过 import.meta.url 相对路径读 package.json，任意 cwd / npm link 下都能找到。
 const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+// 必须在 node:sqlite 第一次加载之前执行（它模块求值时就发警告并捕获当时的
+// process.emitWarning 引用；Node 24 无此警告，本调用是无害的空操作）。
+installSqliteWarningFilter();
 
 /** 用法错误：中文短信息 +（可选）该命令自己的用法，退出码 2。绝不打印堆栈。 */
 class UsageError extends Error {
@@ -21,6 +38,12 @@ class UsageError extends Error {
 
 // 子命令表：后续 issue 只需在这里加条目（summary 进 help，run(args, ctx) 里自己用 parseArgs）。
 const COMMANDS = {
+  add: addCommand,
+  list: listCommand,
+  show: showCommand,
+  cancel: cancelCommand,
+  retry: retryCommand,
+  config: configCommand,
   help: {
     summary: '显示帮助',
     usage: 'night-shift help',
@@ -35,6 +58,10 @@ const TOP_OPTIONS = new Set(['--version', '-v', '--help', '-h']);
 
 function usageText() {
   const commandLines = Object.entries(COMMANDS).map(([name, cmd]) => `  ${name.padEnd(10)}${cmd.summary}`);
+  // 各命令的 usage 单一来源：帮助里原样列出（help 自身显而易见，不重复）。
+  const details = Object.entries(COMMANDS)
+    .filter(([name]) => name !== 'help')
+    .flatMap(([, cmd]) => cmd.usage.split('\n').map((line) => `  ${line}`));
   return [
     'GLM 夜班：把编码任务排进队列，在 GLM 非高峰时段交给 Claude Code 自动完成并开 PR',
     '',
@@ -45,7 +72,14 @@ function usageText() {
     '  --version  显示版本号（-v）',
     '  --help     显示本帮助（-h）',
     '',
-    '更多命令（add/list/show/cancel/retry/config、调度器与日志、网页看板）将在后续版本加入。',
+    '命令详解：',
+    ...details,
+    '',
+    '--prompt-file 的文件内容原样作为提示词（只去掉末尾一个换行符）；--max-attempts 缺省',
+    '取配置的 maxAttempts；list / show 的时间按本地时区显示到分钟。数据目录：',
+    '$NIGHT_SHIFT_HOME（默认 ~/.glm-night-shift）。',
+    '',
+    'start / peak / logs / serve（调度器、看板）等命令将在后续版本加入。',
     '',
   ].join('\n');
 }
