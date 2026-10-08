@@ -220,7 +220,7 @@ test('验收: autoFollowReviews=true 非高峰：拨过 30 分钟（followPollMi
   assert.equal(ghViewCalls(ctx.ghLog), 1, '只调了一次 gh pr view');
   assert.deepEqual(
     readJsonl(ctx.ghLog).filter((argv) => argv[0] === 'pr' && argv[1] === 'view'),
-    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName']],
+    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName,state,mergeable']],
   );
 
   // 再拨 10 分钟（间隔未满）：不再调 gh（证明的是间隔，不只是 source 去重），也没有第二条
