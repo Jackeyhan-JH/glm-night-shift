@@ -510,6 +510,38 @@ export function createPage(options = {}) {
       fields.appendChild(dt);
       fields.appendChild(dd);
     }
+    // 来源 / 指定分支 / 还在等 / 暂不开始（#54）：跟进任务的上下文。没有数据的行
+    // 整行不画（也不画成 -）；来自任务的文字一律 textContent / setAttribute。
+    if (typeof task.source === 'string' && task.source !== '') {
+      addText('来源', task.source); // 自由字符串，不解析、不做链接
+    }
+    if (typeof task.gitRef === 'string' && task.gitRef !== '') {
+      addText('指定分支', task.gitRef); // 跟进时要沿用的分支，与上面的「分支」不是同一字段
+    }
+    if (Array.isArray(task.blockedBy) && task.blockedBy.length > 0) {
+      const dt = doc.createElement('dt');
+      dt.textContent = '还在等';
+      const dd = doc.createElement('dd');
+      dd.className = 'dep-links';
+      for (const depId of task.blockedBy) {
+        if (Number.isInteger(depId) && depId >= 1) {
+          const link = doc.createElement('a');
+          link.setAttribute('href', `/task.html?id=${depId}`);
+          link.textContent = `#${depId}`;
+          dd.appendChild(link);
+        } else {
+          // 非正整数（字符串 / 0 / 负数 / 小数）：只做文本，绝不拼进 href（"3" 不算 3）
+          const span = doc.createElement('span');
+          span.textContent = String(depId);
+          dd.appendChild(span);
+        }
+      }
+      fields.appendChild(dt);
+      fields.appendChild(dd);
+    }
+    if (task.notBefore !== null && task.notBefore !== undefined && task.notBefore !== '') {
+      addText('暂不开始', fmtTime(task.notBefore));
+    }
     if (typeof task.lastError === 'string' && task.lastError !== '') {
       const dt = doc.createElement('dt');
       dt.textContent = '最近错误';
