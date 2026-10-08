@@ -20,6 +20,7 @@ import { formatLocalMinute } from './format.js';
 import { runTask, runEvents } from './runner.js';
 import { diagnose as diagnoseTask } from './diagnose.js';
 import * as gitModule from './git.js';
+import { scanFollowReviews } from './follow.js';
 import {
   InvalidTransitionError,
   claimNextTask,
@@ -50,7 +51,8 @@ const STALE_INFO_PATTERN = /stale info/i;
  * @param {object} options.config 配置（loadConfig 的结果；用 concurrency / pollSeconds /
  *   plan / weekStart / safetyRatio / allowPeak / maxAttempts / rateLimitBackoffMinutes /
  *   keepFailedWorktrees / timeoutMinutes / killGraceSeconds / difficulty /
- *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin / oneTaskPerRepo …）
+ *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin / oneTaskPerRepo /
+ *   autoFollowReviews / followPollMinutes …）
  * @param {string} options.home 数据目录（仓库缓存、worktree、日志都在它下面）
  * @param {() => Date} [options.clock] 取「现在」；缺省真实时间，测试注入可调时钟
  * @param {Function} [options.runner] 执行器，缺省 #7 的 runTask（签名见其 JSDoc）
@@ -71,7 +73,8 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   （各方法的语义见下方 JSDoc）
  * @throws {TypeError} 任一参数缺失或类型不符（db/config/home/env 非对象、home 非非空
  *   字符串、clock/runner 非函数、concurrency 非正整数、pollSeconds / cancelPollMs /
- *   rateLimitBackoffMinutes 非正数、oneTaskPerRepo 非布尔）
+ *   rateLimitBackoffMinutes / followPollMinutes 非正数、oneTaskPerRepo /
+ *   autoFollowReviews 非布尔）
  */
 export function createScheduler({
   db, config, home,
@@ -99,6 +102,11 @@ export function createScheduler({
   if (typeof config.oneTaskPerRepo !== 'boolean') {
     throw new TypeError(`config.oneTaskPerRepo 必须是布尔值，收到：${describe(config.oneTaskPerRepo)}`);
   }
+  // #49：自动跟进的两个新键同理（缺键 = undefined，同样过不了这里的类型检查）
+  if (typeof config.autoFollowReviews !== 'boolean') {
+    throw new TypeError(`config.autoFollowReviews 必须是布尔值，收到：${describe(config.autoFollowReviews)}`);
+  }
+  assertPositiveNumber(config.followPollMinutes, 'config.followPollMinutes');
 
   const events = new EventEmitter();
   /** 运行中的任务：taskId -> { controller, task }。controller 用于取消与停机中止。 */
@@ -113,6 +121,8 @@ export function createScheduler({
   let blocked = null;
   /** blocked 事件去重：同一 (reason, retryAt) 只发一次；有任务被领取时清空。 */
   let lastBlockedKey = null;
+  /** 最近一次自动跟进扫描的时刻（#49；取 clock() 的时间，不是墙钟）。null = 还没查过。 */
+  let lastFollowAt = null;
   let pollTimer = null;
   let cancelTimer = null;
   let tickChain = Promise.resolve();
@@ -259,6 +269,9 @@ export function createScheduler({
   async function doTick() {
     if (stopping) return [];
     const now = nowDate();
+    // #49 自动跟进：放在限流退避 / 手动暂停的早退**之前**——那两种期间扫描照做
+    // （只入队、不领取），查不查这轮由 maybeFollowReviews 按配置 / 高峰 / 间隔自判。
+    await maybeFollowReviews(now);
     if (pausedUntil !== null && now < pausedUntil) {
       setBlocked({ reason: 'rate-limit', retryAt: pausedUntil });
       return [];
@@ -324,6 +337,41 @@ export function createScheduler({
       });
     }
     return claimed;
+  }
+
+  /**
+   * 自动跟进扫描（#49）：autoFollowReviews 开着时，每隔 followPollMinutes 在**非高峰**
+   * 做一次 follow --all 那种扫描（判定与入队共用 src/follow.js 的同一份规则）。
+   * - 默认关闭时任何一轮都不为这件事碰 gh；
+   * - 高峰不查，也**不**把「刚查过」记上（高峰一结束的下一轮就可以查）；
+   * - 间隔用 clock() 的时间差算；从未查过时第一次符合条件的非高峰 tick 立刻查；
+   * - 一旦查了（成败都算）就更新 lastFollowAt，失败也不会每轮都打；
+   * - gh 失败只记一条日志、本轮不再扫其余父任务，绝不影响随后的领取。
+   * 手动暂停 / 限流退避期间调用方不会走到领取，但这里的扫描照做（可以入队）。
+   * @param {Date} now 本轮 tick 的时刻（clock() 的结果）
+   */
+  async function maybeFollowReviews(now) {
+    if (config.autoFollowReviews !== true) return;
+    if (isPeak(now)) return; // 高峰：连 gh 都不调，也不刷新 lastFollowAt
+    if (lastFollowAt !== null
+      && now.getTime() - lastFollowAt.getTime() < config.followPollMinutes * 60_000) {
+      return;
+    }
+    lastFollowAt = now; // 这次算查过：成败都至少隔 followPollMinutes 再来
+    let outcome;
+    try {
+      outcome = await scanFollowReviews(db, { ghBin: config.ghBin, env, config });
+    } catch (err) {
+      // 扫描自身炸了（读库失败等）：记日志后照常返回，绝不让异常逃出 tick
+      console.error('[night-shift] 自动跟进扫描意外失败：', err);
+      return;
+    }
+    for (const item of outcome.failed) {
+      console.error(`[night-shift] 自动跟进 #${item.parentId} 失败（继续扫其余父任务）：${item.message}`);
+    }
+    if (outcome.ghError !== null) {
+      console.error(`[night-shift] 自动跟进扫描遇到 gh 失败，本轮不再扫其余父任务：${outcome.ghError}`);
+    }
   }
 
   /** 统计当前用量：最近 7 天的运行（running 的 run 行按倍率现算，也计入）。 */

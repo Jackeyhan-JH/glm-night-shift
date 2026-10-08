@@ -222,6 +222,26 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
   （不按分支细分）。
 - `runNow`（点名立刻跑）不受此锁约束。
 
+### autoFollowReviews
+
+布尔值，默认 `false`。`true` 时调度器（`serve` / `start`）在**非高峰**时段自动扫描已
+成功任务的 PR 评审——与 `night-shift follow --all` 同一套判定（见下文 follow 一节），
+结论是 `CHANGES_REQUESTED` 就在原 night-shift 分支上入队一条跟进任务，不用人值守。
+默认 `false` 时调度器不轮询：任何一轮 tick 都不会为这件事调用 `gh`，发现评审要求修改
+后手动跑 `follow`。
+
+- 只跟 `CHANGES_REQUESTED`；不跟 `APPROVED` / `COMMENTED`，不合并 PR，也没有网页按钮
+  （开了自动跟进之后，任务自己出现在队列里）。
+- 查到的跟进任务照旧排队等领取：扫描只入队、不执行，领取仍走高峰 / 额度 / 暂停的原有
+  规则；手动 `pause` 或限流退避期间**仍然扫描**（可以入队），只是那几轮不领取。
+
+### followPollMinutes
+
+两次自动跟进扫描至少间隔的分钟数，正数，默认 `30`。间隔按调度器自己的时钟计算。
+高峰期间不扫描、也不刷新「刚查过」的时刻：高峰一结束的下一轮 tick 就可以扫，不必再
+等满一个间隔。扫描中 `gh` 失败同样算查过（调度器记一条日志、本轮不再扫其余父任务），
+至少隔这么多分钟才会再试。
+
 ## 完整 config.json 示例
 
 下面的值全部等于默认值，可以直接拷去改（删掉不想显式写的键即可，缺省键自动用默认值）：
@@ -257,7 +277,9 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
   "diagnoseModel": "glm-5.3-flash",
   "diagnoseTimeoutMinutes": 5,
   "systemctlBin": "systemctl",
-  "oneTaskPerRepo": true
+  "oneTaskPerRepo": true,
+  "autoFollowReviews": false,
+  "followPollMinutes": 30
 }
 ```
 
@@ -353,8 +375,12 @@ prompt 也一样（渲染后压缩连续空行并 trim）。
 「已经入队 #<id>（状态）」退出 0。`--all` 下某条 `gh` 失败会记下来继续，有任何失败
 退出码 1、已入队的保留；`--json` 输出 `{created, skipped, failed}`。
 
-**这批不会自动轮询 PR**：调度器（`serve` / `start`）不会自己去看评审，也没有
-`autoFollowReviews` 这样的配置键——发现评审要求修改后要手动跑 `follow`。
+调度器也可以自动做这套扫描（issue #49）：配置 `autoFollowReviews` 为 `true` 后，只在
+非高峰、且距上次扫描至少 `followPollMinutes` 分钟时扫一遍（判定与入队与本节是同一份
+代码，`src/follow.js`），查到的跟进任务照旧排队等领取、不会因为这次扫描就被直接执行；
+扫描中 `gh` 失败记一条日志并停止本轮（这次仍算查过）。默认 `false` 时调度器不轮询、
+任何一轮都不为此调用 `gh`，要手动跑 `follow`。详见上文 `autoFollowReviews` /
+`followPollMinutes` 两节。
 
 ## 两个页面同时取消
 
