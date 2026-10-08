@@ -3,7 +3,9 @@
 // 依赖多选）。#46：排队中的行多了「修改」，复用新增表单装进任务值、提交改走 PATCH。
 // #50：状态条附近多了「从 GitHub 导入」「清理磁盘」两个入口（先预览后确认）与表格
 // 上方的仓库筛选（浏览器内过滤，不发 repo 参数）。#62：成功任务的状态徽章旁边补一个
-// PR 结果标签（已合并 / 已关闭，用 DOM textContent 画，不进 innerHTML）。DOM 与网络
+// PR 结果标签（已合并 / 已关闭，用 DOM textContent 画，不进 innerHTML）。#74：状态条
+// 在暂停段前再补一句「为什么还没领」（5 小时额度 / 每周额度 / 限流退避），排队行的
+// 徽章旁补「等这个仓库」（oneTaskPerRepo 开着且同仓库有 running）。DOM 与网络
 // 都在这里，纯函数（分组、提示文本、表单转请求体、筛选、预览文案……）在 queue-lib.js。
 //
 // 每 5 秒轮询刷新；document.visibilityState 不是 visible 时暂停，切回来立即刷一次。
@@ -13,6 +15,7 @@
 import { api, fmtTime, navHtml, statusLabel } from '/common.js';
 import {
   REPO_FILTER_ALL,
+  blockedHint,
   cleanupBody,
   cleanupDoneText,
   cleanupPreviewText,
@@ -30,6 +33,7 @@ import {
   pauseToggleView,
   prOutcomeLabel,
   repoFilterOptions,
+  repoWaitLabel,
   statusBarText,
   taskRowActions,
   taskToForm,
@@ -97,11 +101,13 @@ pauseToggle.type = 'button';
 pauseToggle.id = 'pause-toggle';
 els.statusbar.append(statusText, pauseToggle);
 
-/** 页面状态：最近一次拉到的任务 / 模板 / 状态、当前标签与仓库筛选（#50）。 */
+/** 页面状态：最近一次拉到的任务 / 模板 / 状态、当前标签与仓库筛选（#50）、设置
+ * （#74 的 oneTaskPerRepo；请求失败时 null，这次不显示「等这个仓库」）。 */
 const state = {
   tasks: [],
   templates: [],
   status: null,
+  config: null,
   activeTab: 'queued',
   repoFilter: REPO_FILTER_ALL,
 };
@@ -112,14 +118,18 @@ let editingId = null;
 
 // ---------------------------------------------------------------- 数据与渲染
 
-/** 拉状态条与任务列表并重绘（表单与两个面板不动）。失败抛给调用方（轮询里静默吞掉）。 */
+/** 拉状态条、任务列表与设置（#74 的 oneTaskPerRepo）并重绘（表单与两个面板不动）。
+ * status / tasks 失败抛给调用方（轮询里静默吞掉）；config 单独兜底——失败不拖垮整次
+ * 刷新，只是这一轮不显示「等这个仓库」（置 null，不沿用上一轮的值）。 */
 async function refresh() {
-  const [status, tasks] = await Promise.all([
+  const [status, tasks, config] = await Promise.all([
     api('/api/status'),
     api(`/api/tasks?limit=${TASKS_LIMIT}`),
+    api('/api/config').catch(() => null),
   ]);
   state.status = status;
   state.tasks = Array.isArray(tasks) ? tasks : [];
+  state.config = config;
   renderStatusBar();
   renderRepoFilter();
   renderTabs();
@@ -127,10 +137,15 @@ async function refresh() {
   renderDependOptions();
 }
 
+/** 状态条文本（#74 起最多四段，' · ' 分隔）：常规文案 → 拦截原因一句（额度 / 限流）
+ * → 已暂停领取。暂停与拦截句互不压掉，可同时出现；全程 textContent，不进 innerHTML。 */
 function renderStatusBar() {
   const view = pauseToggleView(state.status);
-  const text = statusBarText(state.status);
-  statusText.textContent = view.pausedText === '' ? text : `${text} · ${view.pausedText}`;
+  const parts = [statusBarText(state.status)];
+  const hint = blockedHint(state.status);
+  if (hint !== '') parts.push(hint);
+  if (view.pausedText !== '') parts.push(view.pausedText);
+  statusText.textContent = parts.join(' · ');
   pauseToggle.textContent = view.buttonLabel;
 }
 
@@ -179,6 +194,7 @@ function renderTable() {
   els.table.innerHTML = `<div class="table-card"><table>` +
     `<thead><tr>${head}</tr></thead><tbody>${tasks.map(rowHtml).join('')}</tbody></table></div>`;
   appendPrOutcomeLabels(tasks);
+  appendRepoWaitLabels(tasks);
 }
 
 /**
@@ -198,6 +214,29 @@ function appendPrOutcomeLabels(tasks) {
     span.className = 'pr-outcome';
     span.textContent = label;
     // 徽章是 inline-block 的胶囊，直接接文本会粘成「成功已合并」：先补一个空格文本节点。
+    cell.append(document.createTextNode(' '), span);
+  });
+}
+
+/**
+ * 行上「等这个仓库」（#74）：oneTaskPerRepo 开着且同仓库已有正在跑的任务时，排队行
+ * 的状态徽章旁补这四个字（与 #62 的 PR 结果标签同一画法：表格 innerHTML 画完后用
+ * createElement + textContent 补进状态单元格，不进 innerHTML / 模板字符串；返回空串
+ * 的行一个节点都不建；两句都有时都显示）。判定用已取回的完整任务列表（state.tasks），
+ * 不用仓库筛选后的 visibleTasks()——筛选把正在跑的那条滤出当前标签时，排队行仍应
+ * 显示。行序 = tasks 序（与 appendPrOutcomeLabels 一致）。
+ */
+function appendRepoWaitLabels(tasks) {
+  const rows = els.table.querySelectorAll('tbody tr');
+  tasks.forEach((task, i) => {
+    const label = repoWaitLabel(task, state.tasks, state.config);
+    if (label === '') return; // 不建空 span，也不加空格
+    const cell = rows[i]?.cells[1];
+    if (cell === undefined) return; // 行与任务对不上时宁可不显示（正常不会发生）
+    const span = document.createElement('span');
+    span.className = 'repo-wait';
+    span.textContent = label;
+    // 徽章旁边：先补一个空格文本节点，避免与徽章粘成「排队中等这个仓库」。
     cell.append(document.createTextNode(' '), span);
   });
 }

@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   HISTORY_LIMIT,
+  blockedHint,
   depHint,
   escapeHtml,
   firstLine,
@@ -11,8 +12,10 @@ import {
   groupTasks,
   pauseToggleView,
   prOutcomeLabel,
+  repoWaitLabel,
   statusBarText,
 } from '../web/queue-lib.js';
+import { fmtTime } from '../web/common.js';
 
 // ---------- 按状态分组 ----------
 
@@ -255,4 +258,203 @@ test('验收: 函数不修改入参对象（含 task 为 null / undefined 不抛
   assert.deepEqual(task, before);
   assert.equal(prOutcomeLabel(null), '');
   assert.equal(prOutcomeLabel(undefined), '');
+});
+
+// ---------- 状态条的「为什么还没领」（#74） ----------
+
+/** 与 queue.js 的 renderStatusBar 相同的拼接（顺序写清楚：常规文案 → 拦截一句 →
+ * 已暂停领取，' · ' 分隔；空段不接）。 */
+function statusLine(status) {
+  const parts = [statusBarText(status)];
+  const hint = blockedHint(status);
+  if (hint !== '') parts.push(hint);
+  const { pausedText } = pauseToggleView(status);
+  if (pausedText !== '') parts.push(pausedText);
+  return parts.join(' · ');
+}
+
+test('验收: blocked.reason=five-hour 且 retryAt 为 ISO：整句 + 「；预计 <本地时间到分钟> 恢复」；与 statusBarText 拼接后额度百分比还在', () => {
+  const retryAt = '2026-10-08T16:30:00.000Z';
+  const status = {
+    peak: { peak: false },
+    usage: { fiveHour: { used: 16, limit: 1600 } },
+    runningCount: 2,
+    scheduler: { blocked: { reason: 'five-hour', retryAt } },
+  };
+  assert.equal(blockedHint(status), `5 小时额度已达安全阈值；预计 ${fmtTime(retryAt)} 恢复`);
+  const line = statusLine(status);
+  assert.ok(line.includes('5 小时额度 1.0%（16/1600）'), '原有的额度百分比那段还在');
+  assert.ok(line.includes('5 小时额度已达安全阈值；预计 '), '拦截句接在常规文案后面');
+});
+
+test('验收: five-hour 没有 retryAt：正好「5 小时额度已达安全阈值」，不含「预计」', () => {
+  assert.equal(
+    blockedHint({ scheduler: { blocked: { reason: 'five-hour', retryAt: null } } }),
+    '5 小时额度已达安全阈值',
+  );
+  // retryAt 字段整个缺失也一样
+  assert.equal(
+    blockedHint({ scheduler: { blocked: { reason: 'five-hour' } } }),
+    '5 小时额度已达安全阈值',
+  );
+  assert.ok(!blockedHint({ scheduler: { blocked: { reason: 'five-hour' } } }).includes('预计'));
+});
+
+test('验收: weekly 带 retryAt：「每周额度已达安全阈值」加同样的「；预计 … 恢复」后缀', () => {
+  const retryAt = '2026-10-09T01:05:00.000Z';
+  assert.equal(
+    blockedHint({ scheduler: { blocked: { reason: 'weekly', retryAt } } }),
+    `每周额度已达安全阈值；预计 ${fmtTime(retryAt)} 恢复`,
+  );
+});
+
+test('验收: rate-limit 带 retryAt：「触发限流，全局退避中」加同样的后缀', () => {
+  const retryAt = '2026-10-08T18:00:00.000Z';
+  assert.equal(
+    blockedHint({ scheduler: { blocked: { reason: 'rate-limit', retryAt } } }),
+    `触发限流，全局退避中；预计 ${fmtTime(retryAt)} 恢复`,
+  );
+});
+
+test('验收: blocked 为 null：空串（调用方一个字都不接）', () => {
+  assert.equal(blockedHint({ scheduler: { blocked: null } }), '');
+  assert.equal(blockedHint({ scheduler: { blocked: null }, userPaused: true }), '');
+});
+
+test('验收: scheduler 为 null / 缺 scheduler / status 为 null：空串', () => {
+  assert.equal(blockedHint({ scheduler: null }), '');
+  assert.equal(blockedHint({}), '');
+  assert.equal(blockedHint(null), '');
+  assert.equal(blockedHint(undefined), '');
+});
+
+test('验收: reason 为 peak（即使带 retryAt）：空串，返回值不含「暂不领新任务」', () => {
+  for (const blocked of [
+    { reason: 'peak', retryAt: '2026-10-08T16:30:00.000Z' },
+    { reason: 'peak', retryAt: null },
+    { reason: 'no-such-reason', retryAt: '2026-10-08T16:30:00.000Z' },
+    { reason: 'FIVE-HOUR', retryAt: '2026-10-08T16:30:00.000Z' },
+  ]) {
+    const hint = blockedHint({ scheduler: { blocked } });
+    assert.equal(hint, '', JSON.stringify(blocked));
+    assert.ok(!hint.includes('暂不领新任务'), '不出现「暂不领新任务」');
+    assert.ok(!hint.includes('高峰期，暂不领新任务'), '也不出现「高峰期，暂不领新任务」');
+  }
+});
+
+test('验收: 非法 retryAt：不接「预计」（也不写出「预计 - 恢复」）', () => {
+  for (const retryAt of ['not-a-time', '']) {
+    const hint = blockedHint({ scheduler: { blocked: { reason: 'weekly', retryAt } } });
+    assert.equal(hint, '每周额度已达安全阈值', `retryAt=${JSON.stringify(retryAt)}`);
+    assert.ok(!hint.includes('预计'), '不接「预计」半句');
+  }
+});
+
+test('验收: 暂停视图与 blockedHint 同时非空：拼出的状态条同时有额度那句、拦截句和「已暂停领取」', () => {
+  const retryAt = '2026-10-08T16:30:00.000Z';
+  const status = {
+    peak: { peak: false },
+    usage: { fiveHour: { used: 16, limit: 1600 } },
+    runningCount: 2,
+    userPaused: true,
+    scheduler: { blocked: { reason: 'rate-limit', retryAt } },
+  };
+  // 与 renderStatusBar 相同的拼接：常规文案 · 拦截一句 · 已暂停领取
+  assert.equal(
+    statusLine(status),
+    `非高峰时段 · 5 小时额度 1.0%（16/1600） · 运行中 2 个`
+      + ` · 触发限流，全局退避中；预计 ${fmtTime(retryAt)} 恢复 · 已暂停领取`,
+  );
+});
+
+test('验收: blockedHint 不修改入参', () => {
+  const status = {
+    peak: { peak: true },
+    scheduler: { blocked: { reason: 'rate-limit', retryAt: '2026-10-08T16:30:00.000Z' } },
+    userPaused: false,
+  };
+  const before = structuredClone(status);
+  blockedHint(status);
+  assert.deepEqual(status, before);
+});
+
+// ---------- 排队行的「等这个仓库」（#74） ----------
+
+test('验收: oneTaskPerRepo=true，#1 running、#2 queued 且 repo 相同：#2 得「等这个仓库」，#1 空串', () => {
+  const tasks = [
+    { id: 1, status: 'running', repo: 'a/b' },
+    { id: 2, status: 'queued', repo: 'a/b' },
+  ];
+  const config = { oneTaskPerRepo: true };
+  assert.equal(repoWaitLabel(tasks[1], tasks, config), '等这个仓库');
+  assert.equal(repoWaitLabel(tasks[0], tasks, config), '');
+});
+
+test('验收: oneTaskPerRepo=false：空串', () => {
+  const tasks = [
+    { id: 1, status: 'running', repo: 'a/b' },
+    { id: 2, status: 'queued', repo: 'a/b' },
+  ];
+  assert.equal(repoWaitLabel(tasks[1], tasks, { oneTaskPerRepo: false }), '');
+});
+
+test('验收: config 为 null、缺 oneTaskPerRepo、值为字符串 "true"：空串（不假设默认开）', () => {
+  const tasks = [
+    { id: 1, status: 'running', repo: 'a/b' },
+    { id: 2, status: 'queued', repo: 'a/b' },
+  ];
+  const queued = tasks[1];
+  assert.equal(repoWaitLabel(queued, tasks, null), '');
+  assert.equal(repoWaitLabel(queued, tasks, undefined), '');
+  assert.equal(repoWaitLabel(queued, tasks, {}), '');
+  assert.equal(repoWaitLabel(queued, tasks, { oneTaskPerRepo: 'true' }), '');
+  assert.equal(repoWaitLabel(queued, tasks, { oneTaskPerRepo: 1 }), '');
+});
+
+test('验收: 同一 repo 两条都是 queued、没有 running：空串；running 的是别的 repo：空串（严格全等，不折叠大小写、不 trim）', () => {
+  const config = { oneTaskPerRepo: true };
+  const bothQueued = [
+    { id: 1, status: 'queued', repo: 'a/b' },
+    { id: 2, status: 'queued', repo: 'a/b' },
+  ];
+  assert.equal(repoWaitLabel(bothQueued[1], bothQueued, config), '');
+  const otherRepo = [
+    { id: 1, status: 'running', repo: 'c/d' },
+    { id: 2, status: 'queued', repo: 'a/b' },
+  ];
+  assert.equal(repoWaitLabel(otherRepo[1], otherRepo, config), '');
+  // 大小写不同 / 带空白：不算同仓库
+  assert.equal(
+    repoWaitLabel({ id: 2, status: 'queued', repo: 'a/b' },
+      [{ id: 1, status: 'running', repo: 'A/B' }], config),
+    '',
+  );
+  assert.equal(
+    repoWaitLabel({ id: 2, status: 'queued', repo: 'a/b' },
+      [{ id: 1, status: 'running', repo: ' a/b' }], config),
+    '',
+  );
+  // 终态任务（成功/失败/取消）也不挡领取，不显示
+  for (const status of ['succeeded', 'failed', 'canceled']) {
+    assert.equal(
+      repoWaitLabel({ id: 2, status: 'queued', repo: 'a/b' },
+        [{ id: 1, status, repo: 'a/b' }], config),
+      '',
+      `status=${status}`,
+    );
+  }
+});
+
+test('验收: repoWaitLabel 不修改入参；task / tasks / config 残缺不抛错', () => {
+  const task = { id: 2, status: 'queued', repo: 'a/b' };
+  const tasks = [{ id: 1, status: 'running', repo: 'a/b' }];
+  const config = { oneTaskPerRepo: true };
+  const snapshot = structuredClone({ task, tasks, config });
+  repoWaitLabel(task, tasks, config);
+  assert.deepEqual({ task, tasks, config }, snapshot);
+  assert.doesNotThrow(() => repoWaitLabel(null, tasks, config));
+  assert.doesNotThrow(() => repoWaitLabel(undefined, tasks, config));
+  assert.doesNotThrow(() => repoWaitLabel(task, null, config));
+  assert.doesNotThrow(() => repoWaitLabel(task, undefined, config));
+  assert.doesNotThrow(() => repoWaitLabel(null, null, null));
 });
