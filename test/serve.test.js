@@ -250,7 +250,7 @@ test('验收: serve hang 任务：第一次 SIGINT 不退出、新 TCP 连接被
     { timeoutMs: 10_000, message: '任务应被领取并处于 running' });
 
   proc.child.kill('SIGINT');
-  await waitUntil(() => proc.stdout().includes('再按 Ctrl-C 强制停止'),
+  await waitUntil(() => proc.stdout().includes('再来一次 Ctrl-C 或 SIGTERM 强制停止'),
     { timeoutMs: 2000, message: '第一次 SIGINT 应打印优雅停止提示' });
   assert.ok(proc.stdout().includes('正在停止：不再领取新任务，等待 1 个运行中的任务结束'), proc.stdout());
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -319,7 +319,7 @@ test('serve 优雅停止不掐已建立的 SSE：第一次 SIGINT 后流仍开�
   };
 
   proc.child.kill('SIGINT'); // 任务运行中：进入优雅等待
-  await waitUntil(() => proc.stdout().includes('再按 Ctrl-C 强制停止'),
+  await waitUntil(() => proc.stdout().includes('再来一次 Ctrl-C 或 SIGTERM 强制停止'),
     { timeoutMs: 2000, message: '第一次 SIGINT 应打印优雅停止提示' });
 
   // 第一次信号后的 600ms 里，SSE 连接不应被掐：read 要么等到新数据（open），
@@ -506,4 +506,16 @@ test('serve / install-service / uninstall-service 的 <命令> --help：退出 0
     assert.equal(res.code, 0, `${name}：${res.stderr}`);
     assert.ok(res.stdout.startsWith('用法：night-shift '), `${name}：${res.stdout}`);
   }
+});
+
+// ---------------------------------------------------------------- 停止文案（#97）
+
+test('验收: serve 的停止文案：用法保持原句（逗号版），运行时括号改为「再来一次 Ctrl-C 或 SIGTERM 强制停止」', () => {
+  const src = fs.readFileSync(fileURLToPath(new URL('../src/cli/serve-run.js', import.meta.url)), 'utf8');
+  assert.ok(src.includes('（--port 0 用随机端口；Ctrl-C / SIGTERM 一次优雅停止，再按一次强制停止）'),
+    'serve 用法第二行应保持原样');
+  assert.equal(src.includes('（Ctrl-C / SIGTERM 一次优雅停止；再来一次强制停止）'), false,
+    'serve 用法不应混入 start 的新句子（分号版）');
+  assert.ok(src.includes('（再来一次 Ctrl-C 或 SIGTERM 强制停止）'),
+    '第一次停止的运行时括号应是「再来一次 Ctrl-C 或 SIGTERM 强制停止」');
 });

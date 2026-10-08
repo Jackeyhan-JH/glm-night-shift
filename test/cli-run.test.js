@@ -418,7 +418,7 @@ test('验收: hang 时第一次 SIGINT 优雅等待（不退出），第二次�
     { timeoutMs: 10_000, message: '假 claude 应已启动' });
 
   proc.child.kill('SIGINT');
-  await waitUntil(() => proc.stdout().includes('再按 Ctrl-C 强制停止'),
+  await waitUntil(() => proc.stdout().includes('再来一次 Ctrl-C 或 SIGTERM 强制停止'),
     { timeoutMs: 2000, message: '第一次 SIGINT 应打印优雅停止提示' });
   assert.ok(proc.stdout().includes('正在停止：不再领取新任务，等待 1 个运行中的任务结束'), proc.stdout());
   await new Promise((resolve) => setTimeout(resolve, 700));
@@ -693,4 +693,32 @@ test('用法错误：logs 缺 <id> / --run 非法、peak 带未知选项 → 退
 
   const badStart = await runCli(['start', 'extra'], { home });
   assert.equal(badStart.code, 2, 'start 不收位置参数');
+});
+
+// ---------------------------------------------------------------- 停止文案（#97）
+
+test('验收: start 的停止文案：用法改为「再来一次强制停止」，不再写「再按一次 Ctrl-C 强制停止」', () => {
+  const src = fs.readFileSync(fileURLToPath(new URL('../src/cli/run-commands.js', import.meta.url)), 'utf8');
+  assert.ok(src.includes('（Ctrl-C / SIGTERM 一次优雅停止；再来一次强制停止）'),
+    'start 用法第二行应是「再来一次强制停止」');
+  assert.equal(src.includes('再按一次 Ctrl-C 强制停止'), false,
+    'start 源码不应再出现「再按一次 Ctrl-C 强制停止」');
+  assert.ok(src.includes('（再来一次 Ctrl-C 或 SIGTERM 强制停止）'),
+    '第一次停止的运行时括号应是「再来一次 Ctrl-C 或 SIGTERM 强制停止」');
+});
+
+test('验收: docs/inconsistencies.md 第 5 条标记已解决：原文保留，第 1–4 条标题不动', () => {
+  const doc = fs.readFileSync(fileURLToPath(new URL('../docs/inconsistencies.md', import.meta.url)), 'utf8');
+  // 第 5 条：标题加「（已解决）」，原段落（含「帮助字符串本身没改。」）一字未删
+  assert.ok(doc.includes('5. **（已解决）帮助文案只写了「再按一次 Ctrl-C」。**'), doc);
+  assert.ok(doc.includes('帮助字符串本身没改。'), '第 5 条原文应保留');
+  // 第 1–4 条标题与 main 一致：第 1 条本就已解决，第 2–4 条不得新加「（已解决）」
+  for (const title of [
+    '1. **（已解决）`npm run e2e` 现在有了。**',
+    '2. **docs/images/task.png 截图来自看板的旧版本。**',
+    '3. **「高峰与额度」没有可链接的官方文档。**',
+    '4. **额度数字是本地估算，不是官方账单（备案）。**',
+  ]) {
+    assert.ok(doc.includes(title), `标题应保持原样：${title}`);
+  }
 });

@@ -116,7 +116,7 @@ export const serveRunCommand = {
                 requestStop(false); // 没有运行中的任务：直接收尾退出
                 return;
               }
-              say(`正在停止：不再领取新任务，等待 ${running.length} 个运行中的任务结束（再按 Ctrl-C 强制停止）`);
+              say(`正在停止：不再领取新任务，等待 ${running.length} 个运行中的任务结束（再来一次 Ctrl-C 或 SIGTERM 强制停止）`);
               requestStop(false);
             };
             process.on('SIGINT', onSignal);
