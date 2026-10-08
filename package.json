@@ -6,7 +6,8 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "e2e": "node --test --test-concurrency=1 \"e2e/*.e2e.mjs\""
   },
   "bin": {
     "night-shift": "bin/night-shift.mjs"
