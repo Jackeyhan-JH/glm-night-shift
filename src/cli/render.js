@@ -37,13 +37,16 @@ function cleanPrompt(text) {
  * 每列宽取该列（含表头）的最大显示宽度，列间两个空格，行尾不去补空格。
  * 等依赖的排队任务状态显示为 `queued（等 #1）`（多个：`等 #1,#2`）；succeeded 且
  * PR 已有结论时标 `succeeded（已合并）` / `succeeded（已关闭）`——状态列随之变宽，
- * 同表其余行按显示宽度自动对齐。
+ * 同表其余行按显示宽度自动对齐。waitingIds（#85，Set<number>，由 task-commands.js
+ * 算好传入，不从任务对象上读）是「在等这个仓库」的排队任务 id 集合：命中的排队
+ * 任务在状态里接「，等这个仓库」或整格标 `queued（等这个仓库）`；缺省不标，
+ * 输出与从前逐字相同（format.test.js 不传第二参）。
  */
-export function renderTasksTable(tasks) {
+export function renderTasksTable(tasks, { waitingIds } = {}) {
   const header = ['ID', '状态', '难度', '优先级', '仓库', '标题', '创建时间'];
   const rows = tasks.map((t) => [
     String(t.id),
-    statusCell(t),
+    statusCell(t, waitingIds),
     t.difficulty,
     String(t.priority),
     truncateDisplay(singleLine(t.repo), REPO_MAX_COLUMNS),
@@ -56,12 +59,19 @@ export function renderTasksTable(tasks) {
 /**
  * 状态列：queued 且有未满足依赖时标注在等谁（blockedBy 升序 id）——先判这条，
  * 排队等依赖的任务永远不吃下面的 PR 结果标注（还没跑到开 PR 那步）。
- * succeeded 且 PR 已有结论（#75）时在状态后注明：merged →「（已合并）」、
- * closed →「（已关闭）」；open / 空 / 其他值不加字，仍是光秃秃的 succeeded。
+ * #85：queued 且 id 在 waitingIds 里（oneTaskPerRepo 开着、同仓库另有 running）时
+ * 接「，等这个仓库」（全角逗号），没有依赖则整格 `queued（等这个仓库）`；status
+ * 不是 queued 的任务即使 id 误在集合里也不标。succeeded 且 PR 已有结论（#75）时
+ * 在状态后注明：merged →「（已合并）」、closed →「（已关闭）」；open / 空 /
+ * 其他值不加字，仍是光秃秃的 succeeded。
  */
-function statusCell(task) {
-  if (task.status === 'queued' && task.blockedBy?.length > 0) {
-    return `queued（等 #${task.blockedBy.join(',#')}）`;
+function statusCell(task, waitingIds) {
+  if (task.status === 'queued') {
+    const waitingRepo = waitingIds?.has(task.id) === true;
+    if (task.blockedBy?.length > 0) {
+      return `queued（等 #${task.blockedBy.join(',#')}${waitingRepo ? '，等这个仓库' : ''}）`;
+    }
+    if (waitingRepo) return 'queued（等这个仓库）';
   }
   if (task.status === 'succeeded') {
     if (task.prOutcome === 'merged') return 'succeeded（已合并）';
@@ -80,10 +90,15 @@ function depsLine(deps) {
  * （列：尝试次数、类型、模型、状态、耗时、额度、日志路径）。没有运行记录时明确说无。
  * 带诊断（#12）的运行在表格后逐行列出诊断第一行（诊断是多行文本，塞进表格会撑破列宽）。
  * deps 是 listDependencies() 的结果（[{id, status}]，升序）；缺省视为无依赖。
+ * waitingSameRepo（#85，task-commands.js 判好传入）：true 且任务仍是 queued 时，
+ * 「状态」格写成 `queued（等这个仓库）`（等谁不塞进来，依赖仍是单独一行）；缺省
+ * false，输出与从前逐字相同。
  */
-export function renderTaskDetail(task, runs, deps = []) {
+export function renderTaskDetail(task, runs, deps = [], { waitingSameRepo = false } = {}) {
   const fields = [
-    ['状态', task.status],
+    ['状态', waitingSameRepo === true && task.status === 'queued'
+      ? 'queued（等这个仓库）'
+      : task.status],
     ['难度', task.difficulty],
     ['优先级', String(task.priority)],
     ['仓库', task.repo],

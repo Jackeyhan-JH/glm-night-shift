@@ -84,6 +84,22 @@ function effectiveConfig(ctx) {
   return loadConfig({ home: resolveHome(ctx.env), env: ctx.env });
 }
 
+/**
+ * #85「在等这个仓库」：算 list 要标的 waitingIds——listed 里 status 为 queued、且
+ * running 清单中存在另一条（id 不同）任务 repo 与之全等（===，不 trim、不
+ * toLowerCase）的任务 id。同仓库另一条也只是 queued 不算；自己不是 queued 不进集合。
+ * running 清单由调用方在同一条 withDb 连接上查（limit 固定 1000，不用本次 --limit），
+ * 开关（oneTaskPerRepo === true）也由调用方判过才到这里。
+ */
+function waitingSameRepoIds(listed, running) {
+  const ids = new Set();
+  for (const task of listed) {
+    if (task.status !== 'queued') continue;
+    if (running.some((busy) => busy.id !== task.id && busy.repo === task.repo)) ids.add(task.id);
+  }
+  return ids;
+}
+
 /** --json 时输出缩进 JSON，否则输出人类可读的一行。 */
 function writeOut(ctx, json, value, humanLine) {
   ctx.stdout.write(json ? `${JSON.stringify(value, null, 2)}\n` : `${humanLine}\n`);
@@ -371,12 +387,21 @@ export const listCommand = {
     const limit = values.limit === undefined
       ? undefined // 缺省用 store 的默认（当前 100）
       : parseIntStrict(ctx, values.limit, '--limit', listCommand.usage, { min: 1 });
-    const tasks = await withDb(ctx, (db) => listTasks(db, { status, limit }));
+    const { rows, waitingIds } = await withDb(ctx, (db) => {
+      const listed = listTasks(db, { status, limit });
+      // #85：只给人类可读输出标「等这个仓库」——读这一次生效配置（=== true 才标），
+      // 同一连接另查 running（limit 固定 1000，不用本次 --limit）。--json 短路在前：
+      // 不读配置也不另查，坏掉的 config.json 不会让 list --json 退出 1。
+      const waitingIds = !values.json && effectiveConfig(ctx).oneTaskPerRepo === true
+        ? waitingSameRepoIds(listed, listTasks(db, { status: 'running', limit: 1000 }))
+        : undefined;
+      return { rows: listed, waitingIds };
+    });
     if (values.json) {
-      ctx.stdout.write(`${JSON.stringify(tasks, null, 2)}\n`); // 空列表输出 []，不是「队列是空的」
+      ctx.stdout.write(`${JSON.stringify(rows, null, 2)}\n`); // 空列表输出 []，不是「队列是空的」
       return 0;
     }
-    ctx.stdout.write(tasks.length === 0 ? '队列是空的\n' : renderTasksTable(tasks));
+    ctx.stdout.write(rows.length === 0 ? '队列是空的\n' : renderTasksTable(rows, { waitingIds }));
     return 0;
   },
 };
@@ -391,17 +416,28 @@ export const showCommand = {
       allowPositionals: true,
     });
     const id = parseIdPositional(ctx, positionals, showCommand.usage);
-    const { task, runs, deps } = await withDb(ctx, (db) => {
+    const { task, runs, deps, waitingSameRepo } = await withDb(ctx, (db) => {
       const found = getTask(db, id);
       if (found === null) throw new NotFoundError(id); // 运行时错误：中文原因，退出码 1
+      // #85：人类可读输出在任务 queued、开关开着（读一次配置，=== true）且同仓库另有
+      // running（id 不同、repo 全等）时标「等这个仓库」。--json 短路在最前，不读配置、
+      // 不查 running，输出的对象形状与从前相同。
+      const waitingSameRepo = !values.json
+        && effectiveConfig(ctx).oneTaskPerRepo === true
+        && found.status === 'queued'
+        && listTasks(db, { status: 'running', limit: 1000 })
+          .some((busy) => busy.id !== found.id && busy.repo === found.repo);
       return {
         task: found,
         runs: listRuns(db, { taskId: id, limit: 1000 }),
         deps: listDependencies(db, id), // 依赖行（id + 状态），给人类可读输出用
+        waitingSameRepo,
       };
     });
-    // JSON 形状：任务字段全在顶层（含 status / dependsOn / blockedBy），runs 挂在 runs 键下。
-    writeOut(ctx, values.json, { ...task, runs }, renderTaskDetail(task, runs, deps));
+    // JSON 形状：任务字段全在顶层（含 status / dependsOn / blockedBy），runs 挂在 runs 键下
+    // （waitingSameRepo 不掺进去）。
+    writeOut(ctx, values.json, { ...task, runs },
+      renderTaskDetail(task, runs, deps, { waitingSameRepo }));
     return 0;
   },
 };
