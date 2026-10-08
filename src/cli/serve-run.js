@@ -147,8 +147,10 @@ export const serveRunCommand = {
       lock.release();
       db.close();
       db = null;
-      exitAfterDrain(0);
-      return 0; // 不会到达（上面直接退出）；给进程内调用留个返回值
+      // 真实入口（stdout 是 process.stdout）才硬退出；进程内调用（runCli + 收集 sink）
+      // 返回退出码交给调用方处理。
+      if (ctx.stdout === process.stdout) exitAfterDrain(0);
+      return 0;
     } finally {
       // 异常路径兜底：监听着的 socket 会拖住事件循环（进程挂着不退），必须关掉；
       // 幂等——正常路径里要么已在信号处理中 close，要么进程即将硬退出。

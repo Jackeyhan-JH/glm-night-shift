@@ -160,6 +160,15 @@ test('验收: FAKE_SYSTEMCTL_FAIL=1：install-service 退出 1，stderr 原样�
   assert.ok(fs.existsSync(ctx.unitPath), 'daemon-reload 失败也应保留已写的单元文件（不假装没安装）');
 });
 
+test('--unit-dir 给了但为空白：用法错误退出 2（不写到意外的相对路径）', async (t) => {
+  const home = makeTempHome(t);
+  for (const args of [['install-service', '--unit-dir', ''], ['uninstall-service', '--unit-dir', ' ']]) {
+    const res = await runCli(args, { home });
+    assert.equal(res.code, 2, `${args.join(' ')}：${res.stderr}`);
+    assert.ok(res.stderr.includes('--unit-dir'), res.stderr);
+  }
+});
+
 test('忘了覆盖 systemctlBin 时失败关闭：默认 systemctl 命中沙箱陷阱（退出 99），命令退出 1', async (t) => {
   const home = makeTempHome(t);
   const unitDir = path.join(makeTempHome(t), 'units');

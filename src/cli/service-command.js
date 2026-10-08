@@ -92,6 +92,15 @@ function defaultUnitDir(env) {
   return path.join(xdg ?? path.join(os.homedir(), '.config'), 'systemd', 'user');
 }
 
+/** --unit-dir 的取值：给了但为空白是用法错误（否则单元会写到意外的相对路径）。 */
+function resolveUnitDir(ctx, raw, usage) {
+  const dir = raw ?? defaultUnitDir(ctx.env);
+  if (typeof dir !== 'string' || dir.trim() === '') {
+    throw new ctx.UsageError('--unit-dir 不能是空白（单元目录的路径）', { usage });
+  }
+  return dir;
+}
+
 /**
  * 跑一次 systemctl。退出码非 0 或启动失败：把它的输出原样透传给用户并返回 false。
  * @returns {boolean} 是否成功（退出码 0）
@@ -128,7 +137,7 @@ export const installServiceCommand = {
     const env = ctx.env;
     const home = resolveHome(env);
     const config = loadConfig({ home, env }); // systemctlBin 等；配置非法 → 退出 1
-    const unitDir = values['unit-dir'] ?? defaultUnitDir(env);
+    const unitDir = resolveUnitDir(ctx, values['unit-dir'], installServiceCommand.usage);
     const unitPath = path.join(unitDir, UNIT_NAME);
     const unit = renderUnit({ home, env });
 
@@ -166,7 +175,7 @@ export const uninstallServiceCommand = {
     const env = ctx.env;
     const home = resolveHome(env);
     const config = loadConfig({ home, env });
-    const unitDir = values['unit-dir'] ?? defaultUnitDir(env);
+    const unitDir = resolveUnitDir(ctx, values['unit-dir'], uninstallServiceCommand.usage);
     const unitPath = path.join(unitDir, UNIT_NAME);
 
     if (!fs.existsSync(unitPath)) {
