@@ -11,17 +11,19 @@ import { makeTempHome } from './helpers.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-test(':memory: 建出 tasks / runs 两张表和四个索引，user_version 为 1', () => {
+test(':memory: 建出 tasks / runs 两张表和 v1 的四个索引，user_version 等于迁移步数', () => {
   const db = openDb();
   try {
+    // 后续 issue 会再加表 / 加索引，这里只断言 v1 建的东西存在，不做排他性比较
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
       .all().map((row) => row.name);
-    assert.deepEqual(tables, ['runs', 'tasks']);
+    for (const name of ['runs', 'tasks']) assert.ok(tables.includes(name), `应有表 ${name}`);
     const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%' ORDER BY name")
       .all().map((row) => row.name);
-    assert.deepEqual(indexes, ['idx_runs_list', 'idx_runs_open', 'idx_tasks_claim', 'idx_tasks_list']);
-    assert.equal(userVersion(db), SCHEMA_VERSION);
-    assert.equal(SCHEMA_VERSION, 1);
+    for (const name of ['idx_runs_list', 'idx_runs_open', 'idx_tasks_claim', 'idx_tasks_list']) {
+      assert.ok(indexes.includes(name), `应有索引 ${name}`);
+    }
+    assert.equal(userVersion(db), MIGRATIONS.length); // 不写死数字：版本号 = 迁移步数
   } finally {
     db.close();
   }
@@ -76,7 +78,7 @@ test('CHECK 约束生效：非法 status / difficulty 进不了库', (t) => {
   );
 });
 
-test('关掉再打开同一文件：数据还在，user_version 仍为 1，迁移不重跑', (t) => {
+test('关掉再打开同一文件：数据还在，user_version 等于迁移步数，迁移不重跑', (t) => {
   const file = path.join(makeTempHome(t), 'night-shift.db');
   const db1 = openDb(file);
   const now = new Date().toISOString();
@@ -88,7 +90,7 @@ test('关掉再打开同一文件：数据还在，user_version 仍为 1，迁�
 
   const db2 = openDb(file); // 迁移若重跑，裸 CREATE TABLE 会立刻报错
   t.after(() => db2.close());
-  assert.equal(userVersion(db2), 1);
+  assert.equal(userVersion(db2), MIGRATIONS.length);
   const row = db2.prepare('SELECT repo, priority FROM tasks').get();
   assert.equal(row.repo, 'a/b');
   assert.equal(row.priority, 7);
@@ -96,17 +98,18 @@ test('关掉再打开同一文件：数据还在，user_version 仍为 1，迁�
 
 test('user_version 比代码认识的版本新时，openDb 报清晰错误且不动数据', (t) => {
   const file = path.join(makeTempHome(t), 'night-shift.db');
+  const future = MIGRATIONS.length + 1; // 不管以后加到多少步，“比代码新”都成立
   const db1 = openDb(file);
-  db1.exec('PRAGMA user_version = 42');
+  db1.exec(`PRAGMA user_version = ${future}`);
   db1.close();
 
   assert.throws(
     () => openDb(file),
-    (err) => err instanceof Error && err.message.includes('42') && err.message.includes(String(SCHEMA_VERSION)),
+    (err) => err instanceof Error && err.message.includes(String(future)) && err.message.includes(String(SCHEMA_VERSION)),
   );
   // 失败后文件还是老样子，版本号也没被改掉
   const raw = new DatabaseSync(file);
-  assert.equal(userVersion(raw), 42);
+  assert.equal(userVersion(raw), future);
   raw.close();
 });
 

@@ -1,6 +1,7 @@
 // 数据库打开与迁移。零依赖，只用 node:sqlite（Node 22.13+ 起无需开关）。
-// 后续 issue 加表 / 加列时，只在 MIGRATIONS 末尾追加一个函数并把 SCHEMA_VERSION 同步 +1，
-// 不要改写已发布的迁移（旧库靠 user_version 判断跳过它们）。
+// 后续 issue（#9、#11、#12…）加表 / 加列时，只在 MIGRATIONS 末尾追加一个迁移函数：
+// SCHEMA_VERSION 由 MIGRATIONS.length 算出，不用手工 +1。绝不改写已有迁移
+// （旧库靠 user_version 判断跳过它们）；rebase 后版本号按列表位置自然顺延。
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -148,8 +149,8 @@ export const SCHEMA_VERSION = MIGRATIONS.length;
 
 /**
  * 迁移函数列表：MIGRATIONS[v] 把 user_version 为 v 的库升到 v+1（v 从 0 起）。
- * 只允许在末尾追加，不要改写已发布的迁移；整个升级在单个 IMMEDIATE 事务里跑，
- * 两个进程同时首次打开同一个库也只会有一方真正执行迁移。
+ * 只允许在末尾追加，不要改写已发布的迁移（版本号按位置顺延，rebase 后自然重编号）；
+ * 整个升级在单个 IMMEDIATE 事务里跑，两个进程同时首次打开同一个库也只会有一方真正执行迁移。
  * @type {Array<(db: import('node:sqlite').DatabaseSync) => void>}
  */
 export { MIGRATIONS };

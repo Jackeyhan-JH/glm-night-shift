@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { openDb } from '../src/db.js';
+import { openDb, MIGRATIONS } from '../src/db.js';
 import {
   createTask, getTask, listTasks, claimNextTask, finishTask, cancelTask, retryTask,
   recoverStaleRunning, startRun, finishRun, listRuns,
@@ -537,7 +537,7 @@ test('listRuns：taskId / since / limit 过滤，started_at DESC → id DESC，s
 
 // ---------------------------------------------------------------- 持久性与并发
 
-test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_version 为 1，迁移不重跑', (t) => {
+test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_version 等于迁移步数（当前为 1），迁移不重跑', (t) => {
   const file = tempDbFile(t);
   const db = openDb(file);
   const task = createTask(db, { ...VALID, priority: 2 });
@@ -553,7 +553,7 @@ test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_versi
 
   const db2 = openDb(file); // 迁移不重跑（重跑必因裸 CREATE TABLE 报错）
   t.after(() => db2.close());
-  assert.equal(db2.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(db2.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
   assert.deepEqual(getTask(db2, task.id), doneTask);
   const [runAgain] = listRuns(db2, { taskId: task.id });
   assert.equal(runAgain.status, 'succeeded');
