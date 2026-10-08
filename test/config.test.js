@@ -13,6 +13,7 @@ const EXPECTED_DEFAULTS = {
   maxAttempts: 2,
   pollSeconds: 30,
   port: 7788,
+  host: '127.0.0.1',
   plan: 'v2-max',
   weekStart: null,
   safetyRatio: 0.9,
