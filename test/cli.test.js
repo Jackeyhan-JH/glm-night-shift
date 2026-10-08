@@ -633,9 +633,11 @@ test('验收: Node 24 下各命令 stderr 没有 SQLite 实验性警告', async 
   }
 });
 
-const NODE22 = '/tmp/node-v22.13.0-linux-x64/bin/node';
+// Node 22 可执行文件：优先用环境变量 NODE22_BIN（CI 或别的机器上的安装路径），否则用本机约定的解压位置。
+// 两者都不存在时这两个测试跳过。
+const NODE22 = process.env.NODE22_BIN || '/tmp/node-v22.13.0-linux-x64/bin/node';
 
-test('验收: Node 22 只屏蔽 SQLite 警告——add/list 的 stderr 完全干净', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, async (t) => {
+test('验收: Node 22 只屏蔽 SQLite 警告——add/list 的 stderr 完全干净', { skip: !fs.existsSync(NODE22) && `找不到 Node 22（${NODE22}；可用 NODE22_BIN 指定），跳过` }, async (t) => {
   const home = makeTempHome(t);
   const addRes = await spawnCli(t, ['add', '--repo', 'a/b', '--prompt', '修复登录 bug'], { cwd: home, exec: NODE22 });
   assert.equal(addRes.code, 0, addRes.stderr);
@@ -646,7 +648,7 @@ test('验收: Node 22 只屏蔽 SQLite 警告——add/list 的 stderr 完全干
   assert.equal(listRes.stderr, '', `Node 22 下 stderr 应为空：${listRes.stderr}`);
 });
 
-test('验收: Node 22 下其他警告照常输出（过滤只吞 SQLite 那一条）', { skip: !fs.existsSync(NODE22) && '本机没有 Node 22.13，跳过' }, () => {
+test('验收: Node 22 下其他警告照常输出（过滤只吞 SQLite 那一条）', { skip: !fs.existsSync(NODE22) && `找不到 Node 22（${NODE22}；可用 NODE22_BIN 指定），跳过` }, () => {
   // 子进程脚本：装过滤 → 动态加载 db.js 并真的打开库（触发 SQLite 警告，应被吞）→
   // 发两条自定义警告（一条同为 ExperimentalWarning），它们必须照常打印。
   const script = `
