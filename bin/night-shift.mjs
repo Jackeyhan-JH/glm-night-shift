@@ -25,6 +25,7 @@ import { templatesCommand } from '../src/cli/template-commands.js';
 import { serveCommand } from '../src/cli/serve-command.js';
 import { serveRunCommand } from '../src/cli/serve-run.js';
 import { installServiceCommand, uninstallServiceCommand } from '../src/cli/service-command.js';
+import { cleanupCommand } from '../src/cli/cleanup-command.js';
 import {
   logsCommand,
   peakCommand,
@@ -69,6 +70,7 @@ const COMMANDS = {
   serve: serveRunCommand,
   'install-service': installServiceCommand,
   'uninstall-service': uninstallServiceCommand,
+  cleanup: cleanupCommand,
   help: {
     summary: '显示帮助',
     usage: 'night-shift help',
