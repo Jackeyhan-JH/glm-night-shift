@@ -201,6 +201,15 @@ const MIGRATIONS = [
       );
     `);
   },
+  // 版本 7：tasks 加 git_ref（issue #48 按 PR 评审在原分支跟进）。可空：普通任务没有
+  // 跟随的分支，为 null；follow 命令建的跟进任务把它设成父任务成功时推送的
+  // night-shift/<id>-<slug> 分支，createWorktree 据此从 origin/<git_ref> 检出，
+  // 让改动落回原分支、复用原 PR（见 src/git.js 的 createWorktree）。
+  (db) => {
+    db.exec(`
+      ALTER TABLE tasks ADD COLUMN git_ref TEXT NULL;
+    `);
+  },
 ];
 
 /**

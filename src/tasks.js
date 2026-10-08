@@ -23,6 +23,9 @@ export const DIFFICULTIES = ['easy', 'medium', 'hard'];
 
 const REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const TITLE_MAX_CODE_POINTS = 60; // title 缺省时取 prompt 的前 60 个字符（按 Unicode 码点数）
+// #48 跟进任务跟随的分支名：只认 night-shift/ 命名空间（与 branchName/pushBranch 一致），
+// 斜杠后必须有名字。空格 / 绝对路径 / 其他前缀（main、master、feature/…）都过不了这个形状。
+const GIT_REF_PATTERN = /^night-shift\/[A-Za-z0-9._/-]+$/;
 
 /**
  * 字段校验失败。
@@ -103,6 +106,9 @@ export class DependencyBlockedError extends InvalidTransitionError {
  * @property {string} repo `owner/name`
  * @property {?string} source 来源标识（#39）：import 建的任务是 `github:<repo>#<编号>`，
  *   手工 add 的为 null
+ * @property {?string} gitRef 跟进的分支（#48）：follow 建的跟进任务把它设为父任务成功时
+ *   推送的 night-shift/<id>-<slug> 分支，createWorktree 据此从 origin/<gitRef> 检出，
+ *   改动落回原分支、PR 复用原来那一个；普通任务为 null
  * @property {string} title
  * @property {string} prompt
  * @property {('easy'|'medium'|'hard')} difficulty
@@ -161,6 +167,10 @@ export class DependencyBlockedError extends InvalidTransitionError {
  *   （按码点切，中文 / emoji 不会被切成半个）；给了则 trim 后必须非空
  * @param {?string} [input.source=null] 来源标识（#39 的 import 用 `github:<repo>#<编号>`）；
  *   null = 手工添加、无来源；给了则 trim 后必须非空
+ * @param {?string} [input.gitRef=null] 跟进的分支（#48）：null = 普通任务（从默认分支检出）；
+ *   给了则 trim 后必须形如 `night-shift/<名字>`（拒绝空格、`..`、空路径段、绝对路径与
+ *   其他前缀——`main` / `master` / 裸 `night-shift` 都不行），createWorktree 会从
+ *   `origin/<gitRef>` 检出并沿用这个分支名
  * @param {('easy'|'medium'|'hard')} [input.difficulty='medium']
  * @param {number} [input.priority=0] 任意整数（越大越先被领取，负数合法）
  * @param {?string} [input.testCommand=null] null 或非空字符串
@@ -188,6 +198,7 @@ export function createTask(db, input = {}) {
   }
   const testCommand = optionalTrimmed(input.testCommand, 'testCommand');
   const source = optionalTrimmed(input.source, 'source');
+  const gitRef = validateGitRef(input.gitRef);
   const allowPeak = input.allowPeak ?? false;
   if (typeof allowPeak !== 'boolean') {
     throw new ValidationError('allowPeak', `必须是布尔值（当前值：${allowPeak}）`);
@@ -207,10 +218,10 @@ export function createTask(db, input = {}) {
   const row = inSavepoint(db, () => {
     const inserted = db.prepare(`
       INSERT INTO tasks (repo, title, prompt, difficulty, priority, test_command, allow_peak,
-                         status, attempts, max_attempts, source, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?)
+                         status, attempts, max_attempts, source, git_ref, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
       RETURNING *
-    `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, source, now, now);
+    `).get(repo, title, prompt, difficulty, priority, testCommand, allowPeak ? 1 : 0, maxAttempts, source, gitRef, now, now);
     insertTaskDeps(db, inserted.id, dependsOn);
     return inserted;
   });
@@ -1089,6 +1100,38 @@ function optionalTrimmed(value, field) {
   return requiredTrimmed(value, field);
 }
 
+/**
+ * gitRef 校验（#48）：undefined/null → null（普通任务）；给了则 trim 后必须是
+ * night-shift/ 命名空间下的分支名。逐条给出不合法的原因（ValidationError 的
+ * message 点名），拒绝：空 / 纯空白、空格、`..`、空路径段（`//` 或以 `/` 结尾）、
+ * 绝对路径、其他前缀（`main`、`master`、裸 `night-shift`、`feature/…` 都不行）。
+ * @returns {?string} null 或 trim 后的合法分支名
+ */
+function validateGitRef(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    throw new ValidationError('gitRef', `必须是字符串或 null（当前值：${value}）`);
+  }
+  const gitRef = value.trim();
+  if (gitRef === '') {
+    throw new ValidationError('gitRef', '不能为空字符串（不跟分支就传 null）');
+  }
+  if (!GIT_REF_PATTERN.test(gitRef)) {
+    throw new ValidationError(
+      'gitRef',
+      `必须是 night-shift/ 开头的分支名，斜杠后还要有名字（当前值：${gitRef}）；`
+        + 'main、master 或其他前缀不行',
+    );
+  }
+  if (gitRef.includes('..')) {
+    throw new ValidationError('gitRef', `不能包含 ..（当前值：${gitRef}）`);
+  }
+  if (gitRef.includes('//') || gitRef.endsWith('/')) {
+    throw new ValidationError('gitRef', `不能包含空路径段（当前值：${gitRef}）`);
+  }
+  return gitRef;
+}
+
 function assertPositiveInt(value, field) {
   if (!Number.isInteger(value) || value < 1) {
     throw new ValidationError(field, `必须是正整数（当前值：${value}）`);
@@ -1122,6 +1165,7 @@ function rowToTask(row, dependsOn = [], blockedBy = []) {
     id: row.id,
     repo: row.repo,
     source: row.source ?? null,
+    gitRef: row.git_ref ?? null,
     title: row.title,
     prompt: row.prompt,
     difficulty: row.difficulty,
