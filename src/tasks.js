@@ -591,6 +591,18 @@ export function listRuns(db, { taskId, since, limit = 100 } = {}) {
     .map(rowToRun);
 }
 
+/**
+ * 按 id 取运行记录。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} id 正整数
+ * @returns {?RunRow} 不存在返回 null（操作类函数才抛 NotFoundError）
+ * @throws {ValidationError} id 不是正整数（field='id'）
+ */
+export function getRun(db, id) {
+  assertPositiveInt(id, 'id');
+  return rowToRun(db.prepare('SELECT * FROM runs WHERE id = ?').get(id));
+}
+
 // ---------------------------------------------------------------- 辅助
 
 function nowIso() {
