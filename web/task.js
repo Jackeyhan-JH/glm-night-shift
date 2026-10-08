@@ -383,7 +383,9 @@ export function createPage(options = {}) {
   function appendLines(lines) {
     if (lines.length === 0) return;
     const prev = state.rawLines.length;
-    state.rawLines.push(...lines);
+    // 逐个 push 而不是 push(...lines)：已结束运行的日志是一次性取回的整段文本，
+    // 行数可达十万级，spread 传参会撞引擎参数上限（RangeError），循环没有这个限制。
+    for (const line of lines) state.rawLines.push(line);
     state.rawLines = capLines(state.rawLines, MAX_LOG_LINES);
     const dropped = prev + lines.length - state.rawLines.length;
     if (dropped > 0) {
@@ -474,20 +476,25 @@ export function createPage(options = {}) {
     addText('开始时间', fmtTime(task.startedAt));
     addText('结束时间', fmtTime(task.finishedAt));
     addText('分支', task.branch ?? '-');
-    if (typeof task.prUrl === 'string' && task.prUrl !== '') {
+    // PR 链接：prUrl 是库里的数据，只把 http(s) 地址放进 href——javascript: 之类
+    // 的伪协议挂到 <a href> 上点一下就执行，和 innerHTML 是同一类注入面。
+    const safePrUrl = typeof task.prUrl === 'string' && /^https?:\/\//i.test(task.prUrl)
+      ? task.prUrl : null;
+    if (safePrUrl !== null) {
       const dt = doc.createElement('dt');
       dt.textContent = 'PR';
       const dd = doc.createElement('dd');
       const link = doc.createElement('a');
-      link.setAttribute('href', task.prUrl);
+      link.setAttribute('href', safePrUrl);
       link.setAttribute('target', '_blank'); // 新标签页打开
       link.setAttribute('rel', 'noopener noreferrer');
-      link.textContent = task.prUrl;
+      link.textContent = safePrUrl;
       dd.appendChild(link);
       fields.appendChild(dt);
       fields.appendChild(dd);
     } else {
-      addText('PR', '-');
+      addText('PR', task.prUrl === null || task.prUrl === undefined || task.prUrl === ''
+        ? '-' : task.prUrl); // 非 http(s) 的值不做成链接，按文本原样显示
     }
     if (Array.isArray(task.dependsOn) && task.dependsOn.length > 0) {
       const dt = doc.createElement('dt');

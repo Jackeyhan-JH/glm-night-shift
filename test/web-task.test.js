@@ -462,7 +462,8 @@ test('验收: prompt 与日志里写 <img src=x onerror=alert(1)>：原样显示
     taskId: task.id, attempt: 1, model: 'glm-5.3', effort: 'low', peak: false, logPath,
   });
   finishRun(db, run.id, { status: 'succeeded' });
-  finishTask(db, task.id, { status: 'succeeded' });
+  // prUrl 是库里的数据：伪协议不能进 <a href>（点了会执行），只按文本显示
+  finishTask(db, task.id, { status: 'succeeded', prUrl: 'javascript:alert(9)' });
 
   const { page, doc } = makePage(t, base, `?id=${task.id}`);
   await page.busy;
@@ -472,9 +473,11 @@ test('验收: prompt 与日志里写 <img src=x onerror=alert(1)>：原样显示
   // 这串文字原样出现（标题 + 提示词 + 日志），没有被当 HTML 解析
   assert.ok((text.match(/<img src=x onerror=alert\(1\)>/g) ?? []).length >= 3, text);
   assert.ok(text.includes('<script>alert(2)</script>'));
-  // 没有真的 img / script 元素
+  assert.ok(text.includes('javascript:alert(9)'), '伪协议 prUrl 按文本原样显示');
+  // 没有真的 img / script 元素，也没有挂伪协议的链接
   assert.equal(findByTag(app, 'img').length, 0);
   assert.equal(findByTag(app, 'script').length, 0);
+  assert.equal(findAll(app, (n) => n.tagName === 'A' && n.getAttribute('href').startsWith('javascript:')).length, 0);
   // 全页只有导航（navHtml 静态串）用过 innerHTML，其余一律 textContent
   const htmlUsers = [...findAll(doc.getElementById('nav'), (n) => n._innerHTML !== ''),
     ...findAll(app, (n) => n._innerHTML !== '')];
@@ -657,6 +660,21 @@ test('日志超过 5000 行只保留最后 5000 行；原始 / 精简切换后�
   assert.equal(logView.children[0].textContent, '[stdout] 行 10');
   page.setLogMode('raw');
   assert.equal(logView.children.length, 5000);
+});
+
+test('超长日志（13 万行，超过 push(...lines) 的引擎参数上限）一次性加载不炸，仍只渲染最后 5000 行', async (t) => {
+  const { db, home, base } = await startServer(t);
+  // 已结束运行的日志一次性取回：130000 行 spread 进 push 在 Node 22.13 / 24 都会
+  // RangeError（Maximum call stack size exceeded），页面必须逐行入缓冲。
+  const lines = Array.from({ length: 130000 }, (_, i) => `[stdout] 行 ${i}`);
+  const { task } = seedFinishedRun(db, home, { logLines: lines });
+
+  const { page } = makePage(t, base, `?id=${task.id}`);
+  await page.busy;
+  const logView = page.refs.logView;
+  assert.equal(logView.children.length, 5000);
+  assert.equal(logView.children[0].textContent, '[stdout] 行 125000', '丢掉最旧的 125000 行');
+  assert.equal(logView.children[4999].textContent, '[stdout] 行 129999');
 });
 
 test('原始 / 精简切换：精简只留 assistant 文本、工具名、result；原始恢复全文', async (t) => {
