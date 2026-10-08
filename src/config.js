@@ -31,6 +31,10 @@ export const DEFAULT_CONFIG = deepFreeze({
   // —— issue #9 新增（调度器：限流退避与失败现场保留），按约定追加在对象末尾 ——
   rateLimitBackoffMinutes: 15,
   keepFailedWorktrees: false,
+  // —— issue #12 新增（失败自动诊断），按约定追加在对象末尾 ——
+  autoDiagnose: true,          // 普通失败且还有重试次数时，先用便宜模型诊断再重跑
+  diagnoseModel: 'glm-5.3-flash', // 诊断用的便宜模型
+  diagnoseTimeoutMinutes: 5,   // 诊断超时（诊断不该比任务本身还久）
 });
 
 /**

@@ -167,6 +167,17 @@ const MIGRATIONS = [
       CREATE INDEX idx_task_deps_depends_on ON task_deps (depends_on);
     `);
   },
+  // 版本 4：runs 加 kind / diagnosis（issue #12 失败自动诊断）。kind 区分普通执行（task）
+  // 与失败诊断（diagnosis）运行——诊断也是一次真实调用，同样写 quota_units 参与额度统计；
+  // diagnosis 存诊断文本，写在**被诊断的那次失败运行**行上（诊断运行自己的行保持 NULL）。
+  // 已有行由 DEFAULT 'task' 回填，CHECK 只拦住今后的脏值。
+  (db) => {
+    db.exec(`
+      ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'task'
+                       CHECK (kind IN ('task', 'diagnosis'));
+      ALTER TABLE runs ADD COLUMN diagnosis TEXT NULL;
+    `);
+  },
 ];
 
 /**

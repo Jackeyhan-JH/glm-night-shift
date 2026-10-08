@@ -2,6 +2,8 @@
 // 和 Git 集成（#8）串成一条流水线：定时看队列 → 额度与高峰允许时领任务 →
 // 建缓存/worktree → 跑 Claude → 跑测试 → 提交 → 推送 → 开 PR → 清 worktree，
 // 全程处理失败重试、超时、限流退避、取消（别的进程改库）与停机。
+// 普通失败且还有重试次数时，先跑一次失败诊断（#12 src/diagnose.js）再把任务放回
+// 队列；下次领取时把诊断附进重试的 prompt。
 //
 // 时间：所有「现在」都取注入的 clock（quota/gate/notBefore/pausedUntil/执行器日志
 // 时间戳），只有轮询间隔（pollSeconds）与取消轮询（cancelPollMs）用真实定时器。
@@ -10,17 +12,20 @@
 // 健壮性：tick() 串行（两次重叠的调用排队执行，绝不超发），永不让异常逃出轮询；
 // 单个任务流水线里的任何一步抛错都按「普通失败」兜住，绝不拖垮调度循环。
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import { isPeak, getStatus } from './peak.js';
 import { usage as quotaUsage, canStart, multiplierFor } from './quota.js';
 import * as gateModule from './gate.js';
 import { formatLocalMinute } from './format.js';
-import { runTask } from './runner.js';
+import { runTask, runEvents } from './runner.js';
+import { diagnose as diagnoseTask } from './diagnose.js';
 import * as gitModule from './git.js';
 import {
   InvalidTransitionError,
   claimNextTask,
   claimTaskById,
   finishTask,
+  getRun,
   getTask,
   listRuns,
   recoverStaleRunning,
@@ -28,6 +33,8 @@ import {
 
 /** 额度统计回看的运行条数上限（7 天窗口内的运行数远低于此即可）。 */
 const USAGE_RUN_LIMIT = 10_000;
+/** 找「最近一条带诊断的运行」时回看的运行条数上限（#12）。 */
+const DIAGNOSIS_LOOKUP_LIMIT = 1000;
 const MS_PER_WEEK = 7 * 24 * 60 * 60_000;
 /** 「测试失败」错误信息里保留的输出末尾字符数（按码点截断）。 */
 const TEST_ERROR_TAIL_CHARS = 500;
@@ -42,7 +49,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  * @param {object} options.config 配置（loadConfig 的结果；用 concurrency / pollSeconds /
  *   plan / weekStart / safetyRatio / allowPeak / maxAttempts / rateLimitBackoffMinutes /
  *   keepFailedWorktrees / timeoutMinutes / killGraceSeconds / difficulty /
- *   remoteUrlTemplate / ghBin …）
+ *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin …）
  * @param {string} options.home 数据目录（仓库缓存、worktree、日志都在它下面）
  * @param {() => Date} [options.clock] 取「现在」；缺省真实时间，测试注入可调时钟
  * @param {Function} [options.runner] 执行器，缺省 #7 的 runTask（签名见其 JSDoc）
@@ -51,6 +58,8 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   commitAll / pushBranch / createPr / removeWorktree / prTitle / buildPrBody）
  * @param {object} [options.gate] 高峰/额度闸门模块，缺省 src/gate.js（只需提供
  *   startDecision；测试注入假替身以覆盖「领取后二次确认不通过」的退回路径）
+ * @param {Function} [options.diagnoser] 失败诊断函数，缺省 #12 的 src/diagnose.js 的
+ *   diagnose（测试可注入假替身）
  * @param {number} [options.cancelPollMs=1000] 轮询「运行中任务是否在库里被取消」的间隔
  * @param {object} [options.env=process.env] 子进程环境变量的基底，**原样**（不做任何
  *   清洗）传给 runner 的 `env` 参数和 git.createPr / findOpenPr 的 `env` 选项。
@@ -66,6 +75,7 @@ const STALE_INFO_PATTERN = /stale info/i;
 export function createScheduler({
   db, config, home,
   clock = () => new Date(), runner = runTask, git = gitModule, gate = gateModule,
+  diagnoser = diagnoseTask,
   cancelPollMs = 1000, env = process.env,
 } = {}) {
   assertObject(db, 'db');
@@ -75,6 +85,7 @@ export function createScheduler({
   }
   if (typeof clock !== 'function') throw new TypeError(`clock 必须是函数，收到：${describe(clock)}`);
   if (typeof runner !== 'function') throw new TypeError(`runner 必须是函数，收到：${describe(runner)}`);
+  if (typeof diagnoser !== 'function') throw new TypeError(`diagnoser 必须是函数，收到：${describe(diagnoser)}`);
   assertObject(git, 'git');
   if (typeof cancelPollMs !== 'number' || !Number.isFinite(cancelPollMs) || cancelPollMs <= 0) {
     throw new TypeError(`cancelPollMs 必须是正的有限数字，收到：${describe(cancelPollMs)}`);
@@ -397,12 +408,63 @@ export function createScheduler({
       }
     };
 
-    /** 普通失败：还有尝试次数就排回队列，否则落终态 failed。 */
-    const failNormal = (lastError) => (
-      task.attempts < task.maxAttempts
-        ? finish('queued', { lastError })
-        : finish('failed', { lastError })
-    );
+    /**
+     * 普通失败：还有尝试次数就（可选，#12）先诊断再排回队列，否则落终态 failed。
+     * diagnoseRun 是刚结束的运行结果——只有执行器阶段的失败（failed / timeout）才
+     * 诊断：有失败运行与它的日志可看。限流 / 停机中断 / 取消 / 没有改动走各自专门
+     * 的收尾路径（不诊断）；最后一次失败（次数用尽）也不诊断（issue #12）。
+     */
+    const failNormal = async (lastError, { diagnoseRun = null } = {}) => {
+      if (task.attempts >= task.maxAttempts) {
+        finish('failed', { lastError });
+        return;
+      }
+      if (diagnoseRun !== null && config.autoDiagnose === true) {
+        await maybeDiagnose(diagnoseRun);
+      }
+      finish('queued', { lastError });
+    };
+
+    /**
+     * 失败自动诊断（#12）：取失败运行的完整行 → 过一遍闸门（按 diagnoseModel 与任务的
+     * allowPeak；被高峰 / 额度拦下就跳过，原因记进失败运行的日志）→ 发 diagnose 阶段
+     * 事件并跑诊断。这时任务仍是 running（failNormal 在诊断结束后才排队），看板能看到
+     * 它在诊断。诊断自身的任何意外都不影响重试：记日志后照常返回。
+     */
+    const maybeDiagnose = async (runOutcome) => {
+      const failedRun = getRun(db, runOutcome.runId);
+      // run 行不在（注入的假 runner 不写库等）：没有失败日志可看，无从诊断
+      if (failedRun === null || failedRun.kind !== 'task') return;
+      const nowEach = nowDate();
+      const decision = gate.startDecision({
+        now: nowEach,
+        model: config.diagnoseModel,
+        allowPeak: task.allowPeak,
+        configAllowPeak: config.allowPeak,
+        usage: usageAt(nowEach),
+        safetyRatio: config.safetyRatio,
+      });
+      if (!decision.ok) {
+        logDiagnosisSkip(failedRun, decision.reason, decision.retryAt);
+        return;
+      }
+      try {
+        await stage('diagnose', () => diagnoser({
+          task,
+          failedRun,
+          config,
+          db,
+          home,
+          signal: controller.signal,
+          clock,
+          env,
+        }));
+      } catch (err) {
+        // 诊断失败（超时 / 出错 / 限流）不影响重试：run 行由 diagnose 如实记录，
+        // runs.diagnosis 留空，任务照常排回队列
+        console.error(`[night-shift] 任务 ${task.id} 的诊断未完成（不影响重试）：`, err);
+      }
+    };
 
     /** 任务是否已在库里被别的进程（命令行/看板）取消。 */
     const canceledInDb = () => getTask(db, task.id)?.status === 'canceled';
@@ -416,7 +478,7 @@ export function createScheduler({
           return git.createWorktree({ home, repo: task.repo, task, baseBranch });
         });
 
-        // 2. 执行器（extraPrompt 由 #12 的失败诊断提供，本条先传 null）
+        // 2. 执行器（#12：最近一条带诊断的运行文本作为 extraPrompt 附进重试的 prompt）
         const run = await stage('run', () => runner({
           task,
           workdir: worktree.path,
@@ -425,7 +487,7 @@ export function createScheduler({
           home,
           signal: controller.signal,
           attempt: task.attempts,
-          extraPrompt: null,
+          extraPrompt: latestDiagnosis(task.id),
           clock,
           env,
         }));
@@ -455,7 +517,8 @@ export function createScheduler({
           break pipeline;
         }
         if (run.status !== 'succeeded') {
-          failNormal(`run: ${run.error ?? String(run.status)}`);
+          // 普通失败 / 超时：还有次数 → 先诊断（可配置）再排回队列
+          await failNormal(`run: ${run.error ?? String(run.status)}`, { diagnoseRun: run });
           break pipeline;
         }
 
@@ -466,7 +529,7 @@ export function createScheduler({
           config,
         }));
         if (!testResult.ok) {
-          failNormal(`测试失败：${tailByCodePoints(testResult.output, TEST_ERROR_TAIL_CHARS)}`);
+          await failNormal(`测试失败：${tailByCodePoints(testResult.output, TEST_ERROR_TAIL_CHARS)}`);
           break pipeline;
         }
         if (canceledInDb()) {
@@ -529,7 +592,7 @@ export function createScheduler({
       const prefix = currentStage === 'run' ? 'run: ' : 'git: ';
       const lastError = `${prefix}${err instanceof Error ? err.message : String(err)}`;
       try {
-        failNormal(lastError);
+        await failNormal(lastError);
       } catch (finishErr) {
         // 连失败都写不进去（库坏了等）：如实报告，别让收尾再炸一次
         console.error(`[night-shift] 记录任务 ${task.id} 的失败结果时出错：`, finishErr);
@@ -639,6 +702,50 @@ export function createScheduler({
   }
 
   // ---------------------------------------------------------------- 小工具
+
+  /**
+   * 诊断被闸门拦下（高峰 / 额度）时，把原因补记进失败运行日志的末尾（meta 行，与
+   * 执行器的日志格式一致），并照发 runEvents 的 log 事件——跳过了诊断就没有新的 run
+   * 行可写，失败运行自己的日志是唯一能留痕、看板也看得到的地方。
+   */
+  function logDiagnosisSkip(failedRun, reason, retryAt) {
+    const reasonText = { peak: '高峰期', 'five-hour': '五小时额度', weekly: '周额度' }[reason]
+      ?? String(reason);
+    const line = `诊断被跳过：${reasonText}`
+      + (retryAt instanceof Date && !Number.isNaN(retryAt.getTime())
+        ? `（${retryAt.toISOString()} 后可再试）`
+        : '');
+    const ts = nowDate().toISOString();
+    if (typeof failedRun.logPath === 'string' && failedRun.logPath !== '') {
+      try {
+        fs.appendFileSync(failedRun.logPath, `${ts} [meta] ${line}\n`);
+      } catch (err) {
+        console.error(`[night-shift] 补记诊断跳过原因到 ${failedRun.logPath} 失败：`, err);
+      }
+    }
+    try {
+      runEvents.emit('log', {
+        taskId: failedRun.taskId, runId: failedRun.id, stream: 'meta', line, ts,
+      });
+    } catch (err) {
+      console.error('[night-shift] 诊断跳过日志事件的监听器出错：', err);
+    }
+  }
+
+  /**
+   * 任务最近一条带诊断文本的运行（#12）：领取后传给 runner 的 extraPrompt，附进重试
+   * 的 prompt。没有诊断（首次运行 / 诊断失败）返回 null。
+   */
+  function latestDiagnosis(taskId) {
+    try {
+      const withDiag = listRuns(db, { taskId, limit: DIAGNOSIS_LOOKUP_LIMIT })
+        .find((run) => run.diagnosis !== null && run.diagnosis !== undefined);
+      return withDiag === undefined ? null : withDiag.diagnosis;
+    } catch (err) {
+      console.error(`[night-shift] 读取任务 ${taskId} 的历史诊断失败（本次不附带）：`, err);
+      return null;
+    }
+  }
 
   function nowDate() {
     const d = clock();

@@ -1,6 +1,6 @@
 // 执行器（issue #7）：在一个目录里无人值守地跑一次 Claude Code，把输出逐行记进日志，
-// 按规则判定本次运行的状态，并写进 runs 表。只管执行单个任务；git / 排队 / 重试 /
-// 诊断由 #8、#9、#12 负责。
+// 按规则判定本次运行的状态，并写进 runs 表。只管执行单个任务；git / 排队 / 重试由
+// #8、#9 负责；#12 的失败诊断（src/diagnose.js）复用这里的执行核心 invokeClaude。
 //
 // 进程控制：spawn 用 detached（子进程自成进程组），超时与取消时先
 // process.kill(-pid, 'SIGTERM')，killGrace 后仍存活再 SIGKILL，把 Claude Code 自己
@@ -21,7 +21,7 @@ import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { isPeak } from './peak.js';
 import { runCost } from './quota.js';
-import { startRun, setRunLogPath, finishRun } from './tasks.js';
+import { RUN_KINDS, startRun, setRunLogPath, finishRun } from './tasks.js';
 
 /**
  * 运行事件总线（给 #14 的 SSE 和 #10 的命令行用）。事件：
@@ -77,8 +77,9 @@ export function buildPrompt(task, { extraPrompt = null } = {}) {
 }
 
 /**
- * 跑一次任务。流程：解析难度 → 建日志与 run 行 → spawn claude → 逐行记日志 →
- * 子进程结束后按规则判定状态、finishRun 写库 → 日志落盘后 resolve。
+ * 跑一次任务。流程：解析难度与思考预算 → 组装 prompt 与子进程环境 → 交给 invokeClaude
+ * （与 #12 失败诊断共用的执行核心：建 run 行、spawn claude、逐行记日志、判定状态、
+ * finishRun 写库）。
  *
  * 自身不因运行失败抛异常（spawn ENOENT / 超时 / 取消都算一次正常的 failed /
  * timeout / canceled 结果）；只有参数错误才 reject（缺 task / workdir / db / home /
@@ -133,17 +134,6 @@ export async function runTask({
   if (typeof theKillGraceMs !== 'number' || !Number.isFinite(theKillGraceMs) || theKillGraceMs < 0) {
     throw new TypeError(`killGraceMs 必须是不小于 0 的有限数字，当前值：${String(killGraceMs)}`);
   }
-  // 子进程 exit 后等 close 的宽限：短于击杀宽限（正常 close 只差几毫秒），防止孤儿
-  // 进程抱着管道把 runTask 拖到超时。
-  const stdioGraceMs = Math.min(STDIO_GRACE_MAX_MS, theKillGraceMs);
-
-  const startedAt = clock();
-  if (!(startedAt instanceof Date) || Number.isNaN(startedAt.getTime())) {
-    throw new TypeError('clock() 必须返回合法的 Date');
-  }
-  const peak = isPeak(startedAt);
-  const quotaUnits = runCost({ model, startedAt }); // 非限流运行的扣减量（倍率取开始时刻）
-  const prompt = buildPrompt(task, { extraPrompt });
 
   // 子进程环境：拷贝基底再设 / 删思考预算。为 0 时必须删掉——外层环境里若真设了
   // MAX_THINKING_TOKENS，不删就会被 claude 继承，等于偷偷给 easy 任务开思考。
@@ -154,9 +144,84 @@ export async function runTask({
     delete childEnv.MAX_THINKING_TOKENS;
   }
 
+  return invokeClaude({
+    taskId: task.id,
+    attempt,
+    model,
+    effort,
+    promptText: buildPrompt(task, { extraPrompt }),
+    extraArgs: CLAUDE_ARGS,
+    childEnv,
+    workdir,
+    timeoutMs: theTimeoutMs,
+    killGraceMs: theKillGraceMs,
+    config,
+    db,
+    home,
+    signal,
+    clock,
+  });
+}
+
+/**
+ * （#12 从 runTask 抽出的执行核心，本模块的 runTask 与 src/diagnose.js 共用。）
+ * 跑一次 claude 调用并把它记成一条 run：建 run 行（拿到 id 拼日志路径）→ 建日志流 →
+ * spawn（detached 进程组；旗标由调用方决定——任务运行带 --dangerously-skip-permissions，
+ * 诊断只读不带）→ 逐行记日志、发 runEvents → 子进程结束后按 #7 的规则判定状态、
+ * finishRun 写库 → 日志落盘后 resolve。进程控制 / 内存上限 / 孤儿清场的语义见模块头。
+ *
+ * 自身不因运行失败抛异常（spawn ENOENT / 超时 / 取消都算一次正常的 failed / timeout /
+ * canceled 结果，run 行与日志照常产生）；只有参数错误才 reject（见 assertInvokeArgs）。
+ *
+ * @param {object} options
+ * @param {number} options.taskId 正整数
+ * @param {number} options.attempt 写进 runs.attempt（诊断运行传被诊断运行的 attempt）
+ * @param {('task'|'diagnosis')} [options.kind='task'] 运行类型（#12）
+ * @param {string} options.model 模型名（记进 run 行；额度倍率也按它算）
+ * @param {string} options.effort 思考强度（记进 run 行；诊断固定 'low'）
+ * @param {string} options.promptText `-p` 的参数（调用方组装好：任务 prompt 或诊断 prompt）
+ * @param {string[]} options.extraArgs `--model <model>` 之后再追加的旗标（runTask 传
+ *   CLAUDE_ARGS；诊断传只读旗标，不含 --dangerously-skip-permissions）
+ * @param {object} options.childEnv 子进程环境变量（**已按需设 / 删好**思考预算，原样
+ *   传给 spawn，本函数不再改动）
+ * @param {string} options.workdir 工作目录（须已存在；子进程的 cwd）
+ * @param {number} options.timeoutMs 超时毫秒数（正的有限数字）
+ * @param {number} options.killGraceMs SIGTERM 后等多少毫秒再 SIGKILL（≥ 0）
+ * @param {object} options.config 配置（用 claudeBin）
+ * @param {import('node:sqlite').DatabaseSync} options.db
+ * @param {string} options.home 数据目录，日志写到 `<home>/logs/task-<taskId>/run-<runId>.log`
+ * @param {AbortSignal} [options.signal] 触发即取消；调用时已 aborted 则不启动子进程
+ * @param {() => Date} [options.clock] 取「现在」（高峰判断、额度倍率、日志时间戳）
+ * @returns {Promise<{runId: number, status: 'succeeded'|'failed'|'timeout'|'canceled',
+ *   exitCode: ?number, signal: ?string, numTurns: ?number, isError: ?boolean,
+ *   summary: ?string, error: ?string, rateLimited: boolean, model: string, effort: string,
+ *   peak: boolean, quotaUnits: number, durationMs: number, logPath: string}>}
+ *   结果对象与 runTask 相同（summary 是 result 行文本按码点截 2000 字符——#12 的诊断
+ *   文本也用它）。
+ */
+export async function invokeClaude({
+  taskId, attempt, kind = 'task', model, effort, promptText, extraArgs,
+  childEnv, workdir, timeoutMs, killGraceMs, config, db, home, signal,
+  clock = () => new Date(),
+} = {}) {
+  assertInvokeArgs({
+    taskId, attempt, kind, model, effort, promptText, extraArgs, childEnv,
+    workdir, timeoutMs, killGraceMs, config, db, home, signal, clock,
+  });
+  // 子进程 exit 后等 close 的宽限：短于击杀宽限（正常 close 只差几毫秒），防止孤儿
+  // 进程抱着管道把 runTask 拖到超时。
+  const stdioGraceMs = Math.min(STDIO_GRACE_MAX_MS, killGraceMs);
+
+  const startedAt = clock();
+  if (!(startedAt instanceof Date) || Number.isNaN(startedAt.getTime())) {
+    throw new TypeError('clock() 必须返回合法的 Date');
+  }
+  const peak = isPeak(startedAt);
+  const quotaUnits = runCost({ model, startedAt }); // 非限流运行的扣减量（倍率取开始时刻）
+
   // 先建 run 行拿到 id（日志路径里要用它），再补写真实日志路径（见 setRunLogPath）。
-  const run = startRun(db, { taskId: task.id, attempt, model, effort, peak, logPath: '' });
-  const logDir = path.join(home, 'logs', `task-${task.id}`);
+  const run = startRun(db, { taskId, attempt, kind, model, effort, peak, logPath: '' });
+  const logDir = path.join(home, 'logs', `task-${taskId}`);
   let logStream;
   let logPath;
   try {
@@ -174,7 +239,6 @@ export async function runTask({
   }
   logStream.on('error', () => { /* 写日志失败不影响运行结果；流销毁后 endLog 也能返回 */ });
 
-  const taskId = task.id;
   const runId = run.id;
   // 日志写不进去（磁盘满 / 权限等，流已 destroyed）时跳过写入、事件照发——实时日志
   // 的消费者（SSE）不该跟着断流，运行结果更不该受影响。
@@ -279,7 +343,7 @@ export async function runTask({
     state.abortReason = signal.reason;
     writeLine('meta', `收到中止信号（reason=${describeReason(signal.reason)}），对进程组发 SIGTERM`);
     killGroup('SIGTERM');
-    graceTimer = setTimeout(() => killGroup('SIGKILL'), theKillGraceMs);
+    graceTimer = setTimeout(() => killGroup('SIGKILL'), killGraceMs);
   };
 
   // 子进程退出 / spawn 失败 / 未启动，殊途同归到这里：判状态 → 写库 → 补结尾日志 →
@@ -312,7 +376,7 @@ export async function runTask({
 
   // 判定 + finishRun + 结尾 meta 行；返回给调用方的结果对象。
   const recordOutcome = () => {
-    const judged = judge(state, theTimeoutMs);
+    const judged = judge(state, timeoutMs);
     const numTurns = state.result !== null && Number.isInteger(state.result.numTurns)
       && state.result.numTurns >= 0 ? state.result.numTurns : null;
     const row = finishRun(db, runId, {
@@ -348,7 +412,7 @@ export async function runTask({
   };
 
   emitEvent('start', { taskId, runId, logPath });
-  writeLine('meta', `开始 model=${model} effort=${effort} thinking=${thinkingTokens}`
+  writeLine('meta', `开始 model=${model} effort=${effort} thinking=${childEnv.MAX_THINKING_TOKENS ?? 0}`
     + ` peak=${peak} cwd=${workdir}`);
 
   // 调用前 signal 已中止：不启动子进程，按取消 / 停机规则记录（run 行与日志照常产生）。
@@ -360,7 +424,7 @@ export async function runTask({
     return completion;
   }
 
-  child = spawn(config.claudeBin, ['-p', prompt, '--model', model, ...CLAUDE_ARGS], {
+  child = spawn(config.claudeBin, ['-p', promptText, '--model', model, ...extraArgs], {
     cwd: workdir,
     env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -405,10 +469,10 @@ export async function runTask({
     // 已按取消处理，或子进程赶在超时前已退出（close 可能还在路上）：都不再改写状态
     if (state.aborted || state.exitCode !== null) return;
     state.timeout = true;
-    writeLine('meta', `超时 ${minutesLabel(theTimeoutMs)} 分钟，对进程组发 SIGTERM`);
+    writeLine('meta', `超时 ${minutesLabel(timeoutMs)} 分钟，对进程组发 SIGTERM`);
     killGroup('SIGTERM');
-    graceTimer = setTimeout(() => killGroup('SIGKILL'), theKillGraceMs);
-  }, theTimeoutMs);
+    graceTimer = setTimeout(() => killGroup('SIGKILL'), killGraceMs);
+  }, timeoutMs);
 
   return completion;
 
@@ -527,6 +591,68 @@ function makeLineSink(onLine) {
 
 // ---------------------------------------------------------------- 小工具
 
+/** invokeClaude 的参数校验（runTask 的入参已各自校验过，这里兜独立调用方，如 #12 诊断）。 */
+function assertInvokeArgs({
+  taskId, attempt, kind, model, effort, promptText, extraArgs, childEnv,
+  workdir, timeoutMs, killGraceMs, config, db, home, signal, clock,
+}) {
+  if (!Number.isInteger(taskId) || taskId < 1) {
+    throw new TypeError(`taskId 必须是正整数，收到：${describe(taskId)}`);
+  }
+  if (!Number.isInteger(attempt) || attempt < 1) {
+    throw new TypeError(`attempt 必须是正整数，收到：${describe(attempt)}`);
+  }
+  if (!RUN_KINDS.includes(kind)) {
+    throw new TypeError(`kind 必须是 ${RUN_KINDS.join(' | ')} 之一，收到：${describe(kind)}`);
+  }
+  if (typeof model !== 'string' || model.trim() === '') {
+    throw new TypeError(`model 必须是非空字符串，收到：${describe(model)}`);
+  }
+  if (typeof effort !== 'string' || effort.trim() === '') {
+    throw new TypeError(`effort 必须是非空字符串，收到：${describe(effort)}`);
+  }
+  if (typeof promptText !== 'string' || promptText.trim() === '') {
+    throw new TypeError(`promptText 必须是非空字符串，收到：${describe(promptText)}`);
+  }
+  if (!Array.isArray(extraArgs) || extraArgs.some((arg) => typeof arg !== 'string')) {
+    throw new TypeError(`extraArgs 必须是字符串数组，收到：${describe(extraArgs)}`);
+  }
+  if (childEnv === null || typeof childEnv !== 'object') {
+    throw new TypeError(`childEnv 必须是环境变量对象，收到：${describe(childEnv)}`);
+  }
+  if (typeof workdir !== 'string' || workdir.trim() === '') {
+    throw new TypeError(`workdir 必须是非空字符串（工作目录），收到：${describe(workdir)}`);
+  }
+  if (!fs.existsSync(workdir) || !fs.statSync(workdir).isDirectory()) {
+    throw new TypeError(`workdir 必须是已存在的目录：${workdir}`);
+  }
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`timeoutMs 必须是正的有限数字，当前值：${String(timeoutMs)}`);
+  }
+  if (typeof killGraceMs !== 'number' || !Number.isFinite(killGraceMs) || killGraceMs < 0) {
+    throw new TypeError(`killGraceMs 必须是不小于 0 的有限数字，当前值：${String(killGraceMs)}`);
+  }
+  if (config === null || typeof config !== 'object') {
+    throw new TypeError(`缺 config 参数（配置对象），收到：${describe(config)}`);
+  }
+  if (typeof config.claudeBin !== 'string' || config.claudeBin.trim() === '') {
+    throw new TypeError(`config.claudeBin 必须是非空字符串，收到：${describe(config.claudeBin)}`);
+  }
+  if (db === null || typeof db !== 'object') {
+    throw new TypeError(`缺 db 参数（node:sqlite DatabaseSync），收到：${describe(db)}`);
+  }
+  if (typeof home !== 'string' || home.trim() === '') {
+    throw new TypeError(`home 必须是非空字符串（数据目录），收到：${describe(home)}`);
+  }
+  if (signal !== undefined && signal !== null
+      && (typeof signal !== 'object' || typeof signal.addEventListener !== 'function')) {
+    throw new TypeError(`signal 必须是 AbortSignal，收到：${describe(signal)}`);
+  }
+  if (typeof clock !== 'function') {
+    throw new TypeError(`clock 必须是函数，收到：${describe(clock)}`);
+  }
+}
+
 function assertArguments({ task, workdir, config, db, home, signal, extraPrompt, clock, env }) {
   if (task === null || typeof task !== 'object') {
     throw new TypeError(`runTask 缺 task 参数（任务对象），收到：${describe(task)}`);
@@ -578,8 +704,8 @@ function describeReason(reason) {
   return String(reason);
 }
 
-/** 按 Unicode 码点截断（不把 emoji / 中文切半个），仅在超长时才复制。 */
-function truncateByCodePoints(text, maxChars) {
+/** 按 Unicode 码点截断（不把 emoji / 中文切半个），仅在超长时才复制。导出给 #12 诊断用。 */
+export function truncateByCodePoints(text, maxChars) {
   const value = String(text);
   if ([...value].length <= maxChars) return value;
   return [...value].slice(0, maxChars).join('');

@@ -16,6 +16,8 @@ import { DEFAULT_CONFIG } from './config.js';
 export const TASK_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'canceled'];
 /** runs.status 的全部合法值。 */
 export const RUN_STATUSES = ['running', 'succeeded', 'failed', 'timeout', 'canceled'];
+/** runs.kind 的全部合法值（#12）：task 普通执行 / diagnosis 失败诊断。 */
+export const RUN_KINDS = ['task', 'diagnosis'];
 /** tasks.difficulty 的全部合法值。 */
 export const DIFFICULTIES = ['easy', 'medium', 'hard'];
 
@@ -134,6 +136,10 @@ export class DependencyBlockedError extends InvalidTransitionError {
  * @property {?number} numTurns
  * @property {number} prompts
  * @property {?number} quotaUnits
+ * @property {('task'|'diagnosis')} kind 运行类型（#12）：task 普通执行 / diagnosis
+ *   失败诊断（诊断也是一次真实调用，同样计额度）
+ * @property {?string} diagnosis 诊断文本（≤2000 字符）；写在**被诊断的那次失败运行**行上，
+ *   诊断运行自己的行与其他运行为 null
  * @property {string} logPath
  * @property {string} startedAt UTC ISO
  * @property {?string} finishedAt UTC ISO
@@ -590,13 +596,15 @@ export function recoverStaleRunning(db) {
  * @param {string} input.model 非空
  * @param {string} input.effort 非空
  * @param {boolean} input.peak 开始时是否高峰
+ * @param {('task'|'diagnosis')} [input.kind='task'] 运行类型（#12）：诊断运行传
+ *   'diagnosis'（attempt 与被诊断的失败运行相同）
  * @param {string} input.logPath 空串或非空字符串。空串合法：#7 的 runTask 先 startRun
  *   拿到 id（日志路径里要用它），再立刻 setRunLogPath 补上真实路径；纯空白仍然非法。
  * @returns {RunRow} 新建的 run
  * @throws {ValidationError} 任一字段缺失或类型不对（err.field 指明字段）
  * @throws {NotFoundError} 任务不存在
  */
-export function startRun(db, { taskId, attempt, model, effort, peak, logPath } = {}) {
+export function startRun(db, { taskId, attempt, model, effort, peak, kind = 'task', logPath } = {}) {
   assertPositiveInt(taskId, 'taskId');
   assertPositiveInt(attempt, 'attempt');
   const theModel = requiredTrimmed(model, 'model');
@@ -604,15 +612,18 @@ export function startRun(db, { taskId, attempt, model, effort, peak, logPath } =
   if (typeof peak !== 'boolean') {
     throw new ValidationError('peak', `必须是布尔值（当前值：${peak}）`);
   }
+  if (!RUN_KINDS.includes(kind)) {
+    throw new ValidationError('kind', `必须是 ${RUN_KINDS.join(' | ')} 之一（当前值：${kind}）`);
+  }
   // 空串放行（见上），其余交给 requiredTrimmed：非字符串 / 纯空白照样报错。
   const theLogPath = logPath === '' ? '' : requiredTrimmed(logPath, 'logPath');
   taskRow(db, taskId); // 任务不存在时抛 NotFoundError
   const now = nowIso();
   const row = db.prepare(`
-    INSERT INTO runs (task_id, attempt, model, effort, peak, status, prompts, log_path, started_at)
-    VALUES (?, ?, ?, ?, ?, 'running', 1, ?, ?)
+    INSERT INTO runs (task_id, attempt, model, effort, peak, status, prompts, kind, log_path, started_at)
+    VALUES (?, ?, ?, ?, ?, 'running', 1, ?, ?, ?)
     RETURNING *
-  `).get(taskId, attempt, theModel, theEffort, peak ? 1 : 0, theLogPath, now);
+  `).get(taskId, attempt, theModel, theEffort, peak ? 1 : 0, kind, theLogPath, now);
   return rowToRun(row);
 }
 
@@ -710,18 +721,46 @@ export function finishRun(db, runId, { status, exitCode, numTurns, prompts, quot
 }
 
 /**
+ * 把诊断文本写到一次运行的 runs.diagnosis 上（#12）。诊断写在**被诊断的那次失败运行**
+ * 行上；诊断运行自己的行不写（它的结果就是这段文本的来源）。单条 UPDATE，无状态守卫
+ * （失败运行早已结束，不存在并发改写结果的窗口）；run 不存在时抛 NotFoundError。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} runId 正整数
+ * @param {?string} text 诊断文本（非空白字符串；null = 清空）
+ * @returns {RunRow} 更新后的 run
+ * @throws {ValidationError} runId 非正整数，或 text 不是非空白字符串 / null（field='diagnosis'）
+ * @throws {NotFoundError} run 不存在
+ */
+export function setRunDiagnosis(db, runId, text) {
+  assertPositiveInt(runId, 'runId');
+  if (text !== null && (typeof text !== 'string' || text.trim() === '')) {
+    throw new ValidationError('diagnosis', `必须是非空白字符串或 null（当前值：${text}）`);
+  }
+  const row = db.prepare('UPDATE runs SET diagnosis = ? WHERE id = ? RETURNING *')
+    .get(text, runId);
+  if (row === undefined) throw new NotFoundError(runId, 'run');
+  return rowToRun(row);
+}
+
+/**
  * 运行记录列表：started_at DESC → id DESC（同毫秒开始的按新 id 在前）。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {object} [options]
  * @param {number} [options.taskId] 正整数，按任务过滤
+ * @param {('task'|'diagnosis')} [options.kind] 按运行类型过滤（#12）：'diagnosis' 只看
+ *   诊断运行，'task' 只看普通执行；缺省看全部
  * @param {Date|string} [options.since] 只取 started_at >= since（含等于）；字符串须能被
  *   Date.parse 解析，比较前统一规范化成 UTC ISO
  * @param {number} [options.limit=100] 正整数
  * @returns {RunRow[]}
- * @throws {ValidationError} taskId / limit 非正整数，或 since 不是合法时间（field='since'）
+ * @throws {ValidationError} taskId / limit 非正整数、kind 不在枚举里（field='kind'），
+ *   或 since 不是合法时间（field='since'）
  */
-export function listRuns(db, { taskId, since, limit = 100 } = {}) {
+export function listRuns(db, { taskId, kind, since, limit = 100 } = {}) {
   if (taskId !== undefined) assertPositiveInt(taskId, 'taskId');
+  if (kind !== undefined && !RUN_KINDS.includes(kind)) {
+    throw new ValidationError('kind', `必须是 ${RUN_KINDS.join(' | ')} 之一（当前值：${kind}）`);
+  }
   const sinceIso = since === undefined ? undefined : toIso(since, 'since');
   assertPositiveInt(limit, 'limit');
   const where = [];
@@ -729,6 +768,10 @@ export function listRuns(db, { taskId, since, limit = 100 } = {}) {
   if (taskId !== undefined) {
     where.push('task_id = ?');
     params.push(taskId);
+  }
+  if (kind !== undefined) {
+    where.push('kind = ?');
+    params.push(kind);
   }
   if (sinceIso !== undefined) {
     where.push('started_at >= ?');
@@ -1044,6 +1087,8 @@ function rowToRun(row) {
     numTurns: row.num_turns,
     prompts: row.prompts,
     quotaUnits: row.quota_units,
+    kind: row.kind,
+    diagnosis: row.diagnosis,
     logPath: row.log_path,
     startedAt: row.started_at,
     finishedAt: row.finished_at,

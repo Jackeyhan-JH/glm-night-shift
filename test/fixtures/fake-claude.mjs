@@ -14,6 +14,8 @@
 //                             「之前」装好信号处理器——init 行一到，之后任意时刻发信号，
 //                             行为都是确定的（hang 被 SIGTERM 杀出 143；stubborn 无视）。
 //   FAKE_CLAUDE_DELAY_MS    slow 场景的等待毫秒数（默认 2000，非法值按 2000）
+//   FAKE_CLAUDE_RESULT_TEXT 设了时 success（含 slow）场景 result 行的 result 用这个值
+//                           （默认仍是 'done'；#12 的失败诊断测试用它模拟诊断文本）
 //   FAKE_CLAUDE_SEQUENCE    逗号分隔的场景序列（如 fail,success）：第 N 次调用用第 N 个场景，
 //                           用完后一直用最后一个；优先于 FAKE_CLAUDE_SCENARIO（调度器 /
 //                           端到端测试用它模拟「先失败后成功」）。需同时设置
@@ -247,7 +249,7 @@ async function main() {
     clearInterval(ticker);
     appendFakeMd();
     process.stdout.write(assistantLine());
-    process.stdout.write(resultLine('success', false, 3, 'done'));
+    process.stdout.write(resultLine('success', false, 3, successResultText()));
     return 0;
   }
 
@@ -255,8 +257,13 @@ async function main() {
   if (scenario === 'success') appendFakeMd();
   process.stdout.write(initLine());
   process.stdout.write(assistantLine());
-  process.stdout.write(resultLine('success', false, 3, 'done'));
+  process.stdout.write(resultLine('success', false, 3, successResultText()));
   return 0;
+}
+
+/** success（含 slow）场景 result 行的 result 文本：FAKE_CLAUDE_RESULT_TEXT 覆盖，默认 'done'。 */
+function successResultText() {
+  return process.env.FAKE_CLAUDE_RESULT_TEXT ?? 'done';
 }
 
 main().then(

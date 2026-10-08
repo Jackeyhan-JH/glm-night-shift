@@ -247,6 +247,9 @@ test('验收·集成·失败重试：fail,success 序列，maxAttempts 2 → 第
   const stateFile = path.join(makeTempHome(t), 'sequence-state.txt');
   const ctx = setup(t, {
     taskSpecs: [{ maxAttempts: 2, title: 'flaky' }],
+    // #12 的失败诊断默认开启，会额外消耗序列里的一次假 claude 调用并多记一条 run；
+    // 本条只验证 #9 的重试语义，关掉它（诊断的集成测试见 test/diagnose*.test.js）
+    config: { autoDiagnose: false },
     env: { FAKE_CLAUDE_SEQUENCE: 'fail,success', FAKE_CLAUDE_STATE_FILE: stateFile },
   });
   const [task] = ctx.tasks;
@@ -268,6 +271,7 @@ test('验收·集成·失败重试：fail,success 序列，maxAttempts 2 → 第
 test('验收·集成·重试用尽：fail + maxAttempts 2 → 两轮后 failed', async (t) => {
   const ctx = setup(t, {
     taskSpecs: [{ maxAttempts: 2, title: 'always fail' }],
+    config: { autoDiagnose: false }, // 同上：本条只验证 #9 的重试用尽语义
     env: { FAKE_CLAUDE_SCENARIO: 'fail' },
   });
   const [task] = ctx.tasks;
@@ -299,7 +303,8 @@ test('验收·集成·测试失败：testCommand exit 1 → lastError 以「测�
 test('验收·集成·超时：hang + timeoutMinutes 0.01 → run 记 timeout，任务按重试规则排队', async (t) => {
   const ctx = setup(t, {
     taskSpecs: [{ maxAttempts: 2 }],
-    config: { timeoutMinutes: 0.01, killGraceSeconds: 1 },
+    // 超时也是普通失败，#12 默认会跟一次诊断（多一条 run）；本条只验证 #9 的超时语义
+    config: { timeoutMinutes: 0.01, killGraceSeconds: 1, autoDiagnose: false },
     env: { FAKE_CLAUDE_SCENARIO: 'hang' },
   });
   const [task] = ctx.tasks;
@@ -591,7 +596,8 @@ test('依赖·集成：重试用尽的上游 failed → 下游与下游的下游
       { title: 'mid', dependsOn: [1] },
       { title: 'leaf', dependsOn: [2] },
     ],
-    config: { concurrency: 3 }, // 并发槽位富余：没被领只能是依赖门挡住的
+    // #12 的失败诊断默认开启（上游第一轮失败会多一次诊断调用）；本条验证 #11 的级联语义
+    config: { concurrency: 3, autoDiagnose: false }, // 并发槽位富余：没被领只能是依赖门挡住的
     env: { FAKE_CLAUDE_SCENARIO: 'fail' },
   });
   const [up, mid, leaf] = ctx.tasks;
