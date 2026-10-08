@@ -526,12 +526,10 @@ test('验收: 正在运行的任务：SSE 逐行出现（共 10 行）、结束�
   await waitUntil(() => server.sseConnections === 0, { what: '服务端连接计数回到 0' });
 });
 
-test('验收: 有 diagnosis 的运行能展开看到诊断全文；没有 kind/diagnosis 的旧数据页面不报错', async (t) => {
+test('验收: 有 diagnosis 的运行能展开看到诊断全文；默认 kind=task 的运行页面不报错', async (t) => {
   const { db, home, base } = await startServer(t);
-  // kind / diagnosis 两列由 #12 的迁移加；这里直接 ALTER 模拟合并后的库，验证详情页
-  // 对「有这两个字段的新数据」和「没有的旧数据」都正常（rowToRun 做了透传）。
-  db.exec('ALTER TABLE runs ADD COLUMN kind TEXT');
-  db.exec('ALTER TABLE runs ADD COLUMN diagnosis TEXT');
+  // #12 已在 main：迁移版本 4 自带 runs.kind（NOT NULL DEFAULT 'task'）和 diagnosis。
+  // 不再 ALTER。未指定 kind 的运行是 task；缺 kind 的空单元格由 kindLabel 单测覆盖。
 
   const task = createTask(db, { repo: 'a/b', prompt: 'x' });
   claimTaskById(db, task.id);
@@ -558,11 +556,11 @@ test('验收: 有 diagnosis 的运行能展开看到诊断全文；没有 kind/d
   const { page, doc } = makePage(t, base, `?id=${task.id}`);
   await page.busy;
 
-  // 运行列表新到旧：run3（旧数据）、run2（诊断）、run1（执行 + 诊断全文）
+  // 运行列表新到旧：run3（默认 task）、run2（诊断）、run1（执行 + 诊断全文）
   const rows = page.refs.runsTBody.children.filter((n) => n.className.includes('run-row'));
   assert.equal(rows.length, 3);
   const kindCell = (row) => row.children[1].textContent;
-  assert.equal(kindCell(rows[0]), '', '旧数据没有 kind：类型列为空、页面不报错');
+  assert.equal(kindCell(rows[0]), '执行', '未指定 kind 时默认 task，页面显示「执行」且不报错');
   assert.equal(kindCell(rows[1]), '诊断');
   assert.equal(kindCell(rows[2]), '执行');
 

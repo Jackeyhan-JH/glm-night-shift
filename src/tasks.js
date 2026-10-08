@@ -1087,6 +1087,8 @@ function rowToRun(row) {
     numTurns: row.num_turns,
     prompts: row.prompts,
     quotaUnits: row.quota_units,
+    // #12 迁移（版本 4）的 runs.kind / runs.diagnosis，#16 详情页靠这里透传：
+    // kind 为空则类型列不显示，diagnosis 有值才展开。两边都留，不重复键。
     kind: row.kind,
     diagnosis: row.diagnosis,
     logPath: row.log_path,
@@ -1094,11 +1096,6 @@ function rowToRun(row) {
     finishedAt: row.finished_at,
     durationMs: row.duration_ms,
     error: row.error,
-    // kind / diagnosis 是 #12 给 runs 加的列（task |diagnosis）。本分支的库还没有
-    // 这两列时 row.kind / row.diagnosis 是 undefined，JSON 序列化自然省略该字段——
-    // 看板详情页（#16）按「字段存在才显示」处理，旧数据不受影响。
-    kind: row.kind,
-    diagnosis: row.diagnosis,
   };
 }
 
