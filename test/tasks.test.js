@@ -911,11 +911,25 @@ test('listRuns 组合过滤：taskId + since + limit 一起用，since 等于 st
 
 // ---------------------------------------------------------------- source（issue #39）
 
-test('升级路径：旧库（倒数第二步迁移、无 source 列）经 openDb 升级后 source 列存在、旧行 source 为 null', (t) => {
+test('升级路径：旧库（source 列出现之前的 schema）经 openDb 升级后 source 列存在、旧行 source 为 null', (t) => {
   const file = path.join(makeTempHome(t), 'night-shift.db');
+  // source 不一定是最后一步（#38 的 meta 在它后面）。找出加上 source 列的那一步，
+  // 旧库只跑到它之前；版本号用步数算，不写死。
+  const probe = new DatabaseSync(':memory:');
+  let sourceStep = -1;
+  for (let i = 0; i < MIGRATIONS.length; i++) {
+    const hadTasks = probe.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get();
+    const before = hadTasks
+      ? probe.prepare('PRAGMA table_info(tasks)').all().some((row) => row.name === 'source')
+      : false;
+    MIGRATIONS[i](probe);
+    const after = probe.prepare('PRAGMA table_info(tasks)').all().some((row) => row.name === 'source');
+    if (!before && after) sourceStep = i;
+  }
+  probe.close();
+  assert.ok(sourceStep > 0, '应有一步迁移加上 source 列');
   const old = new DatabaseSync(file);
-  // 迁移到倒数第二步：版本号用 slice 长度算，不写死数字
-  const previous = MIGRATIONS.slice(0, -1);
+  const previous = MIGRATIONS.slice(0, sourceStep);
   for (const migration of previous) migration(old);
   old.exec(`PRAGMA user_version = ${previous.length}`);
   const columnsBefore = old.prepare('PRAGMA table_info(tasks)').all().map((row) => row.name);

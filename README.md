@@ -135,7 +135,6 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `add` | `--repo <owner/name>`（必填）＋ `--prompt <文字>` / `--prompt-file <路径>` / `--template <名字>` 三选一；可选 `--var <名字=值>`（可重复，配合模板）、`--title`、`--difficulty easy\|medium\|hard`、`--priority <整数>`、`--test "<测试命令>"`、`--allow-peak`、`--max-attempts <次数>`、`--depends-on <id,id,…>`、`--json` | 添加任务到队列。例：`night-shift add --repo a/b --template fix-issue --var issue=20 --allow-peak` |
 | `list` | `[--status queued\|running\|succeeded\|failed\|canceled]` `[--limit <条数>]` `[--json]` | 列出任务（时间按本地时区显示到分钟） |
 | `show` | `<id>` `[--json]` | 查看任务详情与运行记录 |
-| `import` | `--repo <owner/name>`（必填）；可选 `--label <名字>`、`--state open\|closed\|all`、`--limit <条数>`、`--difficulty easy\|medium\|hard`、`--dry-run`、`--json` | 按 GitHub issue 批量入队。同一来源（`github:<repo>#<编号>`）已有任务则跳过 |
 | `cancel` | `<id>` | 取消排队/执行中的任务 |
 | `retry` | `<id>` | 把失败/已取消的任务重新排队 |
 | `start` | 无 | 前台运行调度器（只调度，不起看板） |
