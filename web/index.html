@@ -66,14 +66,20 @@
       <div id="import-result" class="panel-result" hidden></div>
     </form>
 
-    <!-- 清理磁盘（#50）：默认先预览将删除的路径，确认后才删；有的没删掉时页面错误条提示。 -->
+    <!-- 清理磁盘（#50）：默认先预览将删除的路径，确认后才删；有的没删掉时页面错误条提示。
+         #89：面板里可以填「日志保留天数」（logsOlderThan），缺省 14；非法输入亮面板内错误条。 -->
     <div id="cleanup-panel" class="card" hidden>
       <h2>清理磁盘</h2>
       <p class="panel-note">删除已结束任务（成功/失败/已取消）的 worktree 与过期日志；排队和运行中的不动，任务记录与 repos/ 缓存保留。</p>
+      <label class="field">
+        <span class="field-label">日志保留天数</span>
+        <input id="c-logs-days" name="logsOlderThan" type="text" inputmode="numeric" value="14" autocomplete="off">
+      </label>
       <div class="form-actions">
         <button type="button" class="primary" id="c-preview">预览</button>
         <button type="button" id="c-confirm" hidden>确认删除</button>
         <button type="button" id="c-cancel">收起</button>
+        <div id="cleanup-error" class="error" hidden></div>
       </div>
       <div id="cleanup-result" class="panel-result" hidden></div>
     </div>

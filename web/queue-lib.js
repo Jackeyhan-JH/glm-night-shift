@@ -363,13 +363,35 @@ export function importDoneText(result) {
 }
 
 /**
- * 清理面板 → POST /api/cleanup 的请求体（#50）：预览 dryRun true、确认 false；
- * logsOlderThan 用服务端缺省（14 天），面板不另设天数输入。
- * @param {boolean} dryRun
- * @returns {{ dryRun: boolean }} 请求体
+ * 清理面板的「日志保留天数」输入 → 不小于 0 的安全整数，或 null（不发请求）。
+ * trim 之后必须是十进制整数字面量：0，或没有前导 0 的正整数字符串。
+ * 空、只有空白、负数、小数、+14、1e2、014、01、14.0、超过 Number 安全整数，都是 null。
+ * 不改入参。
+ * @param {string|number} [raw] 输入框的原始值（或调用方已解析的数字）
+ * @returns {?number} 不小于 0 的安全整数；0 表示这次不列、不删日志
  */
-export function cleanupBody(dryRun) {
-  return { dryRun: dryRun === true };
+export function parseCleanupDays(raw) {
+  const text = String(raw ?? '').trim();
+  if (!/^(0|[1-9]\d*)$/.test(text)) return null;
+  const n = Number(text);
+  return Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+/**
+ * 清理面板 → POST /api/cleanup 的请求体（#50 / #89）：预览 dryRun true、确认 false。
+ * 面板总会带 logsOlderThan（数字；页面先 parseCleanupDays 再把数字传进来，字符串也
+ * 收）；0 表示这次不列、不删日志，同样带上（不是省略字段）。解析不出合法天数返回
+ * null——调用方不得 POST。
+ * @param {number|string} logsOlderThan 日志保留天数（数字或待解析的字符串）
+ * @param {boolean} dryRun
+ * @returns {?{ dryRun: boolean, logsOlderThan: number }} 请求体；非法天数时 null
+ */
+export function cleanupBody(logsOlderThan, dryRun) {
+  const n = typeof logsOlderThan === 'number'
+    ? (Number.isSafeInteger(logsOlderThan) && logsOlderThan >= 0 ? logsOlderThan : null)
+    : parseCleanupDays(logsOlderThan);
+  if (n === null) return null;
+  return { dryRun: dryRun === true, logsOlderThan: n };
 }
 
 /**
