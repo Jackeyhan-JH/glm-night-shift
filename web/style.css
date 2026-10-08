@@ -384,6 +384,62 @@ pre.log {
   font-size: 12px;
 }
 
+/* 状态条下方的两个入口按钮（#50：从 GitHub 导入 / 清理磁盘） */
+.board-actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 0 0;
+}
+.board-actions button {
+  padding: 3px 12px;
+  font-size: 13px;
+}
+/* 导入 / 清理面板：小号卡片，跟在入口按钮下面 */
+#import-panel,
+#cleanup-panel {
+  margin-top: 12px;
+}
+#import-panel h2,
+#cleanup-panel h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+.panel-note {
+  margin: 0 0 4px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.panel-result {
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 表格上方一行工具（#50：仓库筛选，只在浏览器里过滤） */
+.table-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.inline-field select {
+  font: inherit;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+
 /* 三个标签（排队中/运行中/历史），带数量 */
 .tabs {
   display: flex;

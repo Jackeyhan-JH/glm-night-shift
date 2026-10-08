@@ -1,6 +1,6 @@
 // 看板后端（issue #14）：node:http 实现的只听本机的小服务——任务的增删查与操作、
-// 运行日志全文 / SSE 实时跟踪、高峰与额度状态、近几天的用量统计、任务模板接口（#15），
-// 顺带托管 web/ 静态页。
+// 运行日志全文 / SSE 实时跟踪、高峰与额度状态、近几天的用量统计、任务模板接口（#15）、
+// issue 批量导入与磁盘清理（#50），顺带托管 web/ 静态页。
 // 零依赖；不加载 node:sqlite（连接由调用方 openDb 后传入），SSE 只依赖「runs.log_path
 // 指向的日志文件每行一条」的约定（见 #7），不依赖执行器。
 //
@@ -17,6 +17,7 @@ import { getStatus } from './peak.js';
 import { multiplierFor, toDate, usage } from './quota.js';
 import { HISTORY_DAYS_MAX, HISTORY_DAYS_MIN, hourlyUsage } from './stats.js';
 import {
+  DIFFICULTIES,
   InvalidTransitionError,
   NotFoundError,
   ValidationError,
@@ -32,6 +33,16 @@ import {
   updateTask,
 } from './tasks.js';
 import { listTemplates, loadTemplate, renderTemplate } from './templates.js';
+// #50：import / cleanup 的循环与命令行共用（形状、错误句子、删哪些路径两边一致）。
+import {
+  IMPORT_DEFAULT_DIFFICULTY,
+  IMPORT_DEFAULT_LIMIT,
+  IMPORT_REPO_PATTERN,
+  IMPORT_STATES,
+  enqueueIssues,
+  fetchIssues,
+} from './import-issues.js';
+import { DEFAULT_LOGS_DAYS, runCleanup } from './cleanup.js';
 
 /** web/ 静态文件根目录（src/server.js 的上一级里的 web/）。 */
 const WEB_ROOT = path.resolve(fileURLToPath(new URL('../web', import.meta.url)));
@@ -71,6 +82,12 @@ const TASK_BODY_FIELDS = new Set([
 const TASK_EDIT_FIELDS = new Set([
   'title', 'prompt', 'difficulty', 'priority', 'testCommand', 'allowPeak', 'maxAttempts', 'dependsOn',
 ]);
+
+/** POST /api/import 允许的请求体字段（#50；缺省与 import 命令相同，见 parseImportBody）。 */
+const IMPORT_BODY_FIELDS = new Set(['repo', 'label', 'state', 'limit', 'difficulty', 'dryRun']);
+
+/** POST /api/cleanup 允许的请求体字段（#50；缺省与 cleanup 命令相同）。 */
+const CLEANUP_BODY_FIELDS = new Set(['dryRun', 'logsOlderThan']);
 
 /**
  * 带HTTP 语义的错误：处理器主动抛出，按 status / field 回给客户端。
@@ -194,6 +211,53 @@ function buildRoutes(deps, bumpSse) {
     { method: 'POST', pattern: /^\/api\/tasks\/(\d+)\/retry$/, handler: (ctx) => {
       sendJson(ctx.res, 200, retryTask(deps.db, parseId(ctx.params[0], '任务')));
     } },
+    // 从 GitHub issue 批量入队（#50）：与 import 命令同一套逻辑（src/import-issues.js），
+    // 字段缺省也相同；多出来的键 / 形状不对 → 400 点名字段（不调 gh、不建任务）。
+    // gh 失败 → 502，错误句子与命令行同一句（gh 先于入库跑，此时一个任务都没写）。
+    { method: 'POST', pattern: /^\/api\/import$/, handler: async (ctx) => {
+      const input = parseImportBody(ctx.body);
+      let issues;
+      try {
+        issues = await fetchIssues({
+          repo: input.repo,
+          label: input.label,
+          state: input.state,
+          limit: input.limit,
+          ghBin: deps.config.ghBin,
+          env: deps.env,
+        });
+      } catch (err) {
+        throw new HttpError(502, err.message);
+      }
+      const { added, skipped } = enqueueIssues({
+        db: deps.db,
+        repo: input.repo,
+        issues,
+        difficulty: input.difficulty,
+        dryRun: input.dryRun,
+        maxAttempts: deps.config.maxAttempts, // 与 add / import 命令的缺省一致
+      });
+      sendJson(ctx.res, 200, { added, skipped });
+    } },
+    // 清理已结束任务的 worktree 与过期日志（#50）：与 cleanup 命令同一套逻辑
+    // （src/cleanup.js）。有的路径删不掉时其余照删，failed 为 true，HTTP 仍是 200
+    // （命令行靠退出码表达的那件事）；多出来的键 → 400，一个路径都不删。
+    { method: 'POST', pattern: /^\/api\/cleanup$/, handler: async (ctx) => {
+      const input = parseCleanupBody(ctx.body);
+      // 失败明细与命令行一样打到进程 stderr；HTTP 侧的失败语义靠响应里的 failed 布尔。
+      const report = await runCleanup({
+        db: deps.db,
+        home: deps.home,
+        dryRun: input.dryRun,
+        logsOlderThan: input.logsOlderThan,
+        stderr: process.stderr,
+      });
+      sendJson(ctx.res, 200, {
+        worktrees: report.worktrees,
+        logs: report.logs,
+        failed: report.failed,
+      });
+    } },
     { method: 'GET', pattern: /^\/api\/runs\/(\d+)\/log$/, handler: (ctx) => {
       const run = requireRun(deps.db, parseId(ctx.params[0], '运行记录'));
       if (!run.logPath) throw new HttpError(404, '这次运行没有日志文件');
@@ -311,6 +375,109 @@ async function renderTemplateBody(deps, body) {
 /** JSON 里的「普通对象」：非 null 非数组的对象（vars 的形状检查）。 */
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// ---------------------------------------------------------------- import / cleanup（#50）
+
+/** 请求体里的未知字段 → 400 点名字段（与 POST /api/tasks 的检查同一套文案）。 */
+function rejectUnknownFields(body, fields) {
+  for (const key of Object.keys(body)) {
+    if (!fields.has(key)) {
+      throw new HttpError(400, `未知字段：${key}（允许：${[...fields].join(' | ')}）`, key);
+    }
+  }
+}
+
+/** 可选布尔字段：缺省 false；给出但不是布尔（字符串 "true" 不算 true）→ 400 点名字段。 */
+function optionalBoolean(body, key) {
+  if (body[key] === undefined) return false;
+  if (typeof body[key] !== 'boolean') {
+    throw new HttpError(400, `${key} 必须是布尔值（当前值：${JSON.stringify(body[key])}）`, key);
+  }
+  return body[key];
+}
+
+/** 可选整数字段：缺省 fallback；给出但不是 ≥min 的整数（字符串 / 小数都不算）→ 400。 */
+function optionalInteger(body, key, min, fallback) {
+  if (body[key] === undefined) return fallback;
+  if (!Number.isSafeInteger(body[key]) || body[key] < min) {
+    throw new HttpError(400, `${key} 必须是不小于 ${min} 的整数（当前值：${JSON.stringify(body[key])}）`, key);
+  }
+  return body[key];
+}
+
+/**
+ * POST /api/import 的请求体 → fetchIssues / enqueueIssues 的输入。缺省与命令行相同
+ * （state=open、limit=50、difficulty=medium、dryRun=false、label 缺省不带 --label）；
+ * 缺 repo、形状不对、多出来的键都 → 400（此时不会调用 gh，也不会建任务）。
+ * @param {object} body 已过 Content-Type / Origin / 体积检查的请求体
+ * @returns {{ repo: string, label?: string, state: string, limit: number,
+ *   difficulty: string, dryRun: boolean }}
+ */
+function parseImportBody(body) {
+  rejectUnknownFields(body, IMPORT_BODY_FIELDS);
+  if (body.repo === undefined) {
+    throw new HttpError(400, '缺少必填字段：repo（owner/name）', 'repo');
+  }
+  if (typeof body.repo !== 'string') {
+    throw new HttpError(400, `repo 必须是字符串 owner/name（当前值：${JSON.stringify(body.repo)}）`, 'repo');
+  }
+  const repo = body.repo.trim(); // 与 CLI 一致：先 trim 再验格式
+  if (!IMPORT_REPO_PATTERN.test(repo)) {
+    throw new HttpError(400, `repo 必须形如 owner/name（当前值：${body.repo}）`, 'repo');
+  }
+  let label;
+  if (body.label !== undefined) {
+    if (typeof body.label !== 'string') {
+      throw new HttpError(400, `label 必须是字符串（当前值：${JSON.stringify(body.label)}）`, 'label');
+    }
+    label = body.label;
+  }
+  let state = 'open';
+  if (body.state !== undefined) {
+    if (!IMPORT_STATES.includes(body.state)) {
+      throw new HttpError(
+        400,
+        `state 必须是 ${IMPORT_STATES.join(' | ')} 之一（当前值：${JSON.stringify(body.state)}）`,
+        'state',
+      );
+    }
+    state = body.state;
+  }
+  let difficulty = IMPORT_DEFAULT_DIFFICULTY;
+  if (body.difficulty !== undefined) {
+    if (!DIFFICULTIES.includes(body.difficulty)) {
+      throw new HttpError(
+        400,
+        `difficulty 必须是 ${DIFFICULTIES.join(' | ')} 之一（当前值：${JSON.stringify(body.difficulty)}）`,
+        'difficulty',
+      );
+    }
+    difficulty = body.difficulty;
+  }
+  return {
+    repo,
+    label,
+    state,
+    limit: optionalInteger(body, 'limit', 1, IMPORT_DEFAULT_LIMIT),
+    difficulty,
+    dryRun: optionalBoolean(body, 'dryRun'),
+  };
+}
+
+/**
+ * POST /api/cleanup 的请求体 → runCleanup 的输入。缺省与命令行相同（dryRun=false、
+ * logsOlderThan=14）；logsOlderThan 0 表示完全不列、不删日志；多出来的键 → 400，
+ * 一个路径都不删。
+ * @param {object} body 已过 Content-Type / Origin / 体积检查的请求体
+ * @returns {{ dryRun: boolean, logsOlderThan: number }}
+ */
+function parseCleanupBody(body) {
+  rejectUnknownFields(body, CLEANUP_BODY_FIELDS);
+  return {
+    dryRun: optionalBoolean(body, 'dryRun'),
+    logsOlderThan: optionalInteger(body, 'logsOlderThan', 0, DEFAULT_LOGS_DAYS),
+  };
 }
 
 async function handleRequest(req, res, routes) {

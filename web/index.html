@@ -19,8 +19,63 @@
     <!-- 状态条：高峰/非高峰 · 5 小时额度百分比 · 运行中数量 + 手动暂停/恢复按钮（queue.js 渲染） -->
     <div id="statusbar" class="statusbar"></div>
 
-    <!-- 三个标签（含数量）与当前标签的任务表 -->
+    <!-- 状态条附近的两个入口（#50）：面板只在 HTML 里建这一次，轮询刷新不重建，
+         正在填的仓库/标签不会被冲掉（与 #add-form 同一套约定）。 -->
+    <div class="board-actions">
+      <button type="button" id="import-toggle">从 GitHub 导入</button>
+      <button type="button" id="cleanup-toggle">清理磁盘</button>
+    </div>
+
+    <!-- 从 GitHub 导入（#50）：填仓库/可选标签/难度，先预览（dry-run），确认后才真正入队。
+         独立于 #add-form，互不影响。 -->
+    <form id="import-panel" class="card" hidden>
+      <h2>从 GitHub 导入</h2>
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">仓库 <b class="req">*</b></span>
+          <input name="repo" id="i-repo" required placeholder="owner/name">
+        </label>
+        <label class="field">
+          <span class="field-label">标签（可选）</span>
+          <input name="label" id="i-label" placeholder="如 night-shift">
+        </label>
+        <label class="field">
+          <span class="field-label">难度</span>
+          <select name="difficulty" id="i-difficulty">
+            <option value="easy">easy</option>
+            <option value="medium" selected>medium</option>
+            <option value="hard">hard</option>
+          </select>
+        </label>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="primary" id="i-preview">预览</button>
+        <button type="button" id="i-confirm" hidden>确认导入</button>
+        <button type="button" id="i-cancel">收起</button>
+        <div id="import-error" class="error" hidden></div>
+      </div>
+      <div id="import-result" class="panel-result" hidden></div>
+    </form>
+
+    <!-- 清理磁盘（#50）：默认先预览将删除的路径，确认后才删；有的没删掉时页面错误条提示。 -->
+    <div id="cleanup-panel" class="card" hidden>
+      <h2>清理磁盘</h2>
+      <p class="panel-note">删除已结束任务（成功/失败/已取消）的 worktree 与过期日志；排队和运行中的不动，任务记录与 repos/ 缓存保留。</p>
+      <div class="form-actions">
+        <button type="button" class="primary" id="c-preview">预览</button>
+        <button type="button" id="c-confirm" hidden>确认删除</button>
+        <button type="button" id="c-cancel">收起</button>
+      </div>
+      <div id="cleanup-result" class="panel-result" hidden></div>
+    </div>
+
+    <!-- 三个标签（含数量）与当前标签的任务表；表格上方是仓库筛选（#50，只在浏览器里过滤） -->
     <div id="tabs" class="tabs" role="tablist"></div>
+    <div class="table-tools">
+      <label class="inline-field">仓库
+        <select id="repo-filter"></select>
+      </label>
+    </div>
     <div id="task-table"></div>
 
     <!-- 新增任务表单：模板下拉与变量输入、依赖多选由 queue.js 动态填充；
