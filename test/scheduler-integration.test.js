@@ -10,7 +10,7 @@ import path from 'node:path';
 import { openDb, MIGRATIONS } from '../src/db.js';
 import {
   createTask, getTask, listRuns, cancelTask, claimTaskById, startRun, finishRun,
-  InvalidTransitionError,
+  InvalidTransitionError, DependencyBlockedError,
 } from '../src/tasks.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 import { usage as quotaUsage } from '../src/quota.js';
@@ -577,4 +577,115 @@ test('验收·集成·runNow：高峰时段也能跑完普通任务；对 succee
     () => ctx.scheduler.runNow(task.id),
     (err) => err instanceof InvalidTransitionError && err.from === 'succeeded',
   );
+});
+
+// ---------------------------------------------------------------- 任务依赖（#11 × #9）
+// 依赖门在 tasks.js 的 claimNextTask / claimTaskById 里（调度器的 tick / runNow 都只经由
+// 这两个函数领任务）；级联失败挂在 finishTask(failed) / cancelTask 上（调度器落终态也只走
+// 这两个函数），所以下面直接用真调度器 + 假 claude 验证端到端行为。
+
+test('依赖·集成：重试用尽的上游 failed → 下游与下游的下游同一事务级联失败，下游从未被领取', async (t) => {
+  const ctx = setup(t, {
+    taskSpecs: [
+      { maxAttempts: 2, title: 'upstream' },
+      { title: 'mid', dependsOn: [1] },
+      { title: 'leaf', dependsOn: [2] },
+    ],
+    config: { concurrency: 3 }, // 并发槽位富余：没被领只能是依赖门挡住的
+    env: { FAKE_CLAUDE_SCENARIO: 'fail' },
+  });
+  const [up, mid, leaf] = ctx.tasks;
+
+  assert.deepEqual(await ctx.scheduler.tick(), [up.id], '只领上游');
+  await ctx.waitDone(up.id);
+  assert.equal(getTask(ctx.db, up.id).status, 'queued', '第一轮失败后排队重试');
+  assert.equal(getTask(ctx.db, mid.id).status, 'queued', '上游还没终败：下游不动');
+
+  assert.deepEqual(await ctx.scheduler.tick(), [up.id], '第二轮仍只领上游');
+  await ctx.waitDone(up.id, { round: 2 });
+  const upRow = getTask(ctx.db, up.id);
+  assert.deepEqual([upRow.status, upRow.attempts], ['failed', 2]);
+
+  const midRow = getTask(ctx.db, mid.id);
+  const leafRow = getTask(ctx.db, leaf.id);
+  assert.deepEqual([midRow.status, midRow.lastError], ['failed', `依赖 #${up.id} 失败`]);
+  assert.deepEqual([leafRow.status, leafRow.lastError], ['failed', `依赖 #${mid.id} 失败`]);
+  assert.ok(midRow.finishedAt !== null && leafRow.finishedAt !== null);
+  assert.equal(midRow.finishedAt, upRow.finishedAt, '级联与上游终态同一时刻写入（同一事务）');
+  assert.deepEqual([midRow.attempts, leafRow.attempts], [0, 0], '下游从未被领取');
+  assert.equal(listRuns(ctx.db, { taskId: mid.id }).length + listRuns(ctx.db, { taskId: leaf.id }).length, 0);
+  assert.deepEqual(await ctx.scheduler.tick(), [], '之后队列里没有可领的');
+  assert.equal(readJsonl(ctx.argsLog).length, 2, '假 claude 只为上游启动过 2 次');
+});
+
+test('依赖·集成：上游运行中被另一连接取消 → 下游立即级联失败（依赖已取消），之后也不会被领', async (t) => {
+  const ctx = setup(t, {
+    taskSpecs: [{ title: 'upstream' }, { title: 'downstream', dependsOn: [1] }],
+    config: { concurrency: 2 },
+    env: { FAKE_CLAUDE_SCENARIO: 'hang' },
+    cancelPollMs: 50,
+  });
+  const [up, down] = ctx.tasks;
+  assert.deepEqual(await ctx.scheduler.tick(), [up.id]);
+  await ctx.waitClaudeStarted();
+  await waitUntil(() => ctx.scheduler.status().running.includes(up.id));
+
+  const db2 = openDb(ctx.dbPath);
+  t.after(() => db2.close());
+  cancelTask(db2, up.id);
+  // 级联与取消在同一事务里：取消一返回，下游已经是 failed。先记下快照、等上游收尾后
+  // 再断言——断言失败时也不会把 hang 的假 claude 留在后台拖住测试进程。
+  const downRow = getTask(ctx.db, down.id);
+
+  const done = await ctx.waitDone(up.id, { timeoutMs: 5000 });
+  assert.equal(done.status, 'canceled');
+  assert.deepEqual([downRow.status, downRow.lastError], ['failed', `依赖 #${up.id} 已取消`]);
+  assert.equal(getTask(ctx.db, up.id).status, 'canceled', '调度器保持 canceled，不改写');
+  assert.equal(getTask(ctx.db, down.id).status, 'failed', '再 tick 之前确认下游已终态（否则 hang 场景会被领走）');
+  assert.deepEqual(await ctx.scheduler.tick(), []);
+  assert.equal(getTask(ctx.db, down.id).attempts, 0, '下游从未被领取');
+  assert.equal(listRuns(ctx.db, { taskId: down.id }).length, 0);
+});
+
+test('依赖·集成：上游运行时下游不被领（并发有空位也不领）；上游成功后下一轮 tick 领到下游并跑完', async (t) => {
+  const ctx = setup(t, {
+    taskSpecs: [{ title: 'api' }, { title: 'frontend', dependsOn: [1], priority: 10 }],
+    config: { concurrency: 2 },
+    env: { FAKE_CLAUDE_SCENARIO: 'slow', FAKE_CLAUDE_DELAY_MS: '300' },
+  });
+  const [up, down] = ctx.tasks;
+  assert.deepEqual(await ctx.scheduler.tick(), [up.id], '下游优先级更高也不能先领');
+  await waitUntil(() => ctx.scheduler.status().running.includes(up.id));
+  assert.deepEqual(await ctx.scheduler.tick(), [], '上游 running：下游仍被挡住');
+  assert.deepEqual(getTask(ctx.db, down.id).blockedBy, [up.id]);
+
+  await ctx.waitDone(up.id, { timeoutMs: 20_000 });
+  assert.equal(getTask(ctx.db, up.id).status, 'succeeded');
+  assert.deepEqual(getTask(ctx.db, down.id).blockedBy, []);
+  assert.deepEqual(await ctx.scheduler.tick(), [down.id]);
+  await ctx.waitDone(down.id, { timeoutMs: 20_000 });
+  const downRow = getTask(ctx.db, down.id);
+  assert.deepEqual([downRow.status, downRow.attempts], ['succeeded', 1]);
+});
+
+test('依赖·集成·runNow：不绕过依赖门——等依赖时抛 DependencyBlockedError、不启动 claude；上游成功后 runNow 跑完', async (t) => {
+  const ctx = setup(t, {
+    taskSpecs: [{ title: 'api' }, { title: 'frontend', dependsOn: [1] }],
+    clockAt: '2026-10-08T07:00:00Z', // 高峰：runNow 无视高峰，但不无视依赖
+  });
+  const [up, down] = ctx.tasks;
+
+  await assert.rejects(
+    () => ctx.scheduler.runNow(down.id),
+    (err) => err instanceof DependencyBlockedError && err instanceof InvalidTransitionError
+      && JSON.stringify(err.blockedBy) === `[${up.id}]`,
+  );
+  const blocked = getTask(ctx.db, down.id);
+  assert.deepEqual([blocked.status, blocked.attempts], ['queued', 0], '被拒时任务原样不动');
+  assert.equal(readJsonl(ctx.argsLog).length, 0, '没有启动假 claude');
+  assert.deepEqual(ctx.scheduler.status().running, [], '没有登记 running');
+
+  assert.equal((await ctx.scheduler.runNow(up.id)).status, 'succeeded');
+  const final = await ctx.scheduler.runNow(down.id);
+  assert.deepEqual([final.status, final.attempts], ['succeeded', 1]);
 });

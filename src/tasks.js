@@ -74,6 +74,28 @@ export class InvalidTransitionError extends Error {
 }
 
 /**
+ * 任务还在等依赖（#11）：claimTaskById 点名领取一个依赖未全部 succeeded 的 queued 任务。
+ * 是 InvalidTransitionError（queued → running 不允许）的子类，所以按状态冲突处理
+ * （HTTP 409、命令行退出码 1）的调用方无需改动；需要区分时看 err.blockedBy。
+ * @property {number} id 被点名的任务
+ * @property {number[]} blockedBy 还没 succeeded 的依赖 id（升序）
+ */
+export class DependencyBlockedError extends InvalidTransitionError {
+  /**
+   * @param {number} id 被点名的任务
+   * @param {{id: number, status: string}[]} blockers 未完成的依赖（id 升序）
+   */
+  constructor(id, blockers) {
+    super('queued', 'running');
+    this.name = 'DependencyBlockedError';
+    this.id = id;
+    this.blockedBy = blockers.map((b) => b.id);
+    this.message = `任务 #${id} 还在等依赖 ${blockers.map((b) => `#${b.id}（${b.status}）`).join('，')}，`
+      + '依赖全部成功后才能运行';
+  }
+}
+
+/**
  * @typedef {object} TaskRow 对外返回的任务对象（驼峰字段，布尔是真布尔，NULL 保持 null）。
  * @property {number} id
  * @property {string} repo `owner/name`
@@ -271,11 +293,18 @@ export function claimNextTask(db, { allowPeakOnly = false, now } = {}) {
  * 按 id 领取任务（#9 的 runNow 用）：只领 queued，语义同 claimNextTask（原子 UPDATE
  * 带状态守卫、attempts + 1、覆盖 started_at）。与 claimNextTask 不同：不排序、不看
  * not_before / allow_peak——runNow 是用户点名「现在就跑」，无视一切退避与高峰限制。
+ *
+ * 但**不绕过依赖门**（#11）：依赖里还有没 succeeded 的任务时不领取，抛
+ * DependencyBlockedError（InvalidTransitionError 的子类，HTTP 映射 409、命令行退出 1）。
+ * 理由：退避 / 高峰是「什么时候跑划算」的策略，用户可以拍板无视；依赖没完成则是
+ * 「上游产出还不存在」，此时硬跑只会白花额度做无用功。门与状态守卫在同一条 UPDATE 里，
+ * 原子：判定与领取之间不会有上游状态变化的窗口。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
  * @returns {TaskRow} 被领取的任务
  * @throws {ValidationError} id 非正整数
  * @throws {NotFoundError} 任务不存在
+ * @throws {DependencyBlockedError} 任务是 queued 但依赖未全部 succeeded（err.blockedBy 列出 id）
  * @throws {InvalidTransitionError} 任务当前不是 queued（err.from 是库里实际的当前状态）
  */
 export function claimTaskById(db, id) {
@@ -285,10 +314,27 @@ export function claimTaskById(db, id) {
     UPDATE tasks
     SET status = 'running', attempts = attempts + 1, started_at = ?, updated_at = ?
     WHERE id = ? AND status = 'queued'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
+        WHERE d.task_id = tasks.id AND dep.status != 'succeeded'
+      )
     RETURNING *
   `).get(now, now, id);
-  if (row === undefined) throw staleTransitionError(db, id, 'running');
-  return rowToTask(row);
+  if (row === undefined) {
+    const current = db.prepare('SELECT status FROM tasks WHERE id = ?').get(id);
+    if (current?.status === 'queued') {
+      const blockers = db.prepare(`
+        SELECT d.depends_on AS id, dep.status AS status
+        FROM task_deps d JOIN tasks dep ON dep.id = d.depends_on
+        WHERE d.task_id = ? AND dep.status != 'succeeded'
+        ORDER BY d.depends_on ASC
+      `).all(id);
+      if (blockers.length > 0) throw new DependencyBlockedError(id, blockers);
+    }
+    throw staleTransitionError(db, id, 'running');
+  }
+  return hydrateTasks(db, [row])[0];
 }
 
 // ---------------------------------------------------------------- 任务状态流转

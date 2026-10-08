@@ -9,8 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { openDb, MIGRATIONS } from '../src/db.js';
 import {
   createTask, getTask, listTasks, claimNextTask, finishTask, cancelTask, retryTask,
-  setDependencies, listDependencies,
-  ValidationError, NotFoundError, InvalidTransitionError,
+  setDependencies, listDependencies, claimTaskById,
+  ValidationError, NotFoundError, InvalidTransitionError, DependencyBlockedError,
 } from '../src/tasks.js';
 import { makeTempHome } from './helpers.js';
 
@@ -422,7 +422,7 @@ test('无依赖任务的 retryTask 行为不变（回归：不因依赖检查误
   assert.throws(() => retryTask(db, 999), (err) => err instanceof NotFoundError && err.id === 999);
 });
 
-// ---------------------------------------------------------------- 迁移（v1 → v2）
+// ---------------------------------------------------------------- 迁移（升级到含依赖表的版本）
 
 test('验收: 只有版本 1 的数据库文件打开后自动升级：原有任务都在，新建任务可以带依赖', (t) => {
   const file = path.join(makeTempHome(t), 'night-shift.db');
@@ -462,7 +462,7 @@ test('验收: 只有版本 1 的数据库文件打开后自动升级：原有任
 
 test('user_version 等于迁移步数（不写死数字）；依赖表的主键去重约束生效', (t) => {
   const db = openMemory(t);
-  assert.ok(MIGRATIONS.length >= 2, 'v1 之后至少追加了依赖表这一步');
+  assert.ok(MIGRATIONS.length >= 3, 'v1、#9 的 not_before（v2）之后追加了依赖表这一步');
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
   createTask(db, { ...VALID });
   const insert = db.prepare('INSERT INTO task_deps (task_id, depends_on) VALUES (1, 1)');
@@ -664,4 +664,101 @@ test('复查: dependsOn/blockedBy 在各出口都升序；上游 succeeded 后 b
   assert.equal(claimed.id, target.id);
   assert.deepEqual(claimed.dependsOn, [a.id, b.id, c.id], 'claimNextTask 返回值也带');
   assert.deepEqual(claimed.blockedBy, [], '依赖全部成功后不再被挡');
+});
+
+// ---------------------------------------------------------------- 与 #9 合并后的迁移 / 领取门
+
+test('v2 库（main 的迁移 1–2：含 #9 的 not_before）升级到含依赖表的版本：数据与 not_before 都在，依赖可用', (t) => {
+  const file = path.join(makeTempHome(t), 'night-shift.db');
+  // 手工建一个停在 v2 的库：只跑前两步迁移（#3 的表、#9 的 not_before），塞三条任务，
+  // 其中一条带 not_before（限流退避中），一条已 succeeded。
+  const raw = new DatabaseSync(file);
+  try {
+    MIGRATIONS[0](raw);
+    MIGRATIONS[1](raw);
+    raw.exec('PRAGMA user_version = 2');
+    assert.equal(raw.prepare("SELECT name FROM sqlite_master WHERE name='task_deps'").get(), undefined,
+      '前置条件：v2 库里还没有依赖表');
+    const insert = raw.prepare(`
+      INSERT INTO tasks (repo, title, prompt, status, max_attempts, not_before, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 2, ?, ?, ?)
+    `);
+    const at = '2026-10-08T00:00:00.000Z';
+    insert.run('a/b', 'up', 'p1', 'queued', null, at, at);
+    insert.run('a/b', 'backoff', 'p2', 'queued', '2026-10-08T05:00:00.000Z', at, at);
+    insert.run('a/b', 'done', 'p3', 'succeeded', null, at, at);
+  } finally {
+    raw.close();
+  }
+
+  const db = openDb(file); // 触发 v2 → v3
+  t.after(() => db.close());
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
+  assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='task_deps'").get());
+
+  assert.deepEqual(
+    [1, 2, 3].map((id) => { const x = getTask(db, id); return [x.title, x.status, x.notBefore, x.dependsOn.length]; }),
+    [['up', 'queued', null, 0], ['backoff', 'queued', '2026-10-08T05:00:00.000Z', 0], ['done', 'succeeded', null, 0]],
+    '原有任务、状态和 not_before 都原样保留',
+  );
+
+  // 新任务依赖老任务：依赖已 succeeded 的 #3 → 不阻塞；依赖 queued 的 #1 → 阻塞
+  const d1 = createTask(db, { repo: 'a/b', prompt: 'after up', dependsOn: [1, 3] });
+  assert.deepEqual([d1.dependsOn, d1.blockedBy], [[1, 3], [1]]);
+
+  // 领取门 + not_before 一起生效（now = 04:00Z：#2 还在退避）
+  const now = '2026-10-08T04:00:00.000Z';
+  assert.equal(claimNextTask(db, { now }).id, 1, '#2 退避中、#4 被 #1 挡住，只能领 #1');
+  assert.equal(claimNextTask(db, { now }), null);
+  finishTask(db, 1, { status: 'succeeded' });
+  assert.equal(claimNextTask(db, { now }).id, 4, '#1 成功后 #4 可领（#2 仍在退避）');
+  assert.equal(claimNextTask(db, { now: '2026-10-08T05:00:00.000Z' }).id, 2, '退避到点后 #2 可领');
+});
+
+test('claimTaskById（runNow 用）不绕过依赖门：抛 DependencyBlockedError（InvalidTransitionError 子类），任务原样不动', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID });
+  const b = createTask(db, { ...VALID });
+  const c = createTask(db, { ...VALID, dependsOn: [a.id, b.id] });
+
+  let caught = null;
+  try {
+    claimTaskById(db, c.id);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught instanceof DependencyBlockedError);
+  assert.ok(caught instanceof InvalidTransitionError, '按状态冲突处理的调用方（HTTP 409 / 退出码 1）无需改动');
+  assert.equal(caught.name, 'DependencyBlockedError');
+  assert.equal(caught.from, 'queued');
+  assert.equal(caught.to, 'running');
+  assert.deepEqual(caught.blockedBy, [1, 2]);
+  assert.equal(caught.message, '任务 #3 还在等依赖 #1（queued），#2（queued），依赖全部成功后才能运行');
+  const after = getTask(db, c.id);
+  assert.deepEqual([after.status, after.attempts, after.startedAt], ['queued', 0, null], '被拒时不领取、不扣次数');
+
+  // 只剩一个依赖未完成：信息里只列它，状态照实写
+  claimTaskById(db, a.id);
+  finishTask(db, a.id, { status: 'succeeded' });
+  claimTaskById(db, b.id);
+  assert.throws(() => claimTaskById(db, c.id),
+    (err) => err instanceof DependencyBlockedError && err.message.startsWith('任务 #3 还在等依赖 #2（running）')
+      && JSON.stringify(err.blockedBy) === '[2]');
+  finishTask(db, b.id, { status: 'succeeded' });
+  const claimed = claimTaskById(db, c.id);
+  assert.deepEqual([claimed.status, claimed.attempts, claimed.blockedBy], ['running', 1, []]);
+
+  // 非 queued 仍是普通的 InvalidTransitionError（不是 DependencyBlockedError）；不存在仍是 NotFoundError
+  assert.throws(() => claimTaskById(db, c.id),
+    (err) => err instanceof InvalidTransitionError && !(err instanceof DependencyBlockedError) && err.from === 'running');
+  assert.throws(() => claimTaskById(db, 99), (err) => err instanceof NotFoundError);
+});
+
+test('依赖被级联失败后 claimTaskById 报普通的状态错误（failed），不是等依赖', (t) => {
+  const db = openMemory(t);
+  const a = createTask(db, { ...VALID });
+  const b = createTask(db, { ...VALID, dependsOn: [a.id] });
+  cancelTask(db, a.id);
+  assert.throws(() => claimTaskById(db, b.id),
+    (err) => err instanceof InvalidTransitionError && !(err instanceof DependencyBlockedError) && err.from === 'failed');
 });

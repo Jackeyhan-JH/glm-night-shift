@@ -162,6 +162,9 @@ export function createScheduler({
      * 要求「现在就跑」），走完整流水线，返回最终任务对象（Promise）。
      * 任务会在 running 里登记（stop / 取消轮询 / status 都能看到它）。
      * id 接受数字或数字字符串（"12"）；只领 queued 的任务。
+     * **不绕过任务依赖**（#11）：依赖还没全部 succeeded 时 claimTaskById 抛
+     * DependencyBlockedError（InvalidTransitionError 的子类，err.blockedBy 列出未完成的依赖），
+     * 任务原样留在队列、不扣次数、不启动 claude——上游产出还不存在时硬跑只会白花额度。
      * 正在停止（stop() 之后、再次 start() 之前）时拒绝：调度器已承诺不再执行任务，
      * 此时点名跑会跟停机收尾抢任务。先 start() 重启调度器再 runNow。
      * @param {number|string} taskId 正整数或其字符串形式
@@ -169,6 +172,7 @@ export function createScheduler({
      * @throws {TypeError} taskId 不是正整数（或数字字符串）
      * @throws {Error} 调度器正在停止（stop 后未重启）
      * @throws {import('./tasks.js').NotFoundError} 任务不存在
+     * @throws {import('./tasks.js').DependencyBlockedError} 任务在等依赖（见上）
      * @throws {InvalidTransitionError} 任务当前不是 queued（如已 succeeded、或已被
      *   tick 领走正在 running——原子领取保证同一任务绝不会被执行两次）
      */
@@ -177,7 +181,7 @@ export function createScheduler({
       if (stopping) {
         throw new Error(`调度器正在停止，runNow 被拒绝（任务 ${id} 未领取；重启调度器后再试）`);
       }
-      const task = claimTaskById(db, id); // 非 queued 直接抛 InvalidTransitionError
+      const task = claimTaskById(db, id); // 非 queued 或在等依赖都抛 InvalidTransitionError（后者是子类 DependencyBlockedError）
       return processTask(task);
     },
 
