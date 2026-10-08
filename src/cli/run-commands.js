@@ -212,7 +212,7 @@ export const usageCommand = {
     }
     const percent = (window) => `${(window.ratio * 100).toFixed(1)}%`;
     // 与调度器领任务前同一口径的预检（#82）：下一笔按 glm-5.3 当前时刻的倍率计
-    // （模型表里最贵的一档，实际领到的模型只会更便宜），安全阈值用本次读到的
+    // （调度器预检也固定用 glm-5.3，这里跟它同款），安全阈值用本次读到的
     // safetyRatio。不调 canStart——它五小时放不下就直接返回，看不见每周也放不下的
     // 情形；这里逐窗口独立判（比较与 quota.js 同款 1e-9 容差，恰好等于仍算放得下）。
     const nextCost = multiplierFor('glm-5.3', now);
