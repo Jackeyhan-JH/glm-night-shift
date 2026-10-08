@@ -502,12 +502,18 @@ export function cancelTask(db, id) {
  * 重新排队：failed | canceled → queued；attempts 归零、last_error / finished_at /
  * not_before 清空；started_at 保留（下次领取时覆盖），branch / pr_url 也保留
  * （接着上次的开 PR 结果）。
- * 依赖里还有 failed / canceled 的不能重试（要按顺序先重试上游）；重试上游也**不会**
- * 自动恢复因它级联失败的下游——下游要单独 retry。读依赖 + 更新在同一个保存点事务里，
- * 并发下不会出现「校验时依赖还失败、更新时已被别人重试」的窗口。
+ * 依赖里还有 failed / canceled 的不能重试（要按顺序先重试上游）。重试成功时把被这次
+ * 失败**连累**的下游一并重新排队（#55）：状态是 failed、last_error 写着「依赖 #<id>
+ * <原因>」、且 id 是本次重试的任务或同一次已拉回的下游，按这个关系一层层扩——自己跑
+ * 失败的下游（last_error 是运行错误，对不上这句话）保持失败。下游自己的依赖里还有别的
+ * failed / canceled 也不拦（变回排队，领取时自然等着）。读依赖 + 更新 + 连带在同一个
+ * 保存点事务里：上游重试不了时下游一个都不动（回滚不留痕）；并发下不会出现「校验时
+ * 依赖还失败、更新时已被别人重试」的窗口。
  * @param {import('node:sqlite').DatabaseSync} db
  * @param {number} id 正整数
- * @returns {TaskRow} 更新后的任务
+ * @returns {TaskRow} 更新后的任务；附加 `requeued`——被连带重新排队的下游 id（升序，
+ *   没有就是 []，不含重试的任务自己）。只加在返回值上，不进 rowToTask，所以
+ *   GET /api/tasks/:id 的任务 JSON 不带它
  * @throws {ValidationError} id 非正整数，或依赖里还有 failed / canceled 的任务
  *   （field='dependsOn'，message 点名是哪个 id、什么状态）
  * @throws {NotFoundError} 任务不存在
@@ -516,7 +522,7 @@ export function cancelTask(db, id) {
 export function retryTask(db, id) {
   assertPositiveInt(id, 'id');
   const now = nowIso();
-  const row = inSavepoint(db, () => {
+  const { row, requeued } = inSavepoint(db, () => {
     const blocker = db.prepare(`
       SELECT d.depends_on AS id, t.status AS status
       FROM task_deps d JOIN tasks t ON t.id = d.depends_on
@@ -535,9 +541,11 @@ export function retryTask(db, id) {
       RETURNING *
     `).get(now, id);
     if (updated === undefined) throw staleTransitionError(db, id, 'queued');
-    return updated;
+    return { row: updated, requeued: requeueCascadedDependents(db, id, now) };
   });
-  return hydrateTasks(db, [row])[0];
+  const task = hydrateTasks(db, [row])[0];
+  task.requeued = requeued; // 附加字段：不进 rowToTask（GET /api/tasks/:id 不受影响）
+  return task;
 }
 
 /** updateTask 允许出现的 patch 字段（#46）。其余键（repo / source / status / attempts /
@@ -1203,6 +1211,66 @@ function cascadeFailDependents(db, triggerId, now, failureText) {
     FROM (SELECT task_id, MIN(blocker) AS blocker FROM dependents GROUP BY task_id) AS m
     WHERE tasks.id = m.task_id AND tasks.status = 'queued'
   `).run(triggerId, ` ${failureText}`, now, now);
+}
+
+/**
+ * 连带重新排队（#55，retryTask 专用）：把「被这次重试的任务连累失败」的下游拉回
+ * queued。判定只看 last_error 的字面——cascadeFailDependents 写的「依赖 #<n> <原因>」
+ * （井号后是正整数、数字后一个空格），**不看依赖边**：自己跑失败的下游 last_error 是
+ * 运行错误（如 `boom`），对不上这句话，保持失败。先扫出全部 failed 且 last_error 以
+ * 「依赖 #」开头的行，解析出各自点名的 blocker，再从重试的任务出发按「blocker 在本次
+ * 重试集合里」一层层扩到不动点——写着「依赖 #<不在集合里的 id>」的失败任务（那条链的
+ * 根不在本次重试里）不被连带。canceled / queued / running / succeeded 一律不碰。重置
+ * 字段与 retryTask 重置上游一致；UPDATE 带 `status = 'failed'` 守卫（候选行是同一保存点
+ * 里刚扫出来的，正常全部命中，守住并发即可）。必须与 retryTask 在同一保存点里调用：
+ * 上游重试不了时这里根本不会执行，下游一个都不留痕。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} triggerId 刚重试的任务 id
+ * @param {string} now ISO 时间戳（写 updated_at）
+ * @returns {number[]} 被连带重新排队的 id，升序（不含 triggerId 自己）
+ */
+function requeueCascadedDependents(db, triggerId, now) {
+  const rows = db.prepare(`
+    SELECT id, last_error FROM tasks
+    WHERE status = 'failed' AND last_error LIKE '依赖 #%'
+  `).all();
+  const byBlocker = new Map(); // last_error 点名的 blocker id → 指着它的失败任务 id
+  for (const row of rows) {
+    // 级联写的格式是「依赖 #<正整数> 」；LIKE 只做粗筛，这里再按严格的模式解析
+    const matched = /^依赖 #([1-9]\d*) /.exec(row.last_error);
+    if (matched === null) continue;
+    const blocker = Number(matched[1]);
+    const pointing = byBlocker.get(blocker);
+    if (pointing === undefined) byBlocker.set(blocker, [row.id]);
+    else pointing.push(row.id);
+  }
+  const revived = new Set([triggerId]);
+  const requeued = [];
+  let frontier = [triggerId];
+  while (frontier.length > 0) {
+    const next = [];
+    for (const blocker of frontier) {
+      for (const taskId of byBlocker.get(blocker) ?? []) {
+        if (revived.has(taskId)) continue; // 菱形依赖会重逢，去重防死循环
+        revived.add(taskId);
+        requeued.push(taskId);
+        next.push(taskId);
+      }
+    }
+    frontier = next;
+  }
+  requeued.sort((a, b) => a - b);
+  // IN 列表分批：万级长链时不超过 SQLite 的绑定变量上限；同一保存点里仍是一次原子变更
+  for (let i = 0; i < requeued.length; i += 900) {
+    const batch = requeued.slice(i, i + 900);
+    db.prepare(`
+      UPDATE tasks
+      SET status = 'queued', attempts = 0, last_error = NULL, finished_at = NULL,
+          not_before = NULL, updated_at = ?
+      WHERE id IN (${batch.map(() => '?').join(', ')}) AND status = 'failed'
+    `).run(now, ...batch);
+  }
+  return requeued;
 }
 
 /** Date 或 ISO 字符串 → 规范化的 UTC ISO 字符串；两者都不是则抛 ValidationError。 */

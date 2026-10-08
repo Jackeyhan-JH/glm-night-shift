@@ -151,15 +151,18 @@ test('级联只碰 queued：canceled / 已 failed 的下游不被改写', (t) =>
   assert.equal(canceledAfter.status, 'canceled');
   assert.equal(canceledAfter.lastError, null);
 
-  // 已 failed 的下游：第一次级联失败后重试上游、再取消上游——下游保留第一次的 last_error
+  // 已 failed 的下游：第一次级联失败后重试上游、再取消上游——下游保留第一次的 last_error。
+  // D 的 last_error 名 F（一个不在本次重试集合里的失败任务），retry(C) 不会连带它（#55）
+  const f = createTask(db, { ...VALID, prompt: 'F' });
   const c = createTask(db, { ...VALID, prompt: 'C' });
-  const d = createTask(db, { ...VALID, prompt: 'D', dependsOn: [c.id] });
-  failTask(db, c.id); // D 级联失败：依赖 #C 失败
+  const d = createTask(db, { ...VALID, prompt: 'D', dependsOn: [f.id, c.id] });
+  failTask(db, f.id); // D 级联失败：依赖 #F 失败（直接依赖里被干掉的只有 F）
+  failTask(db, c.id); // D 已 failed：这次级联不碰它
   retryTask(db, c.id);
   cancelTask(db, c.id); // 第二次级联若误碰 D，last_error 会变成「已取消」
   const failedAfter = getTask(db, d.id);
   assert.equal(failedAfter.status, 'failed');
-  assert.equal(failedAfter.lastError, `依赖 #${c.id} 失败`, '保留第一次的报错，不被第二次触发改写');
+  assert.equal(failedAfter.lastError, `依赖 #${f.id} 失败`, '保留第一次的报错，不被第二次触发改写');
 });
 
 test('finishTask(succeeded) / finishTask(queued) 不级联；状态守卫未命中时不级联（保存点回滚）', (t) => {
@@ -357,7 +360,7 @@ test('listDependencies：{id, status} 升序；依赖状态随之变化', (t) =>
 
 // ---------------------------------------------------------------- 重试
 
-test('验收: B 因 A 失败而级联失败后 retryTask(B) 抛 ValidationError；先 retry A 再 retry B 成功，B 在 A 成功前仍领不到', (t) => {
+test('验收: B 因 A 失败而级联失败后 retryTask(B) 抛 ValidationError；retry A 连带拉回 B，A 成功前 B 仍领不到', (t) => {
   const db = openMemory(t);
   const a = createTask(db, { ...VALID, prompt: 'A' });
   const b = createTask(db, { ...VALID, prompt: 'B', dependsOn: [a.id] });
@@ -374,9 +377,15 @@ test('验收: B 因 A 失败而级联失败后 retryTask(B) 抛 ValidationError�
   const retriedA = retryTask(db, a.id);
   assert.equal(retriedA.status, 'queued');
   assert.deepEqual(retriedA.dependsOn, []);
-  const retriedB = retryTask(db, b.id);
-  assert.equal(retriedB.status, 'queued');
-  assert.deepEqual(retriedB.blockedBy, [a.id], 'A 只是回队列还没成功，B 仍被挡');
+  const afterB = getTask(db, b.id); // B 已被连带重新排队
+  assert.equal(afterB.status, 'queued');
+  assert.equal(afterB.attempts, 0);
+  assert.equal(afterB.lastError, null);
+  assert.deepEqual(afterB.blockedBy, [a.id], 'A 只是回队列还没成功，B 仍被挡');
+  assert.throws(
+    () => retryTask(db, b.id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'queued',
+  );
 
   assert.equal(claimNextTask(db).id, a.id, '先领 A（B 被挡）');
   assert.equal(claimNextTask(db), null, 'A 成功前 B 领不到');
@@ -384,15 +393,15 @@ test('验收: B 因 A 失败而级联失败后 retryTask(B) 抛 ValidationError�
   assert.equal(claimNextTask(db).id, b.id);
 });
 
-test('重试上游不恢复下游：A 级联失败 B 后 retry(A)，B 保持 failed、lastError 保留', (t) => {
+test('重试上游连带恢复下游：A 级联失败 B 后 retry(A)，B 一起回 queued、lastError 清空', (t) => {
   const db = openMemory(t);
   const a = createTask(db, { ...VALID, prompt: 'A' });
   const b = createTask(db, { ...VALID, prompt: 'B', dependsOn: [a.id] });
   failTask(db, a.id);
   retryTask(db, a.id);
   const after = getTask(db, b.id);
-  assert.equal(after.status, 'failed', '下游要单独 retry');
-  assert.equal(after.lastError, `依赖 #${a.id} 失败`);
+  assert.equal(after.status, 'queued', '下游被连带重新排队');
+  assert.equal(after.lastError, null);
 });
 
 test('依赖是 canceled 的任务同样不能重试；重试成功后依赖只剩 queued 不再拦截', (t) => {
@@ -405,8 +414,8 @@ test('依赖是 canceled 的任务同样不能重试；重试成功后依赖只�
     (err) => err instanceof ValidationError && err.field === 'dependsOn'
       && err.message.includes(`依赖 #${a.id} 仍是 canceled，请先重试它`),
   );
-  retryTask(db, a.id); // A 回队列
-  assert.equal(retryTask(db, b.id).status, 'queued', '依赖不再是 failed/canceled 就能重试');
+  retryTask(db, a.id); // A 回队列（B 写着「依赖 #A 已取消」，被连带一起拉回）
+  assert.equal(getTask(db, b.id).status, 'queued', '依赖不再是 failed/canceled，B 已连带回队列');
 });
 
 test('无依赖任务的 retryTask 行为不变（回归：不因依赖检查误伤）', (t) => {

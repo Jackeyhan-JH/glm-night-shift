@@ -416,7 +416,12 @@ function statusChangeCommand({ name, summary, action, label }) {
       const { positionals } = parseArgs({ args, options: {}, allowPositionals: true });
       const id = parseIdPositional(ctx, positionals, usage);
       const task = await withDb(ctx, (db) => action(db, id));
-      ctx.stdout.write(`#${task.id} ${label}（${task.status}）\n`);
+      // retry 连带重新排队时（#55）在行尾点名下游（id 升序、中文顿号）；cancelTask 的
+      // 返回没有 requeued，chained 为空串，输出与从前逐字一样
+      const chained = Array.isArray(task.requeued) && task.requeued.length > 0
+        ? `，连带 ${task.requeued.map((downstream) => `#${downstream}`).join('、')}`
+        : '';
+      ctx.stdout.write(`#${task.id} ${label}（${task.status}）${chained}\n`);
       return 0;
     },
   };
