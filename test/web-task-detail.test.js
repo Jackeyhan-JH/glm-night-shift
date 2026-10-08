@@ -890,3 +890,148 @@ test('验收: 409：按钮旁显示后端的 error 原文，与取消 / 重试�
   assert.equal(page.refs.followBtn.textContent, '跟进');
   assert.equal(page.refs.followBtn.disabled, false);
 });
+
+// ---------- #106 重试的连带重新排队：按 URL / 方法分支的重试桩 ----------
+
+/**
+ * 重试版页面装配（写法对齐 makeFollowPage）：GET /api/tasks/1 永远回 task（任务对象
+ * 本来就没有 requeued 字段），POST /api/tasks/1/retry 与 POST /api/tasks/1/cancel 各回
+ * 测试给的 { ok, status, body }（retry() / cancel() 每次调用时取）。task 缺省给
+ * canceled——重试按钮只对 failed / canceled 露出。
+ */
+function makeRetryPage(t, { task = taskPayload({ status: 'canceled' }), retry, cancel } = {}) {
+  const doc = makeStubDoc();
+  const real = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? 'GET';
+    calls.push(`${method} ${url}`);
+    const post = (stub) => {
+      const { ok, status, body } = stub();
+      return Promise.resolve({ ok, status, text: () => Promise.resolve(JSON.stringify(body)) });
+    };
+    if (method === 'POST' && url === '/api/tasks/1/retry') return post(retry);
+    if (method === 'POST' && url === '/api/tasks/1/cancel') return post(cancel);
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify(task)),
+    });
+  };
+  const page = createPage({ doc, location: { search: '?id=1' } }).init();
+  t.after(() => {
+    page.destroy();
+    globalThis.fetch = real;
+  });
+  return { page, doc, calls };
+}
+
+test('验收: 重试响应 requeued [3, 2]：actionMsg 精确是「连带 #2、#3 重新排队」且无子元素；POST 在最后一次 GET 之前（先刷新后写句子）', async (t) => {
+  const { page, calls } = makeRetryPage(t, {
+    retry: () => ({ ok: true, status: 200, body: { id: 1, status: 'queued', requeued: [3, 2] } }),
+  });
+  await page.busy;
+  assert.equal(page.refs.retryBtn.style.display, '', '已取消：重试按钮可见');
+
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+
+  assert.equal(page.refs.actionMsg.textContent, '连带 #2、#3 重新排队');
+  assert.equal(page.refs.actionMsg.children.length, 0, '整句一个 textContent，没有子元素');
+  assert.ok(calls.indexOf('POST /api/tasks/1/retry') < calls.lastIndexOf('GET /api/tasks/1'),
+    `先刷新后写句子，实际顺序：${calls.join(' -> ')}`);
+  assert.equal(page.refs.retryBtn.disabled, false, '按钮恢复可用');
+});
+
+test('验收: requeued [10, 2]：显示「连带 #2、#10 重新排队」（数字升序，不是字符串序）', async (t) => {
+  const { page } = makeRetryPage(t, {
+    retry: () => ({ ok: true, status: 200, body: { requeued: [10, 2] } }),
+  });
+  await page.busy;
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.actionMsg.textContent, '连带 #2、#10 重新排队');
+});
+
+test('验收: requeued 只有一个 id：「连带 #2 重新排队」，不多一个顿号', async (t) => {
+  const { page } = makeRetryPage(t, {
+    retry: () => ({ ok: true, status: 200, body: { requeued: [2] } }),
+  });
+  await page.busy;
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.actionMsg.textContent, '连带 #2 重新排队');
+});
+
+test('验收: requeued 是空数组：不写句子也不另做成功提示，actionMsg 是空串', async (t) => {
+  const { page } = makeRetryPage(t, {
+    retry: () => ({ ok: true, status: 200, body: { id: 1, status: 'queued', requeued: [] } }),
+  });
+  await page.busy;
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.actionMsg.textContent, '');
+  assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+  assert.ok(!page.refs.actionMsg.textContent.includes('重新排队'));
+});
+
+test('验收: 响应没有 requeued 字段（只有 id / status）：同样不写，actionMsg 为空', async (t) => {
+  const { page } = makeRetryPage(t, {
+    retry: () => ({ ok: true, status: 200, body: { id: 1, status: 'queued' } }),
+  });
+  await page.busy;
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.actionMsg.textContent, '');
+  assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+  assert.ok(!page.refs.actionMsg.textContent.includes('重新排队'));
+});
+
+test('验收: requeued 不是数组（字符串 / 对象 / null / 数字）：同样不写这句', async (t) => {
+  const bodies = [
+    { requeued: '3,2' },
+    { requeued: { 2: 2, 3: 3 } },
+    { requeued: null },
+    { requeued: 3 },
+  ];
+  for (const body of bodies) {
+    const { page } = makeRetryPage(t, {
+      retry: () => ({ ok: true, status: 200, body }),
+    });
+    await page.busy;
+    page.refs.retryBtn.dispatch('click');
+    await page.busy;
+    assert.equal(page.refs.actionMsg.textContent, '',
+      `requeued=${JSON.stringify(body.requeued)} 不该写句子`);
+    assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+    assert.ok(!page.refs.actionMsg.textContent.includes('重新排队'));
+  }
+});
+
+test('验收: 取消的响应即使带 requeued [3, 2]：actionMsg 也不含「连带」「重新排队」（句子只属于重试路径）', async (t) => {
+  const { page } = makeRetryPage(t, {
+    task: taskPayload(), // queued：取消按钮可见
+    cancel: () => ({ ok: true, status: 200, body: { id: 1, status: 'canceled', requeued: [3, 2] } }),
+  });
+  await page.busy;
+  assert.equal(page.refs.cancelBtn.style.display, '', '排队中：取消按钮可见');
+  page.refs.cancelBtn.dispatch('click');
+  await page.busy;
+  assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+  assert.ok(!page.refs.actionMsg.textContent.includes('重新排队'));
+  assert.equal(page.refs.actionMsg.textContent, '', '取消成功路径上 actionMsg 保持空');
+});
+
+test('验收: 重试非 2xx：actionMsg 是后端 error 原文、不含「连带」；失败不当成功刷新（POST 后没有再 GET）', async (t) => {
+  const { page, calls } = makeRetryPage(t, {
+    retry: () => ({ ok: false, status: 409, body: { error: '不能从 canceled 重试' } }),
+  });
+  await page.busy;
+  page.refs.retryBtn.dispatch('click');
+  await page.busy;
+  assert.equal(page.refs.actionMsg.textContent, '不能从 canceled 重试');
+  assert.ok(!page.refs.actionMsg.textContent.includes('连带'));
+  assert.ok(calls.indexOf('POST /api/tasks/1/retry') > calls.lastIndexOf('GET /api/tasks/1'),
+    `失败后不该再刷新，实际顺序：${calls.join(' -> ')}`);
+});
