@@ -142,6 +142,8 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `usage` | `[--json]` | 查看额度用量（5 小时 / 每周，本地估算） |
 | `logs` | `<id>` `[--run <n>]` `[--follow]` | 查看任务某次运行的日志。`--run` 缺省最新一次。`--follow` 跟到该次运行的 `finished_at` 有值、且日志文件安静了一个轮询周期后退出 0；若永远没有 `finished_at`，它不会自己停，用 Ctrl-C 结束（没有「第二次信号才强制」的处理器） |
 | `run-now` | `<id>` | 立刻执行一次排队中的任务（无视高峰、额度、限流退避与 not-before，但**不绕过依赖**）；任务失败退出 1 |
+| `pause` | 无 | 暂停领取新任务（正在跑的会跑完）。写在库里，和限流暂停分开；`run-now` 不受影响 |
+| `resume` | 无 | 恢复领取新任务 |
 | `deps` | `<id>` `[--set <id,id,…>]` | 查看或修改任务依赖（`--set ""` 清空；只读时不带 `--set`） |
 | `config` | `[--json]` | 查看生效配置与数据目录各路径（只读） |
 | `templates` | `[--json]` 或 `templates show <名字>` | 列出/查看任务模板（内置 + `<数据目录>/templates/` 自定义，同名覆盖内置） |
