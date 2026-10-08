@@ -87,7 +87,8 @@ function depsLine(deps) {
 
 /**
  * show 的任务详情：标题行 + 对齐的字段列表 + 依赖行 + 缩进的提示词 + 运行记录表格
- * （列：尝试次数、类型、模型、状态、耗时、额度、日志路径）。没有运行记录时明确说无。
+ * （列：尝试次数、类型、模型、思考强度、高峰、状态、开始时间、耗时、额度、轮数、错误、
+ * 日志路径）。没有运行记录时明确说无。
  * 带诊断（#12）的运行在表格后逐行列出诊断第一行（诊断是多行文本，塞进表格会撑破列宽）。
  * deps 是 listDependencies() 的结果（[{id, status}]，升序）；缺省视为无依赖。
  * waitingSameRepo（#85，task-commands.js 判好传入）：true 且任务仍是 queued 时，
@@ -140,14 +141,24 @@ export function renderTaskDetail(task, runs, deps = [], { waitingSameRepo = fals
   if (runs.length === 0) {
     lines.push('', '运行记录：无');
   } else {
-    const header = ['尝试次数', '类型', '模型', '状态', '耗时', '额度', '日志路径'];
+    const header = ['尝试次数', '类型', '模型', '思考强度', '高峰', '状态', '开始时间', '耗时', '额度', '轮数', '错误', '日志路径'];
     const rows = runs.map((r) => [
       String(r.attempt),
       r.kind ?? 'task',
       r.model,
+      // #104 思考强度：缺值留空列（不写 null / -），有值原样（high 不翻译）
+      filled(r.effort) ? String(r.effort) : '',
+      r.peak ? '是' : '否',
       r.status,
+      // #104 开始时间：缺值或非法时间给 -，合法 ISO 才转本地分钟（与详情页同规则）
+      filled(r.startedAt) && !Number.isNaN(new Date(r.startedAt).getTime())
+        ? formatLocalMinute(r.startedAt)
+        : '-',
       formatDurationMs(r.durationMs),
       r.quotaUnits === null || r.quotaUnits === undefined ? '-' : String(r.quotaUnits),
+      r.numTurns === null || r.numTurns === undefined ? '-' : String(r.numTurns),
+      // #104 错误只出第一行（不 trim、不截断），再压平控制字符防撑破表格；诊断另有专行
+      filled(r.error) ? singleLine(String(r.error).split('\n')[0]) : '',
       r.logPath,
     ]);
     lines.push('', `运行记录（${runs.length} 条）：`, ...renderTable(header, rows, '  ').split('\n'));

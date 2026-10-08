@@ -230,10 +230,58 @@ test('renderTaskDetail：字段列表、提示词缩进、运行记录表（尝�
   assert.ok(out.includes('提示词：\n  提示词'));
   assert.ok(out.includes('运行记录（2 条）：'));
   assert.ok(out.includes('尝试次数'));
+  // #104：与详情页对齐的五个新列表头
+  for (const column of ['思考强度', '高峰', '开始时间', '轮数', '错误']) {
+    assert.ok(out.includes(column), `运行记录表头缺「${column}」`);
+  }
+  // #104 新列的格子：第一行 effort high、peak false、numTurns 4、error 第一行、
+  // startedAt=CREATED_AT → 本地分钟；第二行 peak true → 是
+  const table = out.slice(out.indexOf('运行记录（2 条）：'));
+  for (const cell of ['high', '否', '是', '2026-10-08 15:30', '4', 'claude 退出码 1']) {
+    assert.ok(table.includes(cell), `运行记录表缺「${cell}」`);
+  }
   assert.ok(out.includes('glm-5.3-flash'));
   assert.ok(out.includes('1分2秒')); // durationMs 62000
   assert.ok(out.includes('-')); // 进行中的 run：耗时/额度为 -
   assert.ok(out.includes('/tmp/logs/task-7-run-2.log'));
+});
+
+test('renderTaskDetail：run 缺新字段时行不丢、逐格按列规则兜底；多行错误只出第一行（#104）', () => {
+  const task = taskFixture({ id: 3, status: 'failed', attempts: 3, maxAttempts: 3 });
+  const runs = [
+    { // 五个新字段全缺（undefined）：行必须还在，格子按各列规则兜底
+      id: 1, taskId: 3, attempt: 1, model: 'glm-5.3', status: 'failed',
+      durationMs: 1500, quotaUnits: null, logPath: '/tmp/logs/task-3-run-1.log',
+      error: '第一行\n第二行',
+    },
+    { // effort 空串、peak null、startedAt 非法、error null；numTurns 0 不是缺，仍是 0
+      id: 2, taskId: 3, attempt: 2, model: 'glm-5.3', effort: '', peak: null,
+      status: 'succeeded', startedAt: '不是时间', numTurns: 0,
+      durationMs: 250, quotaUnits: 1.5, logPath: '/tmp/logs/task-3-run-2.log',
+    },
+    { // effort null、peak undefined 一样算缺；错误第一行里的控制字符被压平成空格
+      id: 3, taskId: 3, attempt: 3, model: 'glm-5.3', effort: null, peak: undefined,
+      status: 'failed', startedAt: CREATED_AT, numTurns: 2,
+      durationMs: 62000, quotaUnits: 3, logPath: '/tmp/logs/task-3-run-3.log',
+      error: '第一\x07行\n第二行',
+    },
+  ];
+  const out = renderTaskDetail(task, runs);
+  // 逐格核对：按 renderTable 同样的宽度规则（列宽 = 表头与全部数据行取宽）拼出期望行
+  const header = ['尝试次数', '类型', '模型', '思考强度', '高峰', '状态', '开始时间', '耗时', '额度', '轮数', '错误', '日志路径'];
+  const expected = [
+    ['1', 'task', 'glm-5.3', '', '否', 'failed', '-', '1.5秒', '-', '-', '第一行', '/tmp/logs/task-3-run-1.log'],
+    ['2', 'task', 'glm-5.3', '', '否', 'succeeded', '-', '250毫秒', '1.5', '0', '', '/tmp/logs/task-3-run-2.log'],
+    ['3', 'task', 'glm-5.3', '', '否', 'failed', '2026-10-08 15:30', '1分2秒', '3', '2', '第一 行', '/tmp/logs/task-3-run-3.log'],
+  ];
+  const widths = header.map((h, i) => Math.max(displayWidth(h), ...expected.map((cells) => displayWidth(cells[i]))));
+  for (const cells of expected) {
+    const row = cells.map((c, i) => padEndDisplay(c, widths[i])).join('  ').trimEnd();
+    assert.ok(out.includes(row), `应含运行行「${row}」`);
+  }
+  assert.ok(!out.includes('第二行'), '多行错误只出第一行');
+  assert.ok(!out.includes('\x07'), '错误里的控制字符换成空格');
+  assert.ok(!out.includes('null'), '任何缺值都不落成单词 null');
 });
 
 test('renderTaskDetail：没有运行记录时明确说无', () => {
