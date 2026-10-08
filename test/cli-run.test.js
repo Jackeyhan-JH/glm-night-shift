@@ -244,8 +244,11 @@ test('验收: start 跑完任务：show 变 succeeded 带 prUrl，stdout 有启�
 
   const proc = spawnCliProc(['start'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
   t.after(() => { proc.child.kill('SIGKILL'); }); // 断言中途失败也别留下进程
-  await waitUntil(() => readTask(home, 1)?.status === 'succeeded',
-    { timeoutMs: 10_000, message: '任务应在 10 秒内跑成 succeeded' });
+  // 等成功行本身（done 事件在 worktree 清理之后才发，比库里的 succeeded 晚一拍，
+  // 直接等库状态再断言 stdout 会有竞态）
+  await waitUntil(() => proc.stdout().includes('#1 成功：'),
+    { timeoutMs: 10_000, message: '任务应在 10 秒内跑成并打印成功行' });
+  assert.equal(readTask(home, 1).status, 'succeeded');
 
   const shown = await runCli(['show', '1', '--json'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
   assert.equal(shown.code, 0, shown.stderr);
@@ -309,6 +312,41 @@ test('start 空队列：第一次 SIGINT 直接退出 0', async (t) => {
   const closed = await withTimeout(proc.close, 3000, '空队列 SIGINT 后 3 秒内应退出');
   assert.equal(closed.code, 0);
   assert.equal(closed.signal, null);
+});
+
+test('start 空队列：SIGTERM 与第一次 Ctrl-C 同样直接退出 0', async (t) => {
+  const { home } = setup(t);
+  const proc = spawnCliProc(['start'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  t.after(() => { proc.child.kill('SIGKILL'); });
+  await waitUntil(() => proc.stdout().includes('GLM 夜班已启动'),
+    { timeoutMs: 5000, message: '应打印启动行' });
+  proc.child.kill('SIGTERM');
+  const closed = await withTimeout(proc.close, 3000, 'SIGTERM 后 3 秒内应退出');
+  assert.equal(closed.code, 0);
+  assert.equal(closed.signal, null);
+});
+
+test('start 失败重试：先打印「放回队列」再「失败」，任务最终 failed（maxAttempts 2）', async (t) => {
+  const { home } = setup(t);
+  // 假 claude 成功写入文件，但测试命令恒失败：两轮都按普通失败走重试
+  const add = await runCli(['add', '--repo', 'a/b', '--prompt', '跑测试', '--test', 'exit 1'], { home });
+  assert.equal(add.code, 0, add.stderr);
+
+  const proc = spawnCliProc(['start'], { home, env: { NIGHT_SHIFT_NOW: OFF_PEAK_NOW } });
+  t.after(() => { proc.child.kill('SIGKILL'); });
+  // 等「失败」行本身（done 事件比库里的 failed 晚一拍，见上一个测试的说明）
+  await waitUntil(() => proc.stdout().includes('#1 失败：测试失败：'),
+    { timeoutMs: 10_000, message: '两次尝试用尽后应打印失败行' });
+
+  assert.ok(proc.stdout().includes('放回队列：测试失败：'), proc.stdout());
+  assert.ok(proc.stdout().includes('#1 失败：测试失败：'), proc.stdout());
+  assert.equal(readTask(home, 1).attempts, 2);
+  // 两次失败各占一行「放回队列 / 失败」，领取也有两行
+  assert.equal(proc.stdout().match(/领取 #1 /g).length, 2, proc.stdout());
+
+  proc.child.kill('SIGINT');
+  const closed = await withTimeout(proc.close, 3000, 'SIGINT 后 3 秒内应退出');
+  assert.equal(closed.code, 0);
 });
 
 test('start 高峰时段：打印「暂停领取：高峰期」，普通任务保持 queued', async (t) => {

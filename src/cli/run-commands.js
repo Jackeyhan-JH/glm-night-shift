@@ -40,13 +40,12 @@ const FOLLOW_POLL_MS = 100;
 /** 多行用法里续行的缩进：对齐到「用法：night-shift 」之后的命令名（与其他 cli 模块一致）。 */
 const USAGE_CONT = ' '.repeat(15);
 
+const p2 = (n) => String(n).padStart(2, '0');
+
 /** 本地时区 HH:MM（事件行的 [HH:MM] 前缀）。 */
 function localHourMinute(date) {
-  const p2 = (n) => String(n).padStart(2, '0');
   return `${p2(date.getHours())}:${p2(date.getMinutes())}`;
 }
-
-const p2 = (n) => String(n).padStart(2, '0');
 
 /** 北京日历时刻（固定 UTC+8，无夏令时）：周几 + HH:MM。 */
 function beijingWeekdayHM(date) {
@@ -397,14 +396,14 @@ export const runNowCommand = {
     }
     if (task.status === 'queued') {
       // 这次执行失败但还有尝试次数：任务已放回队列，交给 start 继续调度
-      ctx.stdout.write(`#${id} 失败：${task.lastError}（已放回队列）\n`);
+      ctx.stdout.write(`#${id} 失败：${task.lastError ?? ''}（已放回队列）\n`);
       return 1;
     }
     if (task.status === 'canceled') {
       ctx.stdout.write(`#${id} 已取消${task.lastError === null ? '' : `：${task.lastError}`}\n`);
       return 1;
     }
-    ctx.stdout.write(`#${id} 失败：${task.lastError}\n`);
+    ctx.stdout.write(`#${id} 失败：${task.lastError ?? ''}\n`);
     return 1;
   },
 };
