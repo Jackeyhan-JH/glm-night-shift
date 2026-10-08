@@ -31,7 +31,9 @@ import {
   kindLabel,
   parseTaskId,
   runStatusLabel,
+  whyNotClaimed,
 } from '../web/task.js';
+import { fmtTime } from '../web/common.js';
 import { makeTempHome } from './helpers.js';
 
 // ---------- DOM 桩 ----------
@@ -400,6 +402,121 @@ test('difficultyLabel / firstErrorLine / parseTaskId', () => {
   assert.equal(parseTaskId('?id=abc'), null);
   assert.equal(parseTaskId(''), null);
   assert.equal(parseTaskId('?other=1'), null);
+});
+
+// ---------- whyNotClaimed（#66：排队任务为什么还没被领） ----------
+
+/** 最小可用的 /api/status 形状（这行只读顶层 userPaused 和 scheduler.blocked）。 */
+function statusBody(overrides = {}) {
+  return {
+    userPaused: false,
+    scheduler: { blocked: null, userPaused: false },
+    ...overrides,
+  };
+}
+
+const QUEUED_TASK = { status: 'queued', allowPeak: false };
+
+test('验收: whyNotClaimed：scheduler === null →「调度器没在跑」，userPaused 也压不过它（顺序 3 在 4 之前）', () => {
+  assert.equal(whyNotClaimed({ scheduler: null, userPaused: true }, QUEUED_TASK), '调度器没在跑');
+  // 顶层夹一个 blocked 也不看：blocked 只认 scheduler.blocked
+  assert.equal(
+    whyNotClaimed(
+      { scheduler: null, userPaused: true, blocked: { reason: 'five-hour' } },
+      QUEUED_TASK,
+    ),
+    '调度器没在跑',
+  );
+});
+
+test('验收: whyNotClaimed：顶层 userPaused === true 且 blocked five-hour → 只「已暂停领任务」，不含「额度」', () => {
+  const out = whyNotClaimed(statusBody({
+    userPaused: true,
+    scheduler: { blocked: { reason: 'five-hour', retryAt: '2026-10-08T09:00:00.000Z' }, userPaused: false },
+  }), QUEUED_TASK);
+  assert.equal(out, '已暂停领任务');
+  assert.ok(!out.includes('额度'), '暂停时 blocked 是上一轮留下的，不显示');
+});
+
+test('验收: whyNotClaimed：不读 scheduler.userPaused——顶层 false、scheduler.userPaused true、blocked null → \'\'', () => {
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: null, userPaused: true },
+  }), QUEUED_TASK), '');
+});
+
+test('验收: whyNotClaimed：five-hour 带 retryAt → 句子 +「；预计 fmtTime(retryAt) 恢复」', () => {
+  const retryAt = '2026-10-08T09:05:00.000Z';
+  const out = whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'five-hour', retryAt }, userPaused: false },
+  }), QUEUED_TASK);
+  assert.ok(out.includes('5 小时额度已达安全阈值'));
+  assert.equal(out, `5 小时额度已达安全阈值；预计 ${fmtTime(retryAt)} 恢复`);
+});
+
+test('验收: whyNotClaimed：five-hour 无 retryAt → 正好一句，不含「预计」', () => {
+  const out = whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'five-hour' }, userPaused: false },
+  }), QUEUED_TASK);
+  assert.equal(out, '5 小时额度已达安全阈值');
+  assert.ok(!out.includes('预计'));
+  // retryAt 为 null 同样不接这半句
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'five-hour', retryAt: null }, userPaused: false },
+  }), QUEUED_TASK), '5 小时额度已达安全阈值');
+});
+
+test('验收: whyNotClaimed：weekly 带 retryAt →「每周额度已达安全阈值」加恢复后缀；非法 retryAt 不接', () => {
+  const retryAt = '2026-10-12T23:00:00.000Z';
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'weekly', retryAt }, userPaused: false },
+  }), QUEUED_TASK), `每周额度已达安全阈值；预计 ${fmtTime(retryAt)} 恢复`);
+  // fmtTime 得 '-'（非法时间）：只留句子，不写「预计 - 恢复」
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'weekly', retryAt: 'not-a-date' }, userPaused: false },
+  }), QUEUED_TASK), '每周额度已达安全阈值');
+});
+
+test('验收: whyNotClaimed：rate-limit 带 retryAt →「触发限流，全局退避中」加同样后缀', () => {
+  const retryAt = '2026-10-08T08:30:00.000Z';
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'rate-limit', retryAt }, userPaused: false },
+  }), QUEUED_TASK), `触发限流，全局退避中；预计 ${fmtTime(retryAt)} 恢复`);
+});
+
+test('验收: whyNotClaimed：peak 且 allowPeak false →「高峰期，暂不领新任务」', () => {
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'peak', retryAt: '2026-10-08T13:00:00.000Z' }, userPaused: false },
+  }), QUEUED_TASK), `高峰期，暂不领新任务；预计 ${fmtTime('2026-10-08T13:00:00.000Z')} 恢复`);
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'peak' }, userPaused: false },
+  }), { status: 'queued', allowPeak: false }), '高峰期，暂不领新任务');
+});
+
+test('验收: whyNotClaimed：peak 且 allowPeak === true → \'\'（这条允许高峰，整行不出现）', () => {
+  assert.equal(whyNotClaimed(statusBody({
+    scheduler: { blocked: { reason: 'peak' }, userPaused: false },
+  }), { status: 'queued', allowPeak: true }), '');
+});
+
+test('验收: whyNotClaimed：scheduler 是对象、blocked null、未暂停、queued → \'\'', () => {
+  assert.equal(whyNotClaimed(statusBody(), QUEUED_TASK), '');
+});
+
+test('验收: whyNotClaimed：task.status running（哪怕 scheduler null）→ \'\'；statusBody null → \'\'', () => {
+  assert.equal(whyNotClaimed({ scheduler: null }, { status: 'running', allowPeak: false }), '');
+  assert.equal(whyNotClaimed(null, QUEUED_TASK), '');
+});
+
+test('验收: whyNotClaimed：不改入参（深拷贝对照）', () => {
+  const body = statusBody({
+    scheduler: { blocked: { reason: 'peak', retryAt: '2026-10-08T10:00:00.000Z' }, userPaused: false },
+  });
+  const task = { status: 'queued', allowPeak: false };
+  const bodyCopy = structuredClone(body);
+  const taskCopy = structuredClone(task);
+  whyNotClaimed(body, task);
+  assert.deepEqual(body, bodyCopy);
+  assert.deepEqual(task, taskCopy);
 });
 
 // ---------- 页面 ----------

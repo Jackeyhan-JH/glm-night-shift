@@ -82,6 +82,41 @@ export function parseTaskId(search) {
   return Number.isInteger(id) && id >= 1 ? id : null;
 }
 
+/**
+ * 排队中的任务为什么还没被领（#66）：读 GET /api/status 的响应，按固定优先级点名
+ * 第一条命中的原因。返回要显示的整句；''（空串）= 整行不画。判定顺序（命中即停，
+ * 不叠句）：
+ * 1. 任务不是 queued → ''（调用方本就不该为非 queued 去拉 status，纯函数自己守住）；
+ * 2. statusBody 缺失 / 请求失败（调用方传 null）→ ''；
+ * 3. scheduler === null（严格 null：服务端没接调度器）→「调度器没在跑」；
+ * 4. 顶层 userPaused === true →「已暂停领任务」（只看顶层字段，不读 scheduler.userPaused；
+ *    暂停时 blocked 可能是上一轮留下的，这一条压过后面所有 blocked）；
+ * 5–8. scheduler.blocked.reason 命中 rate-limit / five-hour / weekly 时给对应句子；
+ *    peak 只拦 allowPeak !== true 的任务，allowPeak === true 整行不出现；
+ * 9. 其余（blocked 为 null、无可点名的 reason、未知 reason）→ ''。
+ * 5–8 带 retryAt 时句尾接「；预计 <本地时间> 恢复」（fmtTime；缺失 / null / 非法时间
+ * 得 '-' 时不接这半句）。纯函数：不改入参、不碰 DOM、不发请求。
+ * @param {object|null} statusBody /api/status 的响应体（请求失败时调用方传 null）
+ * @param {{ status?: string, allowPeak?: boolean }} task 当前任务（页面的 state.task）
+ * @returns {string} 要显示的整句；'' = 不显示
+ */
+export function whyNotClaimed(statusBody, task) {
+  if (task?.status !== 'queued') return '';
+  if (statusBody === null || statusBody === undefined) return '';
+  if (statusBody.scheduler === null) return '调度器没在跑';
+  if (statusBody.userPaused === true) return '已暂停领任务';
+  const blocked = statusBody.scheduler?.blocked;
+  if (blocked === null || typeof blocked !== 'object') return '';
+  let sentence = '';
+  if (blocked.reason === 'rate-limit') sentence = '触发限流，全局退避中';
+  else if (blocked.reason === 'five-hour') sentence = '5 小时额度已达安全阈值';
+  else if (blocked.reason === 'weekly') sentence = '每周额度已达安全阈值';
+  else if (blocked.reason === 'peak' && task.allowPeak !== true) sentence = '高峰期，暂不领新任务';
+  if (sentence === '') return '';
+  const at = fmtTime(blocked.retryAt);
+  return at === '-' ? sentence : `${sentence}；预计 ${at} 恢复`;
+}
+
 // ---------------------------------------------------------------- 页面装配
 
 /**
@@ -115,6 +150,7 @@ export function createPage(options = {}) {
     streamDone: false, // 收到过 done 事件（其后连接关闭触发的 error 要忽略）
     retryTimer: null,
     refreshTimer: null,
+    statusBody: null, // 最近一次 /api/status 的响应（只在任务排队时拉；非 queued / 失败为 null）
   };
   let loadSeq = 0; // 已结束运行日志的加载序号：切换运行后丢弃过期的响应
 
@@ -259,6 +295,14 @@ export function createPage(options = {}) {
     }
     state.task = payload;
     state.runs = Array.isArray(payload.runs) ? payload.runs : [];
+    // #66：排队中顺带拉 /api/status 判定「还没领」的原因（首屏与每次 tick 都在这里，
+    // 不另起定时器）；非 queued 不为这行发请求，并把上一轮的原因清掉——别把旧理由
+    // 留在别的状态的页面上。
+    if (state.task.status === 'queued') {
+      state.statusBody = await fetchStatusBody();
+    } else {
+      state.statusBody = null;
+    }
     renderInfo();
     renderRuns();
     manageRefreshTimer();
@@ -266,6 +310,18 @@ export function createPage(options = {}) {
       await selectRunInner(state.runs[0].id); // 默认选中最新一次（列表已按新到旧排序）
     } else {
       updateLogHeader(state.runs.find((r) => r.id === state.selectedRunId) ?? null);
+    }
+  }
+
+  /**
+   * 拉 /api/status（「还没领」那一行的依据）。失败（网络错误 / 非 2xx）按 null 返回：
+   * 这是附属行，不能因为它把任务信息也拖垮——页面照常画，只是少这一行。
+   */
+  async function fetchStatusBody() {
+    try {
+      return await api('/api/status');
+    } catch {
+      return null;
     }
   }
 
@@ -549,6 +605,13 @@ export function createPage(options = {}) {
     if (task.notBefore !== null && task.notBefore !== undefined && task.notBefore !== '') {
       addText('暂不开始', fmtTime(task.notBefore));
     }
+    // 还没领（#66）：排队中点名为什么没被调度器领走（调度器没开 / 手动暂停 / 限流 /
+    // 额度 / 高峰）。判定在纯函数 whyNotClaimed（优先级见其注释）；没有可点名的
+    // 原因整行不画（也不画成 -），句子一律走 addText 的 textContent。
+    const whyQueued = whyNotClaimed(state.statusBody, task);
+    if (whyQueued !== '') {
+      addText('还没领', whyQueued);
+    }
     if (typeof task.lastError === 'string' && task.lastError !== '') {
       const dt = doc.createElement('dt');
       dt.textContent = '最近错误';
@@ -662,14 +725,17 @@ export function createPage(options = {}) {
     root.appendChild(box);
   }
 
-  /** running 时每 5 秒刷新任务信息（日志由 SSE 负责）；离开 running 停掉定时器。 */
+  /** running / queued 时每 5 秒刷新任务信息（running 看状态与运行列表变化，queued
+   * 还要跟上「还没领」的原因——doRefresh 里只有 queued 才会顺带拉 /api/status）；
+   * 离开这两态（succeeded / failed / canceled）停掉定时器。同一个定时器，不另起。 */
   function manageRefreshTimer() {
-    const running = state.task !== null && state.task.status === 'running';
-    if (running && state.refreshTimer === null) {
+    const active = state.task !== null
+      && (state.task.status === 'running' || state.task.status === 'queued');
+    if (active && state.refreshTimer === null) {
       state.refreshTimer = timers.setInterval(() => {
         page.busy = doRefresh();
       }, REFRESH_MS);
-    } else if (!running && state.refreshTimer !== null) {
+    } else if (!active && state.refreshTimer !== null) {
       timers.clearInterval(state.refreshTimer);
       state.refreshTimer = null;
     }
