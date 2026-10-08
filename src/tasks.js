@@ -378,7 +378,8 @@ export function recoverStaleRunning(db) {
  * @param {string} input.model 非空
  * @param {string} input.effort 非空
  * @param {boolean} input.peak 开始时是否高峰
- * @param {string} input.logPath 非空
+ * @param {string} input.logPath 空串或非空字符串。空串合法：#7 的 runTask 先 startRun
+ *   拿到 id（日志路径里要用它），再立刻 setRunLogPath 补上真实路径；纯空白仍然非法。
  * @returns {RunRow} 新建的 run
  * @throws {ValidationError} 任一字段缺失或类型不对（err.field 指明字段）
  * @throws {NotFoundError} 任务不存在
@@ -391,7 +392,8 @@ export function startRun(db, { taskId, attempt, model, effort, peak, logPath } =
   if (typeof peak !== 'boolean') {
     throw new ValidationError('peak', `必须是布尔值（当前值：${peak}）`);
   }
-  const theLogPath = requiredTrimmed(logPath, 'logPath');
+  // 空串放行（见上），其余交给 requiredTrimmed：非字符串 / 纯空白照样报错。
+  const theLogPath = logPath === '' ? '' : requiredTrimmed(logPath, 'logPath');
   taskRow(db, taskId); // 任务不存在时抛 NotFoundError
   const now = nowIso();
   const row = db.prepare(`
@@ -399,6 +401,26 @@ export function startRun(db, { taskId, attempt, model, effort, peak, logPath } =
     VALUES (?, ?, ?, ?, ?, 'running', 1, ?, ?)
     RETURNING *
   `).get(taskId, attempt, theModel, theEffort, peak ? 1 : 0, theLogPath, now);
+  return rowToRun(row);
+}
+
+/**
+ * 补写 run 的日志路径（#7 的 runTask 流程：startRun 先传空串拿到 id，用 id 拼出
+ * `<home>/logs/task-<taskId>/run-<runId>.log` 后马上调这里更新）。
+ * 单条 UPDATE，run 不存在时抛 NotFoundError。
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {number} runId 正整数
+ * @param {string} logPath 非空字符串（trim 后入库）
+ * @returns {RunRow} 更新后的 run
+ * @throws {ValidationError} runId 非正整数，或 logPath 不是非空字符串（field 对应）
+ * @throws {NotFoundError} run 不存在
+ */
+export function setRunLogPath(db, runId, logPath) {
+  assertPositiveInt(runId, 'runId');
+  const theLogPath = requiredTrimmed(logPath, 'logPath');
+  const row = db.prepare('UPDATE runs SET log_path = ? WHERE id = ? RETURNING *')
+    .get(theLogPath, runId);
+  if (row === undefined) throw new NotFoundError(runId, 'run');
   return rowToRun(row);
 }
 
