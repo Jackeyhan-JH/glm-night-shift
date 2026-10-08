@@ -840,3 +840,20 @@ test('取消轮询读库抛错：记日志跳过该轮不崩，读库恢复后�
   assert.equal(getTask(db, task.id).status, 'canceled');
   assert.deepEqual(scheduler.status().running, []);
 });
+
+test('done 事件在释放并发名额之后才发：监听者看到的 status().running 已不含该任务，紧接着 tick() 能立刻补位', async (t) => {
+  const ctx = setup(t, { taskCount: 2, config: { concurrency: 1 } });
+  const seen = [];
+  const nextClaims = [];
+  ctx.scheduler.events.on('done', (e) => {
+    seen.push({ taskId: e.taskId, running: ctx.scheduler.status().running.slice() });
+  });
+  assert.deepEqual(await ctx.scheduler.tick(), [ctx.tasks[0].id]);
+  await waitUntil(() => seen.length === 1);
+  assert.deepEqual(seen[0], { taskId: ctx.tasks[0].id, running: [] });
+  // 收到 done 之后马上 tick：名额已空出，第二个任务立刻被领取
+  nextClaims.push(...await ctx.scheduler.tick());
+  assert.deepEqual(nextClaims, [ctx.tasks[1].id]);
+  await waitUntil(() => seen.length === 2);
+  assert.deepEqual(seen[1], { taskId: ctx.tasks[1].id, running: [] });
+});

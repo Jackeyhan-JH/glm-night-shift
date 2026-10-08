@@ -310,7 +310,12 @@ export function createScheduler({
       console.error(`[night-shift] claim 事件监听器出错（任务 ${task.id} 照常执行）：`, err);
     }
     ensureCancelPolling();
+    let donePayload = null;
     return runPipeline(task, controller)
+      .then(({ finalTask, done }) => {
+        donePayload = done;
+        return finalTask;
+      })
       .catch((err) => {
         // runPipeline 自身承诺不 reject；这层兜底保证实现失误（如收尾读库抛错）也
         // 绝不把任务永久留在 running：按剩余次数放回队列或落终态，退还这次尝试。
@@ -324,11 +329,19 @@ export function createScheduler({
         } catch (finishErr) {
           console.error(`[night-shift] 记录任务 ${task.id} 的中断结果时出错：`, finishErr);
         }
+        let current = task;
         try {
-          return getTask(db, task.id) ?? task;
+          current = getTask(db, task.id) ?? task;
         } catch {
-          return task;
+          // 读库也失败：用领取时的快照
         }
+        donePayload = {
+          taskId: task.id,
+          status: current.status,
+          prUrl: current.prUrl ?? null,
+          error: current.lastError ?? null,
+        };
+        return current;
       })
       .finally(() => {
         running.delete(task.id);
@@ -340,6 +353,14 @@ export function createScheduler({
             resolve();
           }
           teardownCancelPollIfIdle();
+        }
+        // 名额释放之后再发 done（见 runPipeline 末尾的说明）
+        if (donePayload !== null) {
+          try {
+            events.emit('done', donePayload);
+          } catch (err) {
+            console.error(`[night-shift] done 事件监听器出错（任务 ${task.id} 已收尾）：`, err);
+          }
         }
       });
   }
@@ -522,17 +543,17 @@ export function createScheduler({
     }
 
     finalTask = getTask(db, task.id) ?? finalTask;
-    try {
-      events.emit('done', {
+    // done 事件不在这里发：processTask 先释放 running 名额再发，保证监听者收到 done 时
+    // status().running 已不含该任务、紧接着的 tick() 也能立刻补位。
+    return {
+      finalTask,
+      done: {
         taskId: task.id,
         status: outcome ?? finalTask.status,
         prUrl: finalTask.prUrl ?? null,
         error: finalTask.lastError ?? null,
-      });
-    } catch (err) {
-      console.error(`[night-shift] done 事件监听器出错（任务 ${task.id} 已收尾）：`, err);
-    }
-    return finalTask;
+      },
+    };
   }
 
   /**
