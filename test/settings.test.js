@@ -1,5 +1,5 @@
-// 设置页与 /api/config（issue #61）的端到端测试：serve-api 同款的 createServer + 临时
-// NIGHT_SHIFT_HOME。覆盖：GET 只回七个设置键（重读盘：默认值 < config.json < 环境变量）、
+// 设置页与 /api/config（issue #61 + #90）的端到端测试：serve-api 同款的 createServer +
+// 临时 NIGHT_SHIFT_HOME。覆盖：GET 只回十个设置键（重读盘：默认值 < config.json < 环境变量）、
 // PATCH 校验失败时文件字节不动、成功时合并写盘且只影响下次启动（不测调度器热更新——
 // 那条路线不存在）、页面成功句与错误处理的源码口径。不读 ~/.glm-night-shift，不调真
 // claude / gh（本文件根本不起子进程）。
@@ -17,14 +17,15 @@ import { makeTempHome } from './helpers.js';
 const webDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../web');
 const readWeb = (name) => fs.readFileSync(path.join(webDir, name), 'utf8');
 
-/** GET /api/config 的七个键与顺序（与 src/config.js 的 SETTINGS_KEYS 同一份清单）。 */
+/** GET /api/config 的十个键与顺序（与 src/config.js 的 SETTINGS_KEYS 同一份清单）。 */
 const SETTINGS_KEYS = [
   'allowPeak', 'concurrency', 'oneTaskPerRepo', 'autoFollowReviews',
   'followPollMinutes', 'prStatus', 'prStatusPollMinutes',
+  'keepFailedWorktrees', 'timeoutMinutes', 'autoDiagnose',
 ];
 
-/** 七个键的默认值（没有 config.json 时 GET 的完整响应）。 */
-const SEVEN_DEFAULTS = {
+/** 十个键的默认值（没有 config.json 时 GET 的完整响应）。 */
+const TEN_DEFAULTS = {
   allowPeak: false,
   concurrency: 1,
   oneTaskPerRepo: true,
@@ -32,6 +33,9 @@ const SEVEN_DEFAULTS = {
   followPollMinutes: 30,
   prStatus: false,
   prStatusPollMinutes: 30,
+  keepFailedWorktrees: false,
+  timeoutMinutes: 60,
+  autoDiagnose: true,
 };
 
 // ---------- 辅助（与 test/web-usage.test.js 同款口径） ----------
@@ -68,7 +72,7 @@ async function patchJson(url, body, headers = {}) {
   return { status: res.status, body: await res.json() };
 }
 
-/** 预置一份带多余键的 config.json（七个设置键之外的 port / difficulty / extraFlag）。 */
+/** 预置一份带多余键的 config.json（十个设置键之外的 port / difficulty / extraFlag）。 */
 function seedConfigFile(home) {
   fs.writeFileSync(configPath(home), `${JSON.stringify({
     port: 7900,
@@ -81,17 +85,17 @@ const fileBytes = (home) => fs.readFileSync(configPath(home));
 
 // ---------- GET /api/config ----------
 
-test('验收: 没有 config.json 时 GET /api/config 深度等于且仅有那七个默认值', async (t) => {
+test('验收: 没有 config.json 时 GET /api/config 深度等于且仅有那十个默认值', async (t) => {
   const { base, home } = await startServer(t);
   assert.equal(fs.existsSync(configPath(home)), false, '前提：没有 config.json');
 
   const { status, body } = await getJson(`${base}/api/config`);
   assert.equal(status, 200);
-  assert.deepEqual(body, SEVEN_DEFAULTS);
+  assert.deepEqual(body, TEN_DEFAULTS);
   assert.deepEqual(Object.keys(body), SETTINGS_KEYS);
 });
 
-test('验收: config.json 有改动值加 port/difficulty/extraFlag 时，GET 恰好回七个键、值来自文件', async (t) => {
+test('验收: config.json 有改动值加 port/difficulty/extraFlag 时，GET 恰好回十个键、值来自文件', async (t) => {
   const { base, home } = await startServer(t);
   fs.writeFileSync(configPath(home), JSON.stringify({
     allowPeak: true,
@@ -117,13 +121,17 @@ test('验收: config.json 有改动值加 port/difficulty/extraFlag 时，GET �
     followPollMinutes: 15,
     prStatus: true,
     prStatusPollMinutes: 45,
+    // 文件里没有的三个新键由默认值补上（false / 60 / true）
+    keepFailedWorktrees: false,
+    timeoutMinutes: 60,
+    autoDiagnose: true,
   });
   assert.equal(body.port, undefined, '不能倒出 port');
   assert.equal(body.extraFlag, undefined, '不能倒出未知自定义键');
   assert.equal(body.difficulty, undefined, '不能倒出 difficulty');
 });
 
-test('验收: PATCH {"autoFollowReviews": true, "followPollMinutes": 15} 后：两值变了、多余键原样、GET 仍只有七个键', async (t) => {
+test('验收: PATCH {"autoFollowReviews": true, "followPollMinutes": 15} 后：两值变了、多余键原样、GET 仍只有十个键', async (t) => {
   const { base, home } = await startServer(t);
   seedConfigFile(home);
 
@@ -144,6 +152,33 @@ test('验收: PATCH {"autoFollowReviews": true, "followPollMinutes": 15} 后：�
   assert.equal(after.autoFollowReviews, true);
   assert.equal(after.followPollMinutes, 15);
   assert.deepEqual(Object.keys(after), SETTINGS_KEYS);
+});
+
+test('验收: PATCH {"timeoutMinutes":30,"keepFailedWorktrees":true,"autoDiagnose":false} 200，文件里是数字与布尔，GET 在原七个键后带这三个值', async (t) => {
+  const { base, home } = await startServer(t);
+  seedConfigFile(home);
+
+  const { status, body } = await patchJson(`${base}/api/config`, {
+    timeoutMinutes: 30,
+    keepFailedWorktrees: true,
+    autoDiagnose: false,
+  });
+  assert.equal(status, 200);
+
+  const saved = JSON.parse(fs.readFileSync(configPath(home), 'utf8'));
+  assert.ok(typeof saved.timeoutMinutes === 'number', 'timeoutMinutes 写成 JSON 数字');
+  assert.equal(saved.timeoutMinutes, 30);
+  assert.equal(saved.keepFailedWorktrees, true);
+  assert.equal(saved.autoDiagnose, false);
+  assert.equal(saved.port, 7900, '多余键原样保留');
+
+  assert.deepEqual(Object.keys(body), SETTINGS_KEYS);
+  assert.deepEqual(body, {
+    ...TEN_DEFAULTS,
+    timeoutMinutes: 30,
+    keepFailedWorktrees: true,
+    autoDiagnose: false,
+  });
 });
 
 // ---------- PATCH 的拒绝路径（文件字节必须不动） ----------
@@ -169,6 +204,20 @@ test('验收: PATCH {"concurrency": 0} → 400，error 含 concurrency，文件�
   assert.equal(status, 400);
   assert.ok(body.error.includes('concurrency'), `error 应含字段名：${body.error}`);
   assert.equal(body.field, 'concurrency');
+  assert.ok(fileBytes(home).equals(before), '文件字节不变');
+});
+
+test('验收: PATCH timeoutMinutes 为 0 / 1.5 / "30" / true 都 400，field 为 timeoutMinutes，文件字节不变', async (t) => {
+  const { base, home } = await startServer(t);
+  seedConfigFile(home);
+  const before = fileBytes(home);
+
+  for (const value of [0, 1.5, '30', true]) {
+    const { status, body } = await patchJson(`${base}/api/config`, { timeoutMinutes: value });
+    assert.equal(status, 400, `timeoutMinutes=${JSON.stringify(value)} 应 400`);
+    assert.ok(body.error.includes('timeoutMinutes'), `error 应含字段名：${body.error}`);
+    assert.equal(body.field, 'timeoutMinutes');
+  }
   assert.ok(fileBytes(home).equals(before), '文件字节不变');
 });
 
@@ -209,6 +258,26 @@ test('验收: 类型不对都 400 且文件不变：concurrency 1.5 / allowPeak 
   assert.ok(fileBytes(home).equals(before), '全部拒绝后文件字节仍不变');
 });
 
+test('验收: PATCH keepFailedWorktrees 为 "yes"/1、autoDiagnose 为 "true" 都 400，文件字节不变', async (t) => {
+  const { base, home } = await startServer(t);
+  seedConfigFile(home);
+  const before = fileBytes(home);
+
+  const cases = [
+    { keepFailedWorktrees: 'yes' },
+    { keepFailedWorktrees: 1 },
+    { autoDiagnose: 'true' },
+  ];
+  for (const patchBody of cases) {
+    const key = Object.keys(patchBody)[0];
+    const { status, body } = await patchJson(`${base}/api/config`, patchBody);
+    assert.equal(status, 400, `${key}=${JSON.stringify(patchBody[key])} 应 400`);
+    assert.ok(body.error.includes(key), `error 应含字段名 ${key}：${body.error}`);
+    assert.equal(body.field, key);
+  }
+  assert.ok(fileBytes(home).equals(before), '文件字节不变');
+});
+
 test('验收: 未知键与类型错误同时给时，报未知键（error 含「未知字段」与该键名），文件不变', async (t) => {
   const { base, home } = await startServer(t);
   seedConfigFile(home);
@@ -222,7 +291,7 @@ test('验收: 未知键与类型错误同时给时，报未知键（error 含「
   assert.ok(fileBytes(home).equals(before), '文件字节不变');
 });
 
-test('验收: PATCH 超出七个键的清单（未知键）报 400 且一个键都不写', async (t) => {
+test('验收: PATCH 超出十个键的清单（未知键）报 400 且一个键都不写', async (t) => {
   const { base, home } = await startServer(t);
   seedConfigFile(home);
   const before = fileBytes(home);
@@ -235,6 +304,19 @@ test('验收: PATCH 超出七个键的清单（未知键）报 400 且一个键�
   assert.equal(body.field, 'host');
   assert.ok(body.error.includes('host'), body.error);
   assert.ok(fileBytes(home).equals(before), '合法的 allowPeak 也不能被连带写入');
+});
+
+test('验收: PATCH {"safetyRatio": 0.5} → 400（未知字段），文件字节不变', async (t) => {
+  const { base, home } = await startServer(t);
+  seedConfigFile(home);
+  const before = fileBytes(home);
+
+  const { status, body } = await patchJson(`${base}/api/config`, { safetyRatio: 0.5 });
+  assert.equal(status, 400);
+  assert.ok(body.error.includes('未知字段'), body.error);
+  assert.ok(body.error.includes('safetyRatio'), body.error);
+  assert.equal(body.field, 'safetyRatio');
+  assert.ok(fileBytes(home).equals(before), '文件字节不变');
 });
 
 // ---------- PATCH 的成功路径 ----------
@@ -370,6 +452,20 @@ test('验收: GET /settings.html 返回 200，HTML 里能找到 settings.js 与�
     assert.equal(js.status, 200, file);
     assert.ok(js.headers.get('content-type').startsWith('text/javascript'), file);
   }
+});
+
+test('验收: GET /settings.html 的 HTML 含三个新控件的标签原文与「十个开关」说明', async (t) => {
+  const { base } = await startServer(t);
+  const res = await fetch(`${base}/settings.html`);
+  assert.equal(res.status, 200);
+  const html = await res.text();
+  assert.ok(html.includes('失败时保留工作目录（keepFailedWorktrees）'), 'keepFailedWorktrees 标签原文');
+  assert.ok(html.includes('单次超时（分钟）（timeoutMinutes）'), 'timeoutMinutes 标签原文');
+  assert.ok(html.includes('失败时先诊断（autoDiagnose）'), 'autoDiagnose 标签原文');
+  assert.ok(html.includes('只改下面这十个开关'), '说明句应是十个');
+  assert.ok(!html.includes('七个'), '页面不再出现「七个」');
+  assert.ok(html.includes('name="timeoutMinutes"') && html.includes('min="1"') && html.includes('step="1"'),
+    'timeoutMinutes 与 concurrency 同类的 number 控件');
 });
 
 test('验收: Object.keys(DEFAULT_CONFIG) 深度等于锁死的键清单（键顺序不许变）', () => {

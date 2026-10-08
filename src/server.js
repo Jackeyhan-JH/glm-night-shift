@@ -432,7 +432,7 @@ function buildRoutes(deps, bumpSse) {
       const patch = parseSettingsBody(ctx.body); // 先校验：不过 → 400，一个键都不写
       requireSettingsHome(deps); // home 缺失 → 500，绝不退回 ~/.glm-night-shift
       patchConfigFile(deps.home, patch); // 文件不合法 JSON → 抛错 → 500，原字节不动
-      sendJson(ctx.res, 200, readSettings(deps)); // 写完重读：体与 GET 相同的七个键
+      sendJson(ctx.res, 200, readSettings(deps)); // 写完重读：体与 GET 相同的十个键
     } },
   ];
 }
@@ -599,15 +599,15 @@ function parseSettingsBody(body) {
   }
   for (const key of Object.keys(body)) {
     const value = body[key];
-    if (key === 'concurrency') {
+    if (key === 'concurrency' || key === 'timeoutMinutes') {
       if (!Number.isInteger(value) || value <= 0) {
-        throw new HttpError(400, `concurrency 必须是正整数，收到：${JSON.stringify(value)}`, key);
+        throw new HttpError(400, `${key} 必须是正整数，收到：${JSON.stringify(value)}`, key);
       }
     } else if (key === 'followPollMinutes' || key === 'prStatusPollMinutes') {
       if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         throw new HttpError(400, `${key} 必须是正数，收到：${JSON.stringify(value)}`, key);
       }
-    } else if (typeof value !== 'boolean') { // 其余四个都是布尔键；false 是合法值
+    } else if (typeof value !== 'boolean') { // 其余六个都是布尔键；false 是合法值
       throw new HttpError(400, `${key} 必须是布尔值，收到：${JSON.stringify(value)}`, key);
     }
   }
@@ -622,7 +622,7 @@ function requireSettingsHome(deps) {
 }
 
 /**
- * 重读盘取七个设置键（默认值 < config.json < 环境变量），PATCH 写完再 GET 能看到新值。
+ * 重读盘取十个设置键（默认值 < config.json < 环境变量），PATCH 写完再 GET 能看到新值。
  * 读到的对象不写回 deps.config、不通知调度器——运行中的进程仍用启动时的配置。
  */
 function readSettings(deps) {

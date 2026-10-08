@@ -1,6 +1,6 @@
 // config 子命令：显示生效配置（默认值 < <home>/config.json < 环境变量）与数据目录
 // 里的各路径。只读路径不创建任何文件（config.json 不存在也照常显示默认值）；
-// `config set <键=值> …`（#81）写看板设置页那七个键：先全部校验，有一个不合法就
+// `config set <键=值> …`（#81）写看板设置页那十个键：先全部校验，有一个不合法就
 // 一个键都不写，落盘复用 patchConfigFile（与 PATCH /api/config 同一套写盘语义）。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -81,7 +81,7 @@ function runSet(ctx, tokens, values) {
   const home = resolveHome(ctx.env);
   ensureHome(home); // 与其他会写盘的命令一样：数据目录与 logs/repos/worktrees（幂等）
   patchConfigFile(home, patch); // 文件不是合法 JSON 等错误原样上抛（退出 1，原字节不动）
-  // 写完重读生效配置（默认值 < config.json < 环境变量），七个键按 SETTINGS_KEYS 顺序汇报。
+  // 写完重读生效配置（默认值 < config.json < 环境变量），十个键按 SETTINGS_KEYS 顺序汇报。
   const config = loadConfig({ home, env: ctx.env });
   const lines = ['已写入配置。正在运行的看板要重启后才按新值运行。'];
   for (const key of SETTINGS_KEYS) lines.push(`${key}=${config[key]}`);
@@ -121,11 +121,11 @@ function buildPatch(ctx, tokens) {
 
 /** 单个键的类型检查与转换：失败抛含键名与原文的中文错误（退出 1，不写盘）。 */
 function coerceSetting(key, raw) {
-  if (key === 'concurrency') {
+  if (key === 'concurrency' || key === 'timeoutMinutes') {
     const value = Number(raw);
     // 三道关：规范写法、安全整数、往返无损（拒绝精度丢失的超大整数，如 2^53+1）。
     if (!POSITIVE_INT_RE.test(raw) || !Number.isSafeInteger(value) || String(value) !== raw) {
-      throw new Error(`concurrency 必须是正整数，收到：${raw}`);
+      throw new Error(`${key} 必须是正整数，收到：${raw}`);
     }
     return value;
   }
@@ -136,7 +136,7 @@ function coerceSetting(key, raw) {
     }
     return value;
   }
-  if (raw === 'true') return true; // 其余四个布尔键：只收单词 true / false（区分大小写）
+  if (raw === 'true') return true; // 其余六个布尔键：只收单词 true / false（区分大小写）
   if (raw === 'false') return false;
   throw new Error(`${key} 必须是 true 或 false，收到：${raw}`);
 }
