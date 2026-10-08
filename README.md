@@ -150,6 +150,7 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `install-service` | `[--dry-run]` `[--unit-dir <目录>]` | 把 `serve` 装成 systemd 用户服务（开机自启；`--dry-run` 只打印单元内容） |
 | `uninstall-service` | `[--unit-dir <目录>]` | 卸载 systemd 用户服务 |
 | `help` | 无 | 显示帮助（同 `--help`） |
+| `cleanup` | `[--dry-run] [--logs-older-than <天数>] [--json]` | 清理已结束任务的 worktree 和过期日志。只删 succeeded/failed/canceled 的 worktree，以及早于 N 天的 *.log（默认 14；0 表示不删日志）。不动 queued/running，不删数据库行和 repos/ 缓存 |
 
 顶层还有 `--version` / `-v` 与 `--help` / `-h` 两个旗标；子命令以 `--help` 作为唯一参数时只打印该命令自己的用法。
 
