@@ -274,6 +274,11 @@ test('验收: A 依赖 B 后 setDependencies(B, [A]) 抛 ValidationError，信�
     '环信息应列出 #B → #A → #B',
   );
   assert.deepEqual(listDependencies(db, b.id), [], '写入被拒，B 没有依赖');
+  assert.deepEqual(
+    listDependencies(db, a.id).map((d) => d.id),
+    [b.id],
+    'A 已有的依赖不受 B 那次失败的写入影响（保存点回滚）',
+  );
 
   // 另一组：A→B→C 后让 C 依赖 A，成三环
   const c1 = createTask(db, { ...VALID, prompt: 'C1' }); // 3

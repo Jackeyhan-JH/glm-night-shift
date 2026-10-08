@@ -394,18 +394,23 @@ export function retryTask(db, id) {
 export function setDependencies(db, taskId, ids = []) {
   assertPositiveInt(taskId, 'id');
   const deps = normalizeDependsOn(ids);
-  const current = taskRow(db, taskId); // 不存在时抛 NotFoundError
-  if (current.status !== 'queued') {
-    throw new InvalidTransitionError(current.status, 'queued');
-  }
-  validateDependencyTargets(db, taskId, deps);
-  const cycle = findDependencyCycle(db, taskId, deps);
-  if (cycle !== null) {
-    throw new ValidationError('dependsOn', `会形成依赖环：${cycle.map((id) => `#${id}`).join(' → ')}`);
-  }
+  taskRow(db, taskId); // 不存在时抛 NotFoundError
   return inSavepoint(db, () => {
+    // 状态检查、目标校验、写边、查环都在同一保存点里，任何一步失败整体回滚；
+    // 环检测在**写入后**的完整图上做（从新依赖出发找回到自己的路径），即使别的
+    // 连接同时加边也逃不过。要完全串行得 BEGIN IMMEDIATE，但那会与调用方自己的
+    // 事务冲突——遵循 #3 的原子更新模型，窗口到事务内为止。
+    const { status } = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId);
+    if (status !== 'queued') {
+      throw new InvalidTransitionError(status, 'queued');
+    }
     db.prepare('DELETE FROM task_deps WHERE task_id = ?').run(taskId);
+    validateDependencyTargets(db, taskId, deps);
     insertTaskDeps(db, taskId, deps);
+    const cycle = findDependencyCycle(db, taskId, deps);
+    if (cycle !== null) {
+      throw new ValidationError('dependsOn', `会形成依赖环：${cycle.map((id) => `#${id}`).join(' → ')}`);
+    }
     return hydrateTasks(db, [taskRow(db, taskId)])[0];
   });
 }
