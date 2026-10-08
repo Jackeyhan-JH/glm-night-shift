@@ -2,6 +2,7 @@
 // + 假 gh。覆盖「失败 → 自动诊断 → 带诊断重试」的完整链路：诊断写回失败运行、重试
 // prompt 附诊断、高峰/额度拦下时跳过诊断并记日志、诊断计入额度、show 展示诊断。
 // 绝不联网、不消耗额度；时间用可调时钟，等待一律轮询 + 截止时间。
+// git push 失败走普通失败、不诊断（假 claude 只调用一次）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -309,6 +310,36 @@ test('验收：rate-limit 不诊断——限流走退避路径，runs 只有被�
   assert.equal(runs.length, 1);
   assert.equal(runs[0].kind, 'task');
   assert.equal(readArgsLog(ctx.argsLog).length, 1);
+});
+
+test('验收：git push 失败时不诊断——假 claude 只被调用 1 次，没有 kind=diagnosis 的运行', async (t) => {
+  // 执行器失败会诊断（#12）；git 阶段失败走 failNormal 且不传 diagnoseRun，必须不诊断。
+  // maxAttempts 2：若误诊断，假 claude 会被再调一次。默认 success 会改文件，提交能过，卡在 push。
+  const ctx = setup(t, {
+    taskSpecs: [{ maxAttempts: 2, title: 'push rejected' }],
+  });
+  // 远端拒绝一切推送（fetch 不走这个钩子）。stderr 不含 stale info，避免被当成可重试的 lease 冲突。
+  const hook = path.join(ctx.remote.bare, 'hooks', 'pre-receive');
+  fs.writeFileSync(hook, '#!/bin/sh\necho "night-shift test: push rejected" >&2\nexit 1\n');
+  fs.chmodSync(hook, 0o755);
+
+  const [task] = ctx.tasks;
+  await ctx.scheduler.tick();
+  const done = await ctx.waitDone(task.id);
+  assert.equal(done.status, 'queued', '还有重试次数，但 git 失败不带诊断直接回队');
+  const lastError = getTask(ctx.db, task.id).lastError;
+  assert.match(lastError, /^git:.*\bpush\b/s, lastError);
+
+  const stages = ctx.stageEvents.map((e) => e.stage);
+  assert.ok(stages.includes('push'), '应走到 push，实际：' + stages.join(','));
+  assert.equal(stages.includes('diagnose'), false, 'git 阶段失败不应诊断，实际：' + stages.join(','));
+  assert.equal(stages.includes('pr'), false, 'push 失败后不应开 PR');
+
+  const runs = listRuns(ctx.db, { taskId: task.id });
+  assert.equal(runs.length, 1, '没有 kind=diagnosis 的运行');
+  assert.equal(runs[0].kind, 'task');
+  assert.equal(runs[0].diagnosis, null);
+  assert.equal(readArgsLog(ctx.argsLog).length, 1, '假 claude 只被调用一次');
 });
 
 // ---------------------------------------------------------------- 诊断本身失败
