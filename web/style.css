@@ -153,3 +153,213 @@ pre.log {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ==================== 额度与高峰页（issue #17，只追加；全部限定在
+   .usage-page 下，避免影响队列页 / 任务页） ==================== */
+
+.usage-page .usage-hidden { display: none; }
+
+.usage-page .card h2 {
+  font-size: 16px;
+  margin: 0 0 10px;
+}
+.usage-page .sub-title {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin: 12px 0 4px;
+}
+
+/* 高峰卡片与额度卡片并排（窄屏折行） */
+.usage-page .cards-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.usage-page .cards-row .card { margin-bottom: 20px; }
+@media (max-width: 860px) {
+  .usage-page .cards-row { grid-template-columns: 1fr; }
+}
+
+/* 高峰 / 非高峰大字（颜色之外始终有文字本身，不靠颜色单独表意） */
+.usage-page .peak-state {
+  display: inline-block;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.3;
+  padding: 4px 20px;
+  border-radius: 10px;
+  margin: 2px 0 10px;
+}
+.usage-page .peak-state.is-peak { background: var(--badge-running-bg); color: var(--badge-running-fg); }
+.usage-page .peak-state.is-offpeak { background: var(--badge-succeeded-bg); color: var(--badge-succeeded-fg); }
+
+.usage-page .kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  margin: 8px 0;
+  font-size: 14px;
+}
+.usage-page .kv dt { color: var(--text-muted); white-space: nowrap; }
+.usage-page .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+.usage-page .countdown { font-size: 20px; font-weight: 700; letter-spacing: 0.5px; }
+
+.usage-page .mult {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 14px;
+}
+.usage-page .upcoming {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+}
+.usage-page .upcoming li {
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.usage-page .upcoming li:last-child { border-bottom: none; }
+
+/* 额度进度条：填充色随状态（正常蓝 / 超安全阈值黄 / 超限红），
+   底槽是同色系的浅一档，状态在整条轨道上可读 */
+.usage-page .meter-block { margin: 16px 0; }
+.usage-page .meter-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.usage-page .meter-text { font-variant-numeric: tabular-nums; font-weight: 600; }
+.usage-page .meter {
+  height: 10px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: #dbe7fb;
+}
+.usage-page .meter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 5px 0 0 5px;
+  background: var(--accent);
+  transition: width 0.3s;
+}
+.usage-page .meter-block[data-state="ok"] .meter { background: #dbe7fb; }
+.usage-page .meter-block[data-state="ok"] .meter-fill { background: var(--accent); }
+.usage-page .meter-block[data-state="warn"] .meter { background: #fdeaca; }
+.usage-page .meter-block[data-state="warn"] .meter-fill { background: #fab219; }
+.usage-page .meter-block[data-state="danger"] .meter { background: #f6d0d0; }
+.usage-page .meter-block[data-state="danger"] .meter-fill { background: #d03b3b; }
+.usage-page .meter-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  margin-top: 4px;
+}
+.usage-page .meter-block[data-state="warn"] .meter-pct { color: #b45309; font-weight: 600; }
+.usage-page .meter-block[data-state="danger"] .meter-pct { color: #b91c1c; font-weight: 600; }
+
+/* 调度器被拦提示 */
+.usage-page .scheduler-box {
+  margin-top: 14px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--badge-failed-bg);
+  color: var(--badge-failed-fg);
+  font-size: 14px;
+}
+
+/* 用量图卡片 */
+.usage-page .chart-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.usage-page .range-toggle { display: flex; gap: 6px; }
+.usage-page .range-toggle button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.usage-page .legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  font-size: 13px;
+  margin: 10px 0 4px;
+}
+.usage-page .legend .swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.usage-page .legend .swatch.band { border: 1px solid #f0d9a4; }
+
+.usage-page .chart-wrap { position: relative; }
+.usage-page .chart-wrap svg { display: block; width: 100%; height: auto; }
+.usage-page .grid-line { stroke: var(--border); stroke-width: 1; }
+.usage-page .axis-line { stroke: #c6cbd4; stroke-width: 1; }
+.usage-page .axis-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-page .band { fill: #fef3c7; fill-opacity: 0.55; }
+.usage-page .bar-hit { fill: transparent; outline: none; }
+.usage-page .bar-hit:focus { fill: rgba(37, 99, 235, 0.08); }
+
+.usage-page .chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+  padding: 8px 12px;
+  font-size: 13px;
+  min-width: 170px;
+  z-index: 5;
+}
+.usage-page .chart-tooltip .tip-title {
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-page .chart-tooltip .tip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.7;
+}
+.usage-page .chart-tooltip .tip-row strong { margin-left: auto; font-variant-numeric: tabular-nums; }
+/* 悬停行里的系列键用短横线（线键），不用色块 */
+.usage-page .tip-chip {
+  display: inline-block;
+  width: 12px;
+  height: 3px;
+  border-radius: 2px;
+}
+.usage-page .chart-tooltip .tip-total {
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 4px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-page .data-table { margin-top: 10px; font-size: 13px; }
+.usage-page .data-table summary { cursor: pointer; color: var(--text-muted); }
+.usage-page .chart-note { font-size: 12px; margin: 8px 0 0; }
+.usage-page .error { margin-top: 10px; }

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GLM 夜班 · 额度与高峰</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="usage-page">
+  <header class="page-header">
+    <h1>GLM 夜班</h1>
+  </header>
+  <div id="nav"></div>
+  <main id="app">
+    <div class="cards-row">
+      <!-- 高峰卡片：现在是否高峰、两地时间、下次切换与倒计时、倍率、未来 7 天时段 -->
+      <section class="card" aria-labelledby="peak-title">
+        <h2 id="peak-title">高峰状态</h2>
+        <p class="peak-state" id="peak-state">…</p>
+        <dl class="kv">
+          <dt>北京时间</dt><dd id="now-beijing">-</dd>
+          <dt>本地时间</dt><dd id="now-local">-</dd>
+          <dt>下次切换</dt><dd id="next-change">-</dd>
+          <dt>倒计时</dt><dd class="countdown" id="countdown">-</dd>
+        </dl>
+        <h3 class="sub-title">当前倍率</h3>
+        <ul class="mult" id="multipliers"></ul>
+        <h3 class="sub-title">未来 7 天高峰时段</h3>
+        <ul class="upcoming" id="upcoming"></ul>
+        <p class="error usage-hidden" id="peak-error"></p>
+      </section>
+
+      <!-- 额度卡片：5 小时 / 每周两条进度条、套餐、调度器被拦原因 -->
+      <section class="card" aria-labelledby="quota-title">
+        <h2 id="quota-title">额度</h2>
+        <p class="muted">套餐：<span id="plan">-</span></p>
+        <div class="meter-block" id="five-hour-block">
+          <div class="meter-head"><span>5 小时窗口</span><span class="meter-text" id="five-hour-text">- / -</span></div>
+          <div class="meter"><div class="meter-fill" id="five-hour-fill"></div></div>
+          <div class="meter-foot muted"><span class="meter-pct" id="five-hour-pct"></span><span id="five-hour-reset"></span></div>
+        </div>
+        <div class="meter-block" id="weekly-block">
+          <div class="meter-head"><span>每周窗口</span><span class="meter-text" id="weekly-text">- / -</span></div>
+          <div class="meter"><div class="meter-fill" id="weekly-fill"></div></div>
+          <div class="meter-foot muted"><span class="meter-pct" id="weekly-pct"></span><span id="weekly-reset"></span></div>
+        </div>
+        <div class="scheduler-box usage-hidden" id="scheduler-box"></div>
+        <p class="error usage-hidden" id="quota-error"></p>
+      </section>
+    </div>
+
+    <!-- 用量图：按小时堆叠柱状图（纯 SVG），可切 1 / 7 / 30 天 -->
+    <section class="card" aria-labelledby="chart-title">
+      <div class="chart-head">
+        <h2 id="chart-title">用量（按小时 · prompt）</h2>
+        <div class="range-toggle" id="range-toggle">
+          <button type="button" data-days="1">1 天</button>
+          <button type="button" data-days="7" class="active">7 天</button>
+          <button type="button" data-days="30">30 天</button>
+        </div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="chart-wrap" id="chart-wrap">
+        <div class="chart-tooltip usage-hidden" id="chart-tooltip" role="status"></div>
+      </div>
+      <details class="data-table">
+        <summary>数据表（只列有用量的小时）</summary>
+        <div id="table-box"></div>
+      </details>
+      <p class="muted chart-note">每 30 秒自动刷新；悬停 / 键盘聚焦柱子查看该小时各模型用量与合计。</p>
+      <p class="error usage-hidden" id="chart-error"></p>
+    </section>
+  </main>
+  <script type="module" src="/usage.js"></script>
+</body>
+</html>
