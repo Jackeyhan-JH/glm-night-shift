@@ -10,8 +10,8 @@ import { getTask } from '../tasks.js';
 /** blocked 事件的 reason → 中文原因（与 src/scheduler.js 的四种拦截原因一一对应）。 */
 const BLOCK_REASONS = {
   peak: '高峰期',
-  'five-hour': '5 小时额度已满',
-  weekly: '每周额度已满',
+  'five-hour': '5 小时额度已达安全阈值',
+  weekly: '每周额度已达安全阈值',
   'rate-limit': '被限流',
 };
 
