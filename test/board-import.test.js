@@ -142,8 +142,12 @@ function writeAgedFile(home, rel, days) {
 // ---------------------------------------------------------------- POST /api/import
 
 test('验收: POST /api/import 用假的 issue 列表入队（#7），source 为 github:a/b#7；再调一次同一条进 skipped，任务总数仍是 1', async (t) => {
+  const ghLog = path.join(makeTempHome(t), 'gh.log');
   const { base, db } = await startServer(t, {
-    env: { FAKE_GH_ISSUE_LIST_JSON: '[{"number":7,"title":"登录报错","body":"点击登录返回 500"}]' },
+    env: {
+      FAKE_GH_ISSUE_LIST_JSON: '[{"number":7,"title":"登录报错","body":"点击登录返回 500"}]',
+      FAKE_GH_LOG: ghLog,
+    },
   });
   const res = await postJson(`${base}/api/import`, { repo: 'a/b' });
   assert.equal(res.status, 200);
@@ -156,12 +160,23 @@ test('验收: POST /api/import 用假的 issue 列表入队（#7），source 为
   const firstId = body.added[0].id;
 
   // 再调一次：同一条 issue 已有任务，进 skipped（taskId 是第一次的 id），不产生第二个任务
-  const again = await postJson(`${base}/api/import`, { repo: 'a/b' });
+  const again = await postJson(`${base}/api/import`, {
+    repo: 'a/b', label: 'night-shift', state: 'all', limit: 5,
+  });
   assert.equal(again.status, 200);
   const second = await again.json();
   assert.deepEqual(second.added, []);
   assert.deepEqual(second.skipped, [{ issue: 7, taskId: firstId, status: 'queued' }]);
   assert.equal(listTasks(db).length, 1);
+
+  // gh 参数与 CLI 同一形状：缺省不带 --label；给了就带上（state / limit 透传）
+  const calls = fs.readFileSync(ghLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.deepEqual(calls, [
+    ['issue', 'list', '--repo', 'a/b', '--state', 'open',
+      '--json', 'number,title,body', '--limit', '50'],
+    ['issue', 'list', '--repo', 'a/b', '--state', 'all', '--label', 'night-shift',
+      '--json', 'number,title,body', '--limit', '5'],
+  ]);
 });
 
 test('验收: POST /api/import dryRun: true 时任务数不变，响应 added 的长度看得出将新增几条，listTasks 条数不变', async (t) => {
