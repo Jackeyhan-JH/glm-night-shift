@@ -281,14 +281,23 @@ test('serve 优雅停止不掐已建立的 SSE：第一次 SIGINT 后流仍开�
   });
   const { port } = await proc.base;
   let runId;
+  // 整套并行时偶发一次 fetch 卡住十几秒，deadline 要等它返回才检查，10 秒预算就被吃光。
+  // 单次请求 2 秒到点就放弃，下一轮再问，总预算放到 20 秒。
   await waitUntil(async () => {
-    const task = await (await fetch(`http://127.0.0.1:${port}/api/tasks/1`)).json();
+    let res;
+    try {
+      res = await fetch(`http://127.0.0.1:${port}/api/tasks/1`, { signal: AbortSignal.timeout(2000) });
+    } catch {
+      return false;
+    }
+    if (!res.ok) return false;
+    const task = await res.json();
     if (task.runs.length > 0) {
       runId = task.runs[0].id;
       return true;
     }
     return false;
-  }, { timeoutMs: 10_000, message: 'run 行应已创建' });
+  }, { timeoutMs: 20_000, message: 'run 行应已创建' });
 
   const controller = new AbortController();
   t.after(() => controller.abort());
