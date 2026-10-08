@@ -4,7 +4,7 @@
 // 配置键类型检查、与 #49 自动跟进互不影响、详情页「PR 结果」行、假 gh 默认静默成功。
 // 调度器一律注入可控时钟与挂起的假 runner / 假 git（照 test/auto-follow.test.js），
 // gh 走仓库里的 fake-gh.mjs（FAKE_GH_LOG 记每次调用的 argv），用 --json 参数区分两种
-// pr view：本功能是 state,mergedAt，#49 的跟进是 reviewDecision,reviews,url,headRefName。
+// pr view：本功能是 state,mergedAt，#49/#60 的跟进是 reviewDecision,reviews,url,headRefName,state,mergeable。
 // 绝不联网、不碰真实 ~/.glm-night-shift、不调用真实 claude / gh。
 // runCli 在其他模块之前 import：先装好 SQLite 警告过滤再（经 src/db.js）加载 node:sqlite。
 import { runCli } from '../bin/night-shift.mjs';
@@ -101,10 +101,12 @@ function prViewArgv(log, json) {
 /** 带 state,mergedAt（本功能）的 gh pr view 调用次数。 */
 const prStatusGhCalls = (log) => prViewArgv(log, 'state,mergedAt').length;
 
-/** 带 reviewDecision,reviews,url,headRefName（#49 跟进）的 gh pr view 调用次数。 */
-const followGhCalls = (log) => prViewArgv(log, 'reviewDecision,reviews,url,headRefName').length;
+/** 带 reviewDecision,reviews,url,headRefName,state,mergeable（#49/#60 跟进；argv.includes
+ *  是整元素匹配，短串匹配不到 #60 加长后的字段串）的 gh pr view 调用次数。 */
+const followGhCalls = (log) => prViewArgv(log, 'reviewDecision,reviews,url,headRefName,state,mergeable').length;
 
-/** 同时够 #49 跟进与 #56 状态查询的 pr view JSON（fake gh 原样回吐）。 */
+/** MERGED + CHANGES_REQUESTED：prStatus 写 merged；#64 起 state 压过 reviewDecision，
+ *  跟进跳过不入队（fake gh 原样回吐，高峰段的断言也还用它）。 */
 const BOTH_JSON = JSON.stringify({
   state: 'MERGED',
   mergedAt: '2026-10-08T00:00:00Z',
@@ -112,6 +114,18 @@ const BOTH_JSON = JSON.stringify({
   reviews: [{ id: 99, state: 'CHANGES_REQUESTED', body: '请把变量名改清楚' }],
   url: 'https://github.com/a/b/pull/9',
   headRefName: 'night-shift/1-fix-login-bug',
+});
+
+/** OPEN + CHANGES_REQUESTED（reviews 与 BOTH_JSON 同一条 id 99）：跟进照 #49 入队、
+ *  prStatus 写 open；mergeable 给 MERGEABLE（不触发冲突提示那行）。 */
+const OPEN_JSON = JSON.stringify({
+  state: 'OPEN',
+  mergedAt: null,
+  reviewDecision: 'CHANGES_REQUESTED',
+  reviews: [{ id: 99, state: 'CHANGES_REQUESTED', body: '请把变量名改清楚' }],
+  url: 'https://github.com/a/b/pull/9',
+  headRefName: 'night-shift/1-fix-login-bug',
+  mergeable: 'MERGEABLE',
 });
 
 const MERGED_JSON = '{"state":"MERGED","mergedAt":"2026-10-08T00:00:00Z"}';
@@ -672,11 +686,13 @@ test('验收: gh 失败（FAKE_GH_PR_VIEW_FAIL=1）：tick 仍 resolve、console
 
 // ---------------------------------------------------------------- 11. 与 #49 自动跟进互不影响
 
-test('验收: autoFollowReviews=true 且 prStatus=true 非高峰：follow 照常入队（source/gitRef 同 #49）且 prOutcome 按 state 写入；高峰时 prStatus 查、follow 不查不入队；prStatus=false 时 follow 行为与 #49 一致且不多一次 state,mergedAt', async (t) => {
-  // 两个都开、非高峰：follow 入队 + prStatus 写 merged
+test('验收: autoFollowReviews=true 且 prStatus=true 非高峰：OPEN+CHANGES_REQUESTED 时 follow 照常入队（source/gitRef 同 #49）且 prOutcome 写 open；MERGED 时按 #64 跳过不入队（state 压过 CHANGES_REQUESTED、prOutcome 写 merged）；高峰时 prStatus 查、follow 不查不入队；prStatus=false 时 follow 仍按 #49/#60 工作（--json 是长字段串）且不多一次 state,mergedAt', async (t) => {
+  // 两个都开、非高峰、OPEN + CHANGES_REQUESTED：follow 入队（同 #49），prStatus 写
+  // open。两组 --json 不同：follow 是 #60 的 reviewDecision,reviews,url,headRefName,
+  // state,mergeable，prStatus 是 state,mergedAt。
   const ctx = setup(t, {
     configOverrides: { autoFollowReviews: true, prStatus: true },
-    envOverrides: { FAKE_GH_PR_VIEW_JSON: BOTH_JSON },
+    envOverrides: { FAKE_GH_PR_VIEW_JSON: OPEN_JSON },
   });
   const parent = seedSucceeded(ctx.db);
   assert.deepEqual(await ctx.scheduler.tick(), [2], '入队的跟进这轮被领走');
@@ -685,9 +701,34 @@ test('验收: autoFollowReviews=true 且 prStatus=true 非高峰：follow 照常
   const follow = getTask(ctx.db, found.id);
   assert.equal(follow.gitRef, parent.branch, 'gitRef 与 #49 相同（父任务分支）');
   assert.equal(follow.source, 'pr-review:a/b#9:99', 'source 与 #49 相同');
-  assert.equal(getTask(ctx.db, parent.id).prOutcome, 'merged', 'prOutcome 同时按 state 写入');
+  assert.equal(getTask(ctx.db, parent.id).prOutcome, 'open', 'prOutcome 按 state 写入 open（不是 merged）');
   assert.equal(followGhCalls(ctx.ghLog), 1);
   assert.equal(prStatusGhCalls(ctx.ghLog), 1);
+  assert.deepEqual(
+    prViewArgv(ctx.ghLog, 'reviewDecision,reviews,url,headRefName,state,mergeable'),
+    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName,state,mergeable']],
+    'follow 的命令字面（#60 的长字段串）',
+  );
+  assert.deepEqual(
+    prViewArgv(ctx.ghLog, 'state,mergedAt'),
+    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'state,mergedAt']],
+    'prStatus 的命令字面：与 follow 的 --json 不是同一组',
+  );
+
+  // 两个都开、非高峰、BOTH_JSON（MERGED + CHANGES_REQUESTED）：#64 起 state 压过
+  // reviewDecision，follow 跳过、不入队——唯一的跳过原因是「PR 已合并」。调度器先扫
+  // follow 再查 prStatus，扫描时 prOutcome 还是 null，所以 follow 仍打了一次 gh；
+  // skipped 不进 console，这里只按入队 / gh 次数断言，不要求日志。
+  const merged = setup(t, {
+    configOverrides: { autoFollowReviews: true, prStatus: true },
+    envOverrides: { FAKE_GH_PR_VIEW_JSON: BOTH_JSON },
+  });
+  const mergedParent = seedSucceeded(merged.db);
+  assert.deepEqual(await merged.scheduler.tick(), [], '这次跟进没有入队任何任务可领');
+  assert.equal(findTaskBySource(merged.db, 'pr-review:a/b#9:99'), null, 'MERGED 的 PR 不入队');
+  assert.equal(getTask(merged.db, mergedParent.id).prOutcome, 'merged', 'prOutcome 按 state 写入 merged');
+  assert.equal(followGhCalls(merged.ghLog), 1, 'prOutcome 当时是 null：follow 仍打了一次 gh 才跳过');
+  assert.equal(prStatusGhCalls(merged.ghLog), 1);
 
   // 高峰（周四北京 17:45）：prStatus 查，follow 不查也不入队
   const peak = setup(t, {
@@ -702,23 +743,43 @@ test('验收: autoFollowReviews=true 且 prStatus=true 非高峰：follow 照常
   assert.equal(findTaskBySource(peak.db, 'pr-review:a/b#9:99'), null, '高峰不入队');
   assert.equal(getTask(peak.db, peakParent.id).prOutcome, 'merged');
 
-  // 只开 follow（prStatus=false）：与 #49 的 auto-follow 测试一致，不多一次 state,mergedAt
-  const off = setup(t, {
+  // 只开 follow（prStatus=false）+ OPEN：与 #49 的 auto-follow 行为一致，prStatus 关着
+  // 不多一次 state,mergedAt、不写结论；follow 的 --json 是 #60 的长字段串。
+  const offOpen = setup(t, {
+    configOverrides: { autoFollowReviews: true },
+    envOverrides: { FAKE_GH_PR_VIEW_JSON: OPEN_JSON },
+  });
+  const offOpenParent = seedSucceeded(offOpen.db);
+  assert.deepEqual(await offOpen.scheduler.tick(), [2], 'prStatus 关不影响跟进入队并被领走');
+  const offFound = findTaskBySource(offOpen.db, 'pr-review:a/b#9:99');
+  assert.ok(offFound !== null);
+  assert.equal(getTask(offOpen.db, offFound.id).gitRef, offOpenParent.branch);
+  assert.equal(getTask(offOpen.db, offOpenParent.id).prOutcome, null, 'prStatus 关：不写结论');
+  assert.equal(prStatusGhCalls(offOpen.ghLog), 0, 'prStatus 关：不多一次 state,mergedAt 的 gh');
+  assert.equal(followGhCalls(offOpen.ghLog), 1);
+  assert.deepEqual(
+    prViewArgv(offOpen.ghLog, 'reviewDecision,reviews,url,headRefName,state,mergeable'),
+    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName,state,mergeable']],
+    'argv 是 #60 的长字段串（不是多了一次 prStatus 调用）',
+  );
+
+  // 只开 follow + BOTH_JSON（MERGED）：follow 跳过、不入队；prStatus 关着所以不打
+  // state,mergedAt、prOutcome 保持 null。follow 自己仍打一次 gh（prOutcome 是 null），
+  // 那一次的 --json 就是 #60 的长字段串。
+  const offMerged = setup(t, {
     configOverrides: { autoFollowReviews: true },
     envOverrides: { FAKE_GH_PR_VIEW_JSON: BOTH_JSON },
   });
-  const offParent = seedSucceeded(off.db);
-  assert.deepEqual(await off.scheduler.tick(), [2]);
-  const offFound = findTaskBySource(off.db, 'pr-review:a/b#9:99');
-  assert.ok(offFound !== null);
-  assert.equal(getTask(off.db, offFound.id).gitRef, offParent.branch);
-  assert.equal(getTask(off.db, offParent.id).prOutcome, null, 'prStatus 关：不写结论');
-  assert.equal(prStatusGhCalls(off.ghLog), 0, 'prStatus 关：不多一次 state,mergedAt 的 gh');
-  assert.equal(followGhCalls(off.ghLog), 1);
+  const offMergedParent = seedSucceeded(offMerged.db);
+  assert.deepEqual(await offMerged.scheduler.tick(), []);
+  assert.equal(findTaskBySource(offMerged.db, 'pr-review:a/b#9:99'), null, 'MERGED 的 PR 不入队');
+  assert.equal(getTask(offMerged.db, offMergedParent.id).prOutcome, null, 'prStatus 关：不写结论');
+  assert.equal(prStatusGhCalls(offMerged.ghLog), 0, 'prStatus 关：一次 state,mergedAt 都不打');
+  assert.equal(followGhCalls(offMerged.ghLog), 1, 'prOutcome 当时是 null：follow 仍打了一次 gh');
   assert.deepEqual(
-    prViewArgv(off.ghLog, 'reviewDecision,reviews,url,headRefName'),
-    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName']],
-    'argv 仍是 reviewDecision 那组',
+    prViewArgv(offMerged.ghLog, 'reviewDecision,reviews,url,headRefName,state,mergeable'),
+    [['pr', 'view', '9', '--repo', 'a/b', '--json', 'reviewDecision,reviews,url,headRefName,state,mergeable']],
+    '唯一那次 gh 是 follow 的长字段 pr view',
   );
 });
 
