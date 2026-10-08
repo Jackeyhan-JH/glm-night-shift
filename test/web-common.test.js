@@ -63,6 +63,17 @@ test('navHtml：队列 / 与额度 /usage.html 两项，命中项带 active', ()
   assert.ok(!navHtml('/somewhere-else').includes('class="active"'));
 });
 
+test('验收: navHtml 有设置项（/settings.html），设置页命中时该项带 class="active"', () => {
+  const html = navHtml('/settings.html');
+  assert.ok(html.includes('href="/settings.html"'), '应有设置页链接');
+  assert.ok(html.includes('设置'), '链接文案应为「设置」');
+  assert.ok(html.includes('class="active"'), '设置页自身应命中 active');
+  // active 恰好落在设置项上：截取该 <a> 整段核对（其他项不带 active）
+  const item = html.split('\n').find((line) => line.includes('/settings.html'));
+  assert.match(item, /class="active"/);
+  assert.equal(navHtml('/').split('\n').find((line) => line.includes('/settings.html')).includes('active'), false);
+});
+
 test('web/common.js 是 ESM 且可被 Node 直接 import（无 DOM 依赖）', () => {
   // 走到这里本身就是证明；再确认导出形状。
   assert.equal(typeof navHtml, 'function');

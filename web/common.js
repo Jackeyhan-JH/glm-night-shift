@@ -1,4 +1,4 @@
-// 看板前端公共模块（issue #14）：三个看板页（队列 / 任务详情 / 额度）共用的工具。
+// 看板前端公共模块（issue #14）：四个看板页（队列 / 任务详情 / 额度 / 设置）共用的工具。
 // 纯 ESM、零依赖，浏览器里 <script type="module"> 直接引；除 api() 在调用时才碰
 // fetch 外全是纯函数，import 时不碰任何 DOM——所以 node:test 也能直接 import 单测
 // （见 test/web-common.test.js）。
@@ -96,12 +96,14 @@ export function statusLabel(status) {
 
 /**
  * 顶部导航的 HTML（纯字符串拼装，不碰 DOM）。
- * @param {string} [active=''] 当前页路径（'/' 或 '/usage.html'），命中的项加 class="active"。
+ * @param {string} [active=''] 当前页路径（'/' 或 '/usage.html' 或 '/settings.html'），
+ *   命中的项加 class="active"。
  */
 export function navHtml(active = '') {
   const items = [
     { href: '/', label: '队列' },
     { href: '/usage.html', label: '额度' },
+    { href: '/settings.html', label: '设置' },
   ];
   const links = items
     .map(({ href, label }) => `  <a href="${href}"${href === active ? ' class="active"' : ''}>${label}</a>`)

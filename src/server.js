@@ -13,6 +13,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { systemClock } from './clock.js';
+import { SETTINGS_KEYS, loadConfig, patchConfigFile, pickSettings } from './config.js';
 import { getStatus } from './peak.js';
 import { multiplierFor, toDate, usage } from './quota.js';
 import { HISTORY_DAYS_MAX, HISTORY_DAYS_MIN, hourlyUsage } from './stats.js';
@@ -88,6 +89,9 @@ const IMPORT_BODY_FIELDS = new Set(['repo', 'label', 'state', 'limit', 'difficul
 
 /** POST /api/cleanup 允许的请求体字段（#50；缺省与 cleanup 命令相同）。 */
 const CLEANUP_BODY_FIELDS = new Set(['dryRun', 'logsOlderThan']);
+
+/** PATCH /api/config 允许的请求体字段（#61；清单与顺序见 src/config.js 的 SETTINGS_KEYS）。 */
+const SETTINGS_BODY_FIELDS = new Set(SETTINGS_KEYS);
 
 /**
  * 带HTTP 语义的错误：处理器主动抛出，按 status / field 回给客户端。
@@ -330,6 +334,18 @@ function buildRoutes(deps, bumpSse) {
       const runs = listRuns(deps.db, { since: from, limit: HUGE_LIMIT });
       sendJson(ctx.res, 200, hourlyUsage(runs, now, days));
     } },
+    // 常用开关的读写（#61）：GET 每次重读 <home>/config.json（默认值 < 文件 < 环境变量），
+    // PATCH 校验全过才原子写盘。写盘只影响下次启动——正在跑的调度器继续用启动时握住的
+    // 配置对象：这里不通知它，也不把读到的对象写回 deps.config（本条不做热更新）。
+    { method: 'GET', pattern: /^\/api\/config$/, handler: (ctx) => {
+      sendJson(ctx.res, 200, readSettings(deps));
+    } },
+    { method: 'PATCH', pattern: /^\/api\/config$/, handler: (ctx) => {
+      const patch = parseSettingsBody(ctx.body); // 先校验：不过 → 400，一个键都不写
+      requireSettingsHome(deps); // home 缺失 → 500，绝不退回 ~/.glm-night-shift
+      patchConfigFile(deps.home, patch); // 文件不合法 JSON → 抛错 → 500，原字节不动
+      sendJson(ctx.res, 200, readSettings(deps)); // 写完重读：体与 GET 相同的七个键
+    } },
   ];
 }
 
@@ -478,6 +494,52 @@ function parseCleanupBody(body) {
     dryRun: optionalBoolean(body, 'dryRun'),
     logsOlderThan: optionalInteger(body, 'logsOlderThan', 0, DEFAULT_LOGS_DAYS),
   };
+}
+
+// ---------------------------------------------------------------- 设置读写（#61）
+
+/**
+ * PATCH /api/config 的请求体 → 要写盘的键值子集。空对象、未知键、类型不对都 → 400
+ * 点名字段（先按对象键顺序查未知键，再查类型；未知键与类型错误并存时报未知键）；
+ * 多个键一起给时有一个不合法就整单拒绝，一个键都不写。全过才返回子集本身
+ * （此时它只含白名单里的键，调用方才去碰文件）。
+ */
+function parseSettingsBody(body) {
+  rejectUnknownFields(body, SETTINGS_BODY_FIELDS);
+  if (Object.keys(body).length === 0) {
+    throw new HttpError(400, `没有可写入的配置项（允许：${[...SETTINGS_BODY_FIELDS].join(' | ')}）`);
+  }
+  for (const key of Object.keys(body)) {
+    const value = body[key];
+    if (key === 'concurrency') {
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new HttpError(400, `concurrency 必须是正整数，收到：${JSON.stringify(value)}`, key);
+      }
+    } else if (key === 'followPollMinutes' || key === 'prStatusPollMinutes') {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw new HttpError(400, `${key} 必须是正数，收到：${JSON.stringify(value)}`, key);
+      }
+    } else if (typeof value !== 'boolean') { // 其余四个都是布尔键；false 是合法值
+      throw new HttpError(400, `${key} 必须是布尔值，收到：${JSON.stringify(value)}`, key);
+    }
+  }
+  return body;
+}
+
+/** GET/PATCH /api/config 前置：home 缺失 → 500（禁止退回 ~/.glm-night-shift 读真实家目录）。 */
+function requireSettingsHome(deps) {
+  if (typeof deps.home !== 'string' || deps.home === '') {
+    throw new HttpError(500, '服务器未配置数据目录（home），无法读写设置');
+  }
+}
+
+/**
+ * 重读盘取七个设置键（默认值 < config.json < 环境变量），PATCH 写完再 GET 能看到新值。
+ * 读到的对象不写回 deps.config、不通知调度器——运行中的进程仍用启动时的配置。
+ */
+function readSettings(deps) {
+  requireSettingsHome(deps);
+  return pickSettings(loadConfig({ home: deps.home, env: deps.env }));
 }
 
 async function handleRequest(req, res, routes) {
