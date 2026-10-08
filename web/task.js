@@ -496,6 +496,13 @@ export function createPage(options = {}) {
       addText('PR', task.prUrl === null || task.prUrl === undefined || task.prUrl === ''
         ? '-' : task.prUrl); // 非 http(s) 的值不做成链接，按文本原样显示
     }
+    // PR 结果（#56）：PR 在 GitHub 上已合并 / 已关闭。open 与未查过（null / undefined /
+    // 空串及其他任何值）整行不画（也不画成 -），值是纯文本不是链接。
+    if (task.prOutcome === 'merged') {
+      addText('PR 结果', '已合并');
+    } else if (task.prOutcome === 'closed') {
+      addText('PR 结果', '已关闭');
+    }
     if (Array.isArray(task.dependsOn) && task.dependsOn.length > 0) {
       const dt = doc.createElement('dt');
       dt.textContent = '依赖';

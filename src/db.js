@@ -210,6 +210,16 @@ const MIGRATIONS = [
       ALTER TABLE tasks ADD COLUMN git_ref TEXT NULL;
     `);
   },
+  // 版本 8：tasks 加 pr_outcome（issue #56 记下 PR 已合并或已关闭）。可空文本，合法值
+  // 只有调用方写入的 open / merged / closed，未查过是 NULL——不加 CHECK（旧测试的插入
+  // 路径不被约束绊住）、不建索引（查询按 status 过滤后量级很小）。调度器开 prStatus 时
+  // 定期用 gh pr view 查已成功任务的 PR state 并写这里（见 src/pr-status.js）；只记录
+  // 结论，任务的 status / attempts / pr_url / branch / finished_at 一概不动。
+  (db) => {
+    db.exec(`
+      ALTER TABLE tasks ADD COLUMN pr_outcome TEXT NULL;
+    `);
+  },
 ];
 
 /**

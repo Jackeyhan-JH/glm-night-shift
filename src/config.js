@@ -42,6 +42,9 @@ export const DEFAULT_CONFIG = deepFreeze({
   // —— issue #49 新增（调度器自动跟进 PR 评审），按约定追加在对象末尾 ——
   autoFollowReviews: false,    // true 时调度器在非高峰自动扫描已成功任务的 PR 评审并入队跟进
   followPollMinutes: 30,       // 两次自动扫描至少间隔的分钟数（正数）
+  // —— issue #56 新增（记下 PR 已合并或已关闭），按约定追加在对象末尾 ——
+  prStatus: false,             // true 时调度器定期用 gh 查已成功任务 PR 的 state，写进 prOutcome
+  prStatusPollMinutes: 30,     // 两次 PR 状态查询至少间隔的分钟数（正数）
 });
 
 /**

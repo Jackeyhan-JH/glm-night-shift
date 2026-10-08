@@ -21,6 +21,7 @@ import { runTask, runEvents } from './runner.js';
 import { diagnose as diagnoseTask } from './diagnose.js';
 import * as gitModule from './git.js';
 import { scanFollowReviews } from './follow.js';
+import { pollPrOutcomes } from './pr-status.js';
 import {
   InvalidTransitionError,
   claimNextTask,
@@ -52,7 +53,7 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   plan / weekStart / safetyRatio / allowPeak / maxAttempts / rateLimitBackoffMinutes /
  *   keepFailedWorktrees / timeoutMinutes / killGraceSeconds / difficulty /
  *   autoDiagnose / diagnoseModel / remoteUrlTemplate / ghBin / oneTaskPerRepo /
- *   autoFollowReviews / followPollMinutes …）
+ *   autoFollowReviews / followPollMinutes / prStatus / prStatusPollMinutes …）
  * @param {string} options.home 数据目录（仓库缓存、worktree、日志都在它下面）
  * @param {() => Date} [options.clock] 取「现在」；缺省真实时间，测试注入可调时钟
  * @param {Function} [options.runner] 执行器，缺省 #7 的 runTask（签名见其 JSDoc）
@@ -73,8 +74,8 @@ const STALE_INFO_PATTERN = /stale info/i;
  *   （各方法的语义见下方 JSDoc）
  * @throws {TypeError} 任一参数缺失或类型不符（db/config/home/env 非对象、home 非非空
  *   字符串、clock/runner 非函数、concurrency 非正整数、pollSeconds / cancelPollMs /
- *   rateLimitBackoffMinutes / followPollMinutes 非正数、oneTaskPerRepo /
- *   autoFollowReviews 非布尔）
+ *   rateLimitBackoffMinutes / followPollMinutes / prStatusPollMinutes 非正数、
+ *   oneTaskPerRepo / autoFollowReviews / prStatus 非布尔）
  */
 export function createScheduler({
   db, config, home,
@@ -107,6 +108,11 @@ export function createScheduler({
     throw new TypeError(`config.autoFollowReviews 必须是布尔值，收到：${describe(config.autoFollowReviews)}`);
   }
   assertPositiveNumber(config.followPollMinutes, 'config.followPollMinutes');
+  // #56：PR 状态查询的两个新键同理（缺键 = undefined，同样过不了这里的类型检查）
+  if (typeof config.prStatus !== 'boolean') {
+    throw new TypeError(`config.prStatus 必须是布尔值，收到：${describe(config.prStatus)}`);
+  }
+  assertPositiveNumber(config.prStatusPollMinutes, 'config.prStatusPollMinutes');
 
   const events = new EventEmitter();
   /** 运行中的任务：taskId -> { controller, task }。controller 用于取消与停机中止。 */
@@ -123,6 +129,8 @@ export function createScheduler({
   let lastBlockedKey = null;
   /** 最近一次自动跟进扫描的时刻（#49；取 clock() 的时间，不是墙钟）。null = 还没查过。 */
   let lastFollowAt = null;
+  /** 最近一次 PR 状态查询的时刻（#56；同样取 clock() 的时间，与 lastFollowAt 互相独立）。 */
+  let lastPrStatusAt = null;
   let pollTimer = null;
   let cancelTimer = null;
   let tickChain = Promise.resolve();
@@ -272,6 +280,9 @@ export function createScheduler({
     // #49 自动跟进：放在限流退避 / 手动暂停的早退**之前**——那两种期间扫描照做
     // （只入队、不领取），查不查这轮由 maybeFollowReviews 按配置 / 高峰 / 间隔自判。
     await maybeFollowReviews(now);
+    // #56 PR 状态查询：同一位置（早退之前），但独立于跟进——高峰也查（这点与 #49
+    // 相反）、只写 pr_outcome 不入队；查不查这轮由 maybePollPrStatus 按配置 / 间隔自判。
+    await maybePollPrStatus(now);
     if (pausedUntil !== null && now < pausedUntil) {
       setBlocked({ reason: 'rate-limit', retryAt: pausedUntil });
       return [];
@@ -371,6 +382,32 @@ export function createScheduler({
     }
     if (outcome.ghError !== null) {
       console.error(`[night-shift] 自动跟进扫描遇到 gh 失败，本轮不再扫其余父任务：${outcome.ghError}`);
+    }
+  }
+
+  /**
+   * PR 状态查询（#56）：prStatus 开着时，每隔 prStatusPollMinutes 做一轮
+   * pollPrOutcomes（查已成功任务的 PR state、写 pr_outcome，逻辑全在 src/pr-status.js）。
+   * 与 #49 自动跟进的关键差别：**高峰也查**，而且查过就把「刚查过」记上（不因 isPeak
+   * 跳过）；手动暂停 / 限流退避期间照查（只写列），调用方随后的早退照旧不领取、不入队。
+   * - 默认关闭（prStatus !== true）时任何一轮都不为这件事调 gh；
+   * - 间隔用 clock() 的时间差算；从未查过时第一次符合条件的 tick 立刻查（含高峰）；
+   * - 在真正调 gh 之前更新 lastPrStatusAt：成败都算查过，失败也不会每 tick 再打
+   *   （gh 失败由 pollPrOutcomes 记一条日志并停掉本轮，不影响随后的领取）。
+   * @param {Date} now 本轮 tick 的时刻（clock() 的结果）
+   */
+  async function maybePollPrStatus(now) {
+    if (config.prStatus !== true) return;
+    if (lastPrStatusAt !== null
+      && now.getTime() - lastPrStatusAt.getTime() < config.prStatusPollMinutes * 60_000) {
+      return;
+    }
+    lastPrStatusAt = now; // 这次算查过：成败都至少隔 prStatusPollMinutes 再来（高峰也一样）
+    try {
+      await pollPrOutcomes(db, { ghBin: config.ghBin, env, now });
+    } catch (err) {
+      // 查询自身炸了（读库失败等）：记日志后照常返回，绝不让异常逃出 tick
+      console.error('[night-shift] PR 状态查询意外失败：', err);
     }
   }
 
