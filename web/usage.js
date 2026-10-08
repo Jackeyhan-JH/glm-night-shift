@@ -74,8 +74,10 @@ async function refreshStatus() {
 }
 
 async function refreshHistory() {
+  const days = state.days; // 请求期间用户切了范围 → 这次响应作废（见下）
   try {
-    const history = await api(`/api/usage/history?days=${state.days}`);
+    const history = await api(`/api/usage/history?days=${days}`);
+    if (days !== state.days) return;
     state.history = history;
     hideError('chart-error');
     renderChart();
@@ -196,6 +198,7 @@ function renderScheduler(scheduler) {
 
 function renderChart() {
   if (state.history === null) return;
+  hideTooltip(); // 重画会换掉悬停命中的矩形：旧提示不复位就会永远挂着
   const wrap = $('#chart-wrap');
   const width = Math.max(Math.floor(wrap.clientWidth) || 920, 320);
   const height = CHART_HEIGHT;
