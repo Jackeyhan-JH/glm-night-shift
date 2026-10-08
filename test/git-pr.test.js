@@ -72,6 +72,24 @@ test('findOpenPr：gh 退出码非 0 时抛 GitError（含退出码与 stderr）
   );
 });
 
+test('ghBin 不存在：清晰的 GitError（带路径），不挂起；临时正文目录也不残留', async (t) => {
+  const nope = path.join(makeTempHome(t), 'definitely-no-such-gh');
+  await assert.rejects(
+    () => findOpenPr({ repo: 'a/b', branch: 'night-shift/12-x', config: { ghBin: nope }, env: fakeEnv() }),
+    (err) => err instanceof GitError && err.message.includes('无法启动') && err.message.includes(nope),
+  );
+  const leftovers = () => fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('night-shift-pr-'));
+  const before = leftovers().length;
+  await assert.rejects(
+    () => createPr({
+      repo: 'a/b', branch: 'night-shift/12-x', base: 'main', title: 't', body: 'b',
+      config: { ghBin: nope }, env: fakeEnv(),
+    }),
+    (err) => err instanceof GitError && err.message.includes('无法启动'),
+  );
+  assert.equal(leftovers().length, before, 'gh 启动失败的路径上临时目录也要删干净');
+});
+
 // —— createPr ——
 
 test('验收：createPr 的 argv 精确、正文落到 FAKE_GH_BODY_COPY、临时正文文件删净', async (t) => {
@@ -186,6 +204,49 @@ echo 没有地址`);
     }),
     (err) => err instanceof GitError && err.message.includes('PR 地址'),
   );
+});
+
+test('createPr：含空格/Unicode/前置连字符的 title 与 base 照原样各占一个 argv token', async (t) => {
+  const dir = makeTempHome(t);
+  const log = path.join(dir, 'gh.log');
+  const title = '-修 复 登 录“引号”';
+  const pr = await createPr({
+    repo: 'a/b', branch: 'night-shift/12-fix', base: 'release/1.0 x', title, body: 'b',
+    config: { ghBin: FAKE_GH }, env: fakeEnv({ FAKE_GH_LOG: log }),
+  });
+  assert.deepEqual(pr, { url: 'https://github.com/a/b/pull/1', existed: false });
+  const create = readGhLog(log).at(-1);
+  const titleIndex = create.indexOf('--title');
+  const baseIndex = create.indexOf('--base');
+  assert.notEqual(titleIndex, -1);
+  // title 以 '-' 开头也必须只是 --title 的值（下一个 token），不会被当成别的选项
+  assert.deepEqual(create.slice(titleIndex, titleIndex + 2), ['--title', title]);
+  assert.deepEqual(create.slice(baseIndex, baseIndex + 2), ['--base', 'release/1.0 x']);
+});
+
+test('createPr / findOpenPr：repo/branch/base/title 非法时先抛参数错误（不启动 gh）', async (t) => {
+  const dir = makeTempHome(t);
+  const log = path.join(dir, 'gh.log');
+  const env = fakeEnv({ FAKE_GH_LOG: log });
+  const base = { repo: 'a/b', branch: 'night-shift/12-x', base: 'main', title: 't', body: 'b', config: { ghBin: FAKE_GH }, env };
+  const cases = [
+    [{ ...base, repo: 'oops' }, /owner\/name/],
+    [{ ...base, repo: '' }, /owner\/name/],
+    [{ ...base, branch: '' }, /branch/],
+    [{ ...base, branch: null }, /branch/],
+    [{ ...base, base: '' }, /base/],
+    [{ ...base, base: '  ' }, /base/],
+    [{ ...base, title: '' }, /title/],
+    [{ ...base, title: null }, /title/],
+  ];
+  for (const [args, pattern] of cases) {
+    await assert.rejects(() => createPr(args), pattern, JSON.stringify(args));
+  }
+  await assert.rejects(
+    () => findOpenPr({ repo: 'a/b', branch: '', config: { ghBin: FAKE_GH }, env }),
+    /branch/,
+  );
+  assert.equal(fs.existsSync(log), false, '参数非法时根本不应调用 gh');
 });
 
 // —— buildPrBody ——

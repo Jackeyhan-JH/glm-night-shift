@@ -67,18 +67,28 @@ function configFor(bareDir) {
   return { remoteUrlTemplate: path.join(bareDir, '{owner}__{name}.git') };
 }
 
-/** 常用前置：bare 远端 + home + task-12 的 worktree。 */
+/** 常用前置：bare 远端 + home + 缓存 + task-12 的 worktree（createWorktree 只吃现成缓存）。 */
 async function prepareWorktree(t) {
   const remote = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(remote.dir) });
   const wt = await createWorktree({
     home,
     repo: 'a/b',
     task: { id: 12, title: 'fix login bug' },
     baseBranch: 'main',
-    config: configFor(remote.dir),
   });
   return { ...remote, home, wt };
+}
+
+/** 轮询直到 fn() 为真（每 20ms 一次，超时 timeoutMs 返回 false）。避免测试里写死 sleep。 */
+async function waitUntil(fn, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await fn()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 20));
+  }
 }
 
 // —— 纯函数 ——
@@ -201,6 +211,67 @@ test('ensureRepoCache：缓存是有效仓库但没有 origin 远端时也重克
   assert.equal(git(['rev-parse', 'origin/main'], cache).trim(), baseSha);
 });
 
+/**
+ * 造一个「别的 git checkout」，home 放在它的工作区里；返回
+ * { checkout, home, outerBare, parentWorktree }。git rev-parse 在其任何子目录里
+ * 都能成功（解析到父仓库），正好用来考验「可用缓存」的判定。
+ */
+function makeHomeInsideForeignCheckout(t) {
+  const box = makeTempHome(t);
+  const outerBare = path.join(box, 'outer-origin.git');
+  const checkout = path.join(box, 'checkout');
+  git(['init', '--bare', '-q', '-b', 'main', outerBare]);
+  git(['init', '-q', '-b', 'main', checkout]);
+  git(['remote', 'add', 'origin', outerBare], checkout);
+  fs.writeFileSync(path.join(checkout, 'own.txt'), '父仓库自己的文件\n');
+  git(['add', '-A'], checkout);
+  git(['commit', '--quiet', '-m', 'outer init'], checkout);
+  // 父仓库自己的 linked worktree（目录稍后被手动删掉，留下待 prune 的元数据——
+  // 用于断言我们的代码绝不会对父仓库跑 worktree prune）
+  const parentWorktree = path.join(box, 'outer-wt');
+  git(['worktree', 'add', '-q', '-b', 'outer-side', parentWorktree, 'main'], checkout);
+  fs.rmSync(parentWorktree, { recursive: true, force: true });
+  const home = path.join(checkout, 'night-shift-home');
+  fs.mkdirSync(home, { recursive: true });
+  return { checkout, home, outerBare, parentWorktree, box };
+}
+
+test('回归：home 在别人的 git checkout 里时，坏缓存不算可用，父仓库不被 set-url/fetch', async (t) => {
+  const { checkout, home, outerBare } = makeHomeInsideForeignCheckout(t);
+  const { dir, bare, baseSha } = makeBareRemote(t);
+  // 坏缓存：空目录，但位于父仓库工作区内——`rev-parse --git-dir` 会成功（解析到父仓库）
+  fs.mkdirSync(path.join(home, 'repos', 'a__b'), { recursive: true });
+
+  const cache = await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
+  // 缓存是独立仓库、指向我们的 bare，不是父仓库
+  assert.equal(git(['rev-parse', '--show-toplevel'], cache).trim(), path.resolve(cache));
+  assert.equal(git(['remote', 'get-url', 'origin'], cache).trim(), bare);
+  assert.equal(git(['rev-parse', 'origin/main'], cache).trim(), baseSha);
+  // 父仓库毫发无损：origin 还是它自己的，对象库里没有被塞进我们的 main
+  assert.equal(git(['remote', 'get-url', 'origin'], checkout).trim(), outerBare);
+  const outerRefs = git(['for-each-ref', '--format=%(refname)', 'refs/remotes/origin'], checkout).trim();
+  assert.equal(outerRefs, '', '父仓库不应多出任何远端跟踪 ref');
+});
+
+test('回归：home 在别人的 git checkout 里，缓存坏掉时 removeWorktree 不 prune 父仓库', async (t) => {
+  const { checkout, home, parentWorktree } = makeHomeInsideForeignCheckout(t);
+  const { dir } = makeBareRemote(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
+  const wt = await createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' });
+
+  // 把缓存破坏成「位于父仓库工作区里的普通目录」：错误实现会把它当可用仓库，
+  // 进而对父仓库执行 worktree remove/prune
+  fs.rmSync(repoCacheDir(home, 'a/b'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(home, 'repos', 'a__b'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'repos', 'a__b', 'broken'), 'x');
+
+  await removeWorktree({ home, repo: 'a/b', worktree: wt.path });
+  assert.equal(fs.existsSync(wt.path), false, 'worktree 目录应被删掉');
+  // 父仓库的 worktree 元数据（outer-wt 已无目录、正等着被 prune）必须原样保留
+  const list = git(['worktree', 'list', '--porcelain'], checkout);
+  assert.ok(list.includes('outer-side'), `父仓库的待 prune 元数据不应被动过：\n${list}`);
+});
+
 // —— 默认分支 ——
 
 test('验收：defaultBranch 对 main / trunk 两个 bare 仓库分别返回正确分支', async (t) => {
@@ -229,12 +300,12 @@ test('defaultBranch：空 bare 仓库解析不出分支时抛 GitError', async (
 test('验收：createWorktree 建出 task-12、分支正确、内容等于 origin/main', async (t) => {
   const { dir, baseSha } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const wt = await createWorktree({
     home,
     repo: 'a/b',
     task: { id: 12, title: 'Fix Login Bug!!' },
     baseBranch: 'main',
-    config: configFor(dir),
   });
   assert.equal(wt.path, path.join(home, 'worktrees', 'task-12'));
   assert.equal(wt.branch, 'night-shift/12-fix-login-bug');
@@ -249,12 +320,12 @@ test('验收：createWorktree 建出 task-12、分支正确、内容等于 origi
 test('验收：对同一任务再次 createWorktree 不报错，分支被重置回基线', async (t) => {
   const { dir, baseSha } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const opts = {
     home,
     repo: 'a/b',
     task: { id: 12, title: 'fix login bug' },
     baseBranch: 'main',
-    config: configFor(dir),
   };
   const first = await createWorktree(opts);
   fs.writeFileSync(path.join(first.path, 'new.txt'), 'x\n');
@@ -273,14 +344,53 @@ test('验收：对同一任务再次 createWorktree 不报错，分支被重置�
 test('createWorktree：目标路径被非 worktree 的残留目录占用时先清掉', async (t) => {
   const { dir } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const junk = path.join(home, 'worktrees', 'task-12');
   fs.mkdirSync(junk, { recursive: true });
   fs.writeFileSync(path.join(junk, 'junk.txt'), '残留');
   const wt = await createWorktree({
-    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main', config: configFor(dir),
+    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main',
   });
   assert.equal(fs.existsSync(path.join(wt.path, 'junk.txt')), false);
   assert.ok(fs.existsSync(path.join(wt.path, 'README.md')));
+});
+
+test('回归：createWorktree 不自带 config，只吃现成缓存：origin 地址保持本地 bare，不 re-point 不联网', async (t) => {
+  // 规格签名是 createWorktree({ home, repo, task, baseBranch })。它绝不能自己去
+  // ensureRepoCache：那会带上默认 GitHub 模板，把本地 bare 远端的缓存悄悄 re-point
+  // 到 https://github.com/a/b.git 并触发一次必然失败的联网 fetch。
+  const { dir, bare } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
+  const wt = await createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' });
+  assert.ok(fs.existsSync(path.join(wt.path, 'README.md')), '应正常建出 worktree');
+  assert.equal(git(['remote', 'get-url', 'origin'], repoCacheDir(home, 'a/b')).trim(), bare,
+    '缓存的 origin 仍应指向本地 bare');
+});
+
+test('createWorktree：没有可用缓存时清晰报错，且不动现场', async (t) => {
+  const { dir } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  // 场景一：缓存目录压根不存在（忘了先 ensureRepoCache）
+  await assert.rejects(
+    () => createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' }),
+    (err) => err instanceof Error && /ensureRepoCache/.test(err.message),
+  );
+  // 场景二：缓存目录存在但是坏的——也不能擅自重建
+  const junk = path.join(home, 'repos', 'a__b');
+  fs.mkdirSync(junk, { recursive: true });
+  fs.writeFileSync(path.join(junk, 'half'), '半截克隆');
+  await assert.rejects(
+    () => createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' }),
+    (err) => err instanceof Error && /ensureRepoCache/.test(err.message) && err.message.includes(junk),
+  );
+  assert.equal(fs.existsSync(path.join(junk, 'half')), true, 'createWorktree 不应删除/重建缓存');
+  assert.equal(fs.existsSync(path.join(home, 'worktrees', 'task-12')), false);
+  // 场景三：baseBranch 缺失直接抛参数错误
+  await assert.rejects(
+    () => createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, config: configFor(dir) }),
+    /baseBranch/,
+  );
 });
 
 // —— 提交 ——
@@ -466,13 +576,41 @@ test('runTestCommand：worktree 不存在时不抛错，ok:false、说明在 out
   assert.ok(res.output.length > 0);
 });
 
+test('runTestCommand：worktree 缺失/空白时抛错，绝不落到当前目录执行', async (t) => {
+  await assert.rejects(() => runTestCommand({ command: 'true' }), /worktree/);
+  await assert.rejects(() => runTestCommand({ worktree: '  ', command: 'true' }), /worktree/);
+});
+
+test('回归：命令正常退出后，它留下的后台进程也被清掉（不留孙进程）', async (t) => {
+  const dir = makeTempHome(t);
+  // `sleep 30 & echo $!`：sh 立刻退出 0，但 sleep 30 还活着——runTestCommand
+  // 收尾时必须 SIGTERM（宽限后 SIGKILL）整个进程组
+  const res = await runTestCommand({ worktree: dir, command: 'sleep 30 & echo $!', timeoutMs: 60000 });
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.ok, true);
+  const pid = Number.parseInt(res.output.trim(), 10);
+  assert.ok(Number.isInteger(pid), `output 应带出后台进程 pid：${JSON.stringify(res.output)}`);
+  // settle 时 SIGTERM 已同步发出；轮询等它消失（进程表更新有延迟，忽略 SIGTERM
+  // 的进程由 2s 后的 SIGKILL 兜底）
+  const gone = await waitUntil(() => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      return err.code === 'ESRCH';
+    }
+  }, 5000);
+  assert.ok(gone, `后台进程 ${pid} 应在 runTestCommand 返回后被清理`);
+});
+
 // —— 推送 ——
 
 test('验收：pushBranch 推到 bare 的 night-shift/ 分支；amend 后可覆盖；拒绝其他命名空间', async (t) => {
   const { dir, bare } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const wt = await createWorktree({
-    home, repo: 'a/b', task: { id: 12, title: 'fix login bug' }, baseBranch: 'main', config: configFor(dir),
+    home, repo: 'a/b', task: { id: 12, title: 'fix login bug' }, baseBranch: 'main',
   });
   fs.writeFileSync(path.join(wt.path, 'change.txt'), 'v1\n');
   const { sha } = await commitAll({ worktree: wt.path, message: 'v1', config: {} });
@@ -495,14 +633,135 @@ test('验收：pushBranch 推到 bare 的 night-shift/ 分支；amend 后可覆�
   assert.equal(git(['rev-parse', 'refs/heads/main'], bare).trim(), mainBefore);
 });
 
+test('回归：pushBranch 与 ensureRepoCache 的 fetch 在同一缓存锁上排队', async (t) => {
+  const { dir } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  const config = configFor(dir);
+  await ensureRepoCache({ home, repo: 'a/b', config });
+  const wt = await createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' });
+  fs.writeFileSync(path.join(wt.path, 'a.txt'), '1\n');
+  await commitAll({ worktree: wt.path, message: 'm', config: {} });
+
+  // 用一个记录 BEGIN/END、并给 fetch 人为加延迟的 git 包装脚本放大竞争窗口。
+  // 若 pushBranch 用的是别的锁 key（比如 worktree 路径），push 会在 fetch 进行中
+  // 就开始（BEGIN push 出现在 END fetch 之前）。
+  const realGit = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  assert.ok(realGit !== '', '找不到真实 git');
+  const box = makeTempHome(t);
+  const log = path.join(box, 'git.log');
+  const shimDir = path.join(box, 'shim');
+  fs.mkdirSync(shimDir);
+  const gitShim = path.join(shimDir, 'git');
+  fs.writeFileSync(gitShim, [
+    '#!/bin/sh',
+    `echo "BEGIN $*" >> '${log}'`,
+    'if [ "$1" = fetch ] && [ -n "$NS_TEST_FETCH_DELAY" ]; then sleep "$NS_TEST_FETCH_DELAY"; fi',
+    `"${realGit}" "$@"`,
+    'st=$?',
+    `echo "END $*" >> '${log}'`,
+    'exit $st',
+  ].join('\n'));
+  fs.chmodSync(gitShim, 0o755);
+
+  const readLog = () => {
+    try {
+      return fs.readFileSync(log, 'utf8').split('\n').filter((line) => line !== '');
+    } catch {
+      return [];
+    }
+  };
+
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shimDir}${path.delimiter}${oldPath}`;
+  process.env.NS_TEST_FETCH_DELAY = '0.5';
+  try {
+    const fetching = ensureRepoCache({ home, repo: 'a/b', config }); // fetch 会睡 0.5s
+    // 等 fetch 真正开始后再发起 push，确保两者在时间上重叠
+    assert.ok(await waitUntil(() => readLog().some((line) => line.startsWith('BEGIN fetch'))), 'fetch 应已开始');
+    const pushing = pushBranch({ worktree: wt.path, branch: wt.branch });
+    await Promise.all([fetching, pushing]); // 两者都成功
+  } finally {
+    process.env.PATH = oldPath;
+    delete process.env.NS_TEST_FETCH_DELAY;
+  }
+
+  const lines = readLog();
+  const fetchEnd = lines.findIndex((line) => line.startsWith('END fetch'));
+  const pushBegin = lines.findIndex((line) => line.startsWith('BEGIN push'));
+  assert.ok(fetchEnd >= 0, `日志里应有 END fetch：\n${lines.join('\n')}`);
+  assert.ok(pushBegin >= 0, `日志里应有 BEGIN push：\n${lines.join('\n')}`);
+  assert.ok(pushBegin > fetchEnd, `push 必须等 fetch 结束才能开始（同一缓存锁）：\n${lines.join('\n')}`);
+});
+
+test('回归：缓存重新克隆后（远端已有旧分支），--force-with-lease 仍能覆盖重试', async (t) => {
+  const { dir, bare } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  const config = configFor(dir);
+  await ensureRepoCache({ home, repo: 'a/b', config });
+  const opts = { home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' };
+
+  // 第一次运行：推上 v1，然后正常清理
+  const wt1 = await createWorktree(opts);
+  fs.writeFileSync(path.join(wt1.path, 'v.txt'), 'v1\n');
+  const v1 = await commitAll({ worktree: wt1.path, message: 'v1', config: {} });
+  await pushBranch({ worktree: wt1.path, branch: wt1.branch });
+  assert.equal(git(['rev-parse', `refs/heads/${wt1.branch}`], bare).trim(), v1.sha);
+  await removeWorktree({ home, repo: 'a/b', worktree: wt1.path });
+
+  // 模拟缓存被删后重建：重新克隆会重新拉到 night-shift/ 分支的远端跟踪 ref，
+  // --force-with-lease 认这个位置，覆盖旧分支应被允许
+  fs.rmSync(repoCacheDir(home, 'a/b'), { recursive: true, force: true });
+  await ensureRepoCache({ home, repo: 'a/b', config });
+
+  const wt2 = await createWorktree(opts); // -B 把分支重置回 base
+  fs.writeFileSync(path.join(wt2.path, 'v.txt'), 'v2\n');
+  const v2 = await commitAll({ worktree: wt2.path, message: 'v2', config: {} });
+  const pushed = await pushBranch({ worktree: wt2.path, branch: wt2.branch });
+  assert.equal(pushed.sha, v2.sha);
+  assert.equal(git(['rev-parse', `refs/heads/${wt2.branch}`], bare).trim(), v2.sha, '远端应被覆盖到 v2');
+});
+
+test('pushBranch：上次 fetch 之后远端分支被人动过 → 拒绝（stale info）；重新 fetch 后恢复', async (t) => {
+  const { dir, bare, seed } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  const config = configFor(dir);
+  await ensureRepoCache({ home, repo: 'a/b', config });
+  const wt = await createWorktree({ home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main' });
+  fs.writeFileSync(path.join(wt.path, 'mine.txt'), '1\n');
+  const mine = await commitAll({ worktree: wt.path, message: 'mine', config: {} });
+  await pushBranch({ worktree: wt.path, branch: wt.branch });
+
+  // 别人在我们上次 fetch 之后推了同名的 night-shift/ 分支（从 seed 克隆直推；
+  // 历史已分叉，用 --force 覆盖——正好构造「远端不在我们见过的位置上」）
+  fs.writeFileSync(path.join(seed, 'theirs.txt'), '2\n');
+  git(['add', '-A'], seed);
+  git(['commit', '--quiet', '-m', 'theirs'], seed);
+  git(['push', '--quiet', '--force', 'origin', `HEAD:refs/heads/${wt.branch}`], seed);
+  const theirs = git(['rev-parse', 'HEAD'], seed).trim();
+
+  // 覆盖被 lease 拒绝：远端不在我们见过的位置上，不许抹掉别人的提交
+  await assert.rejects(
+    () => pushBranch({ worktree: wt.path, branch: wt.branch }),
+    (err) => err instanceof GitError && /stale info/.test(err.stderr),
+  );
+  assert.equal(git(['rev-parse', `refs/heads/${wt.branch}`], bare).trim(), theirs, '远端应保持别人的提交');
+
+  // 刻意的恢复路径：重新 ensureRepoCache（fetch 刷新跟踪 ref）后 lease 放行
+  await ensureRepoCache({ home, repo: 'a/b', config });
+  const pushed = await pushBranch({ worktree: wt.path, branch: wt.branch });
+  assert.equal(pushed.sha, mine.sha);
+  assert.equal(git(['rev-parse', `refs/heads/${wt.branch}`], bare).trim(), mine.sha);
+});
+
 // —— 清理 ——
 
 test('验收：removeWorktree 删目录、worktree list 里没有、分支保留、重复调用不报错', async (t) => {
   const { dir } = makeBareRemote(t);
   const home = makeTempHome(t);
   const cache = repoCacheDir(home, 'a/b');
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const wt = await createWorktree({
-    home, repo: 'a/b', task: { id: 12, title: 'fix login bug' }, baseBranch: 'main', config: configFor(dir),
+    home, repo: 'a/b', task: { id: 12, title: 'fix login bug' }, baseBranch: 'main',
   });
 
   await removeWorktree({ home, repo: 'a/b', worktree: wt.path });
@@ -517,12 +776,54 @@ test('验收：removeWorktree 删目录、worktree list 里没有、分支保留
 test('removeWorktree：缓存目录没了但 worktree 目录还在 → 直接删目录不报错', async (t) => {
   const { dir } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const wt = await createWorktree({
-    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main', config: configFor(dir),
+    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'main',
   });
   fs.rmSync(repoCacheDir(home, 'a/b'), { recursive: true, force: true });
   await removeWorktree({ home, repo: 'a/b', worktree: wt.path });
   assert.equal(fs.existsSync(wt.path), false);
+});
+
+test('removeWorktree：拒绝删除 <home>/worktrees/ 之外的任意路径（含 .. 越界与符号链接）', async (t) => {
+  const { dir } = makeBareRemote(t);
+  const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
+  fs.mkdirSync(path.join(home, 'worktrees'), { recursive: true });
+
+  // 家目录之外的「贵重」目录与文件
+  const preciousBox = makeTempHome(t);
+  const precious = path.join(preciousBox, 'precious');
+  fs.mkdirSync(precious, { recursive: true });
+  fs.writeFileSync(path.join(precious, 'keep.txt'), '不能被删');
+  const preciousFile = path.join(preciousBox, 'file.txt');
+  fs.writeFileSync(preciousFile, '也不能被删');
+
+  // worktrees 之内指向外部的符号链接
+  const link = path.join(home, 'worktrees', 'task-12');
+  fs.symlinkSync(precious, link, 'dir');
+
+  const badPaths = [
+    precious,
+    preciousFile,
+    path.dirname(precious),
+    home,
+    path.join(home, 'worktrees'), // 根本身
+    path.join(home, 'worktrees', '..', 'repos'), // '..' 越界
+    path.join(home, 'worktrees', 'task-12'), // 符号链接逃逸
+    '/',
+  ];
+  for (const bad of badPaths) {
+    await assert.rejects(
+      () => removeWorktree({ home, repo: 'a/b', worktree: bad }),
+      (err) => err instanceof Error && /拒绝删除/.test(err.message),
+      JSON.stringify(bad),
+    );
+  }
+  assert.ok(fs.existsSync(path.join(precious, 'keep.txt')));
+  assert.ok(fs.existsSync(preciousFile));
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), '符号链接本身也不应被删');
+  assert.equal(fs.existsSync(path.join(home, 'worktrees')), true, 'worktrees 根目录必须保留');
 });
 
 // —— 并发 ——
@@ -532,7 +833,7 @@ test('并发：同一仓库两个任务同时 ensureRepoCache + createWorktree �
   const home = makeTempHome(t);
   const config = configFor(dir);
   const runTask = (task) => ensureRepoCache({ home, repo: 'a/b', config })
-    .then(() => createWorktree({ home, repo: 'a/b', task, baseBranch: 'main', config }));
+    .then(() => createWorktree({ home, repo: 'a/b', task, baseBranch: 'main' }));
   const [wt12, wt13] = await Promise.all([
     runTask({ id: 12, title: 'alpha' }),
     runTask({ id: 13, title: 'beta' }),
@@ -553,8 +854,9 @@ test('并发：同一仓库两个任务同时 ensureRepoCache + createWorktree �
 test('GitError：command/args/exitCode/stderr 字段齐全，message 含命令与 stderr 末尾', async (t) => {
   const { dir } = makeBareRemote(t);
   const home = makeTempHome(t);
+  await ensureRepoCache({ home, repo: 'a/b', config: configFor(dir) });
   const err = await createWorktree({
-    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'does-not-exist', config: configFor(dir),
+    home, repo: 'a/b', task: { id: 12, title: 'x' }, baseBranch: 'does-not-exist',
   }).then(
     () => { throw new Error('应该失败才对'); },
     (e) => e,
@@ -583,7 +885,7 @@ test('全流程：缓存 → 默认分支 → worktree → 改动 → 提交 →
   const cache = await ensureRepoCache({ home, repo, config });
   assert.equal(await defaultBranch(cache), 'main');
 
-  const wt = await createWorktree({ home, repo, task, baseBranch: 'main', config });
+  const wt = await createWorktree({ home, repo, task, baseBranch: 'main' });
   fs.writeFileSync(path.join(wt.path, 'fix.txt'), '修好了\n');
   const commit = await commitAll({ worktree: wt.path, message: '修复登录 bug', config });
   assert.equal(commit.changed, true);

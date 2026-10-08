@@ -42,7 +42,12 @@ export class GitError extends Error {
 }
 
 function commandLine(bin, args) {
-  return [bin, ...args].join(' ');
+  return [bin, ...args].map(quoteArg).join(' ');
+}
+
+/** 错误信息里给参数加引号：含空白/引号/非 ASCII 的参数（提交说明、标题……）照原样拼会难以阅读。 */
+function quoteArg(arg) {
+  return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replaceAll("'", `'\\''`)}'`;
 }
 
 /** 拼一个「命令失败」的 GitError：命令 + 退出码 + stderr（stdout 兜底）末尾。 */
@@ -57,27 +62,39 @@ function commandFailed(bin, args, exitCode, stderr, stdout) {
 }
 
 /** 拼一个「进程没跑起来」的 GitError（可执行文件不存在、cwd 不存在等）。 */
-function launchFailed(bin, args, cause) {
+function launchFailed(bin, args, cause, cwd) {
   const command = commandLine(bin, args);
-  const message = `无法启动 ${bin}：${cause && cause.message ? cause.message : String(cause)}（命令：${command}）`;
+  const where = cwd ? `（工作目录 ${cwd}）` : '';
+  const message = `无法启动 ${bin}${where}：${cause && cause.message ? cause.message : String(cause)}（命令：${command}）`;
   return new GitError(message, { command, args, exitCode: null, stderr: '' });
 }
 
+// 这些 GIT_* 环境变量会强行覆盖「按 cwd 发现仓库」的规则：夜班进程若不小心带上
+// （比如从别的 git 脚本里启动），所有「在缓存目录里跑」的 git 命令会操作到完全错误的
+// 仓库上，且往往不报错。一律剥掉；身份/配置类变量（GIT_AUTHOR_*、GIT_CONFIG_*）保留。
+const GIT_DISCOVERY_ENV_KEYS = [
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_NAMESPACE',
+];
+
 /**
  * 内部通用的子进程执行器：spawn(bin, args)，参数数组、无 shell、忽略 stdin，
- * 子进程环境 = { ...process.env, ...env }。退出码非 0 抛 GitError，成功返回 { stdout, stderr }。
+ * 子进程环境 = process.env 去掉 GIT_DISCOVERY_ENV_KEYS 后再叠加 env。
+ * 退出码非 0 抛 GitError，成功返回 { stdout, stderr }。
  */
 function runProcess(bin, args, { cwd, env } = {}) {
   return new Promise((resolve, reject) => {
+    const childEnv = { ...process.env };
+    for (const key of GIT_DISCOVERY_ENV_KEYS) delete childEnv[key];
+    Object.assign(childEnv, env);
     let child;
     try {
       child = spawn(bin, args, {
         cwd,
-        env: { ...process.env, ...env },
+        env: childEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
-      reject(launchFailed(bin, args, err));
+      reject(launchFailed(bin, args, err, cwd));
       return;
     }
     let stdout = '';
@@ -92,7 +109,7 @@ function runProcess(bin, args, { cwd, env } = {}) {
     child.on('error', (err) => {
       if (settled) return;
       settled = true;
-      reject(launchFailed(bin, args, err));
+      reject(launchFailed(bin, args, err, cwd));
     });
     child.on('close', (code) => {
       if (settled) return;
@@ -117,7 +134,10 @@ function runGh(bin, args, { env } = {}) {
 // #9 会并发跑多个任务，同一个 repo 缓存上的操作（克隆/拉取/worktree/推送）必须排队，
 // 否则 fetch 与 worktree add 互相踩、坏缓存恢复会重复克隆。锁只在进程内有效，足够：
 // 一个夜班进程就是唯一写这些缓存的进程。
-const repoLocks = new Map(); // key（缓存目录路径）-> 队尾 Promise（永不 reject）
+// key 一律经 lockKey() 归一化：ensureRepoCache/createWorktree/removeWorktree 用
+// repoCacheDir(home, repo) 算 key，pushBranch 从 worktree 反推缓存目录算 key——
+// 同一个缓存目录必须落到同一个 key 上，序列化才成立。
+const repoLocks = new Map(); // key（归一化后的缓存目录路径）-> 队尾 Promise（永不 reject）
 
 /** 把 fn 排进 key 的队列里执行；fn 抛出的错误原样传给调用方，不影响后续排队。 */
 function withLock(key, fn) {
@@ -129,6 +149,58 @@ function withLock(key, fn) {
     if (repoLocks.get(key) === tail) repoLocks.delete(key); // 没人排队了就回收，避免 Map 无限增长
   });
   return result;
+}
+
+// —— 路径工具 ——
+
+/** realpath；路径不存在时返回 null（供锁 key / 删除守卫降级用）。 */
+function realpathOrNull(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * child 是否严格位于 parent 之内（按 path.resolve 判定；等于 parent、越出（..）
+ * 或是绝对路径拼接都算不在内）。注意 '..foo' 这种合法目录名不算越出。
+ */
+function isStrictlyInside(child, parent) {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/**
+ * 同一个目录 → 同一个锁 key：resolve 之后再 realpath（解掉符号链接）。
+ * macOS 的 /tmp、用户把 NIGHT_SHIFT_HOME 放进符号链接目录时，resolve 和 realpath
+ * 是两个字符串，不归一就会出现两把锁、序列化失效。目录还不存在（首次克隆前）时
+ * 退回 resolve 结果——此时并发调用拿到的是同一个原始字符串，仍然互斥。
+ */
+function lockKey(dir) {
+  return realpathOrNull(dir) ?? path.resolve(dir);
+}
+
+/**
+ * 删除守卫：rm -rf 只允许删 parentDir 严格之内的路径，双重判定（resolve 与 realpath，
+ * 连「parentDir 之内的符号链指向别处」也拦下），不满足就直接抛错，先于任何删除动作。
+ */
+function assertDeleteInside(target, parentDir, what) {
+  if (!isStrictlyInside(target, parentDir)) {
+    throw new Error(`拒绝删除${what}：${target} 不在 ${parentDir} 之内`);
+  }
+  const targetReal = realpathOrNull(target);
+  const parentReal = realpathOrNull(parentDir) ?? path.resolve(parentDir);
+  if (targetReal !== null && !isStrictlyInside(targetReal, parentReal)) {
+    throw new Error(`拒绝删除${what}：${target} 经符号链接解析后在 ${parentDir} 之外（${targetReal}）`);
+  }
+}
+
+/** 通用参数校验：非空字符串（纯空白也算空）。 */
+function assertNonEmptyString(value, what) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${what}必须是非空字符串，当前：${JSON.stringify(value)}`);
+  }
 }
 
 // —— 仓库标识与地址 ——
@@ -164,15 +236,28 @@ export function remoteUrl(repo, config = {}) {
  * 不在文件系统里多造一层目录，同时避免 owner 相同就互相混淆。
  */
 export function repoCacheDir(home, repo) {
+  assertNonEmptyString(home, 'repoCacheDir 的 home');
   const { owner, name } = parseRepo(repo);
   return path.join(home, 'repos', `${owner}__${name}`);
 }
 
-/** 判断目录是否是一个能跑 git 命令的仓库（不存在 / 半截克隆都算不是）。 */
-async function isUsableRepo(dir) {
+/**
+ * 判断目录是否是一个「就在 dir 本身」的可用缓存形态：
+ * - `rev-parse --show-toplevel` 必须解析到 dir 自己——否则 dir 只是某个更大仓库
+ *   工作区里的子目录（NIGHT_SHIFT_HOME 恰好放在别人的 checkout 里时会出现），
+ *   后续的 set-url / fetch / worktree 操作会误伤那个父仓库；
+ * - `--absolute-git-dir` 必须是 dir/.git——排除裸仓库和别人仓库的 linked worktree
+ *   （它们与主仓库共享远端配置和远端跟踪 ref）。
+ * 命令失败（目录不存在、半截克隆……）或任一条件不满足都算不可用。
+ */
+async function isUsableCache(dir) {
   try {
-    await runGit(['rev-parse', '--git-dir'], { cwd: dir });
-    return true;
+    const { stdout } = await runGit(['rev-parse', '--show-toplevel', '--absolute-git-dir'], { cwd: dir });
+    const [topLevel, gitDir] = stdout.trim().split('\n');
+    const real = realpathOrNull(dir);
+    return real !== null
+      && realpathOrNull(topLevel) === real
+      && realpathOrNull(gitDir) === realpathOrNull(path.join(real, '.git'));
   } catch {
     return false;
   }
@@ -189,14 +274,17 @@ async function originUrl(dir) {
 }
 
 /** 把 dir 变成指向 url 的可用缓存（无则克隆，坏则重建，好则按需改地址并拉取）。 */
-async function syncRepoCache(dir, url) {
-  const usable = await isUsableRepo(dir);
+async function syncRepoCache(home, dir, url) {
+  const usable = await isUsableCache(dir);
   const currentUrl = usable ? await originUrl(dir) : null;
   if (!usable || currentUrl === null) {
     // 不存在、半截克隆，或是没有 origin 远端的怪形态：整个删掉重克隆最稳。
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(dir), { recursive: true });
-    await runGit(['clone', '--no-checkout', url, dir]);
+    // rm -rf 前过删除守卫：只允许删 <home>/repos/ 之内的路径。
+    const target = path.resolve(dir);
+    assertDeleteInside(target, path.join(home, 'repos'), '仓库缓存');
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    await runGit(['clone', '--no-checkout', url, target]);
     return;
   }
   if (currentUrl !== url) {
@@ -211,10 +299,10 @@ async function syncRepoCache(dir, url) {
  * 同一缓存的并发调用会排队执行。返回缓存目录。
  */
 export async function ensureRepoCache({ home, repo, config = {} }) {
-  const dir = repoCacheDir(home, repo);
+  const dir = repoCacheDir(home, repo); // 一并校验 home / repo
   const url = remoteUrl(repo, config);
-  return withLock(dir, async () => {
-    await syncRepoCache(dir, url);
+  return withLock(lockKey(dir), async () => {
+    await syncRepoCache(home, dir, url);
     return dir;
   });
 }
@@ -255,12 +343,13 @@ export function slugify(title) {
 /**
  * 任务对应的分支名：`night-shift/<id>-<slug>`。只允许 night-shift/ 命名空间
  * （pushBranch 也只推这个空间），便于人工识别和批量清理。
- * task.id 必须是正整数，否则抛错。
+ * task.id 只认正整数（number）：字符串 "12" 之类一律拒绝，避免同一个任务因
+ * 调用方传入形态不同而生成两个不同的 worktree/分支。
  */
 export function branchName(task) {
   const id = task?.id;
   if (!Number.isInteger(id) || id <= 0) {
-    throw new Error(`branchName 需要 task.id 为正整数，当前：${JSON.stringify(id)}`);
+    throw new Error(`branchName 需要 task.id 为正整数（number），当前：${JSON.stringify(id)}`);
   }
   return `night-shift/${id}-${slugify(task?.title)}`;
 }
@@ -297,21 +386,34 @@ async function recordedBaseSha(worktree) {
 /**
  * 为任务建 worktree：路径 <home>/worktrees/task-<id>，分支 night-shift/<id>-<slug>，
  * 从 origin/<baseBranch> 检出（-B：重试时分支已存在就强制重置到最新基线）。
- * 先 ensureRepoCache（克隆/拉取），再清理残留的同路径 worktree（上次没删干净），
- * 然后建新的。同一缓存上的并发调用排队执行。
+ *
+ * 只在**已存在的**缓存上干活，自己不克隆、不 fetch、不改 origin 地址——按规格，
+ * #9 以 ensureRepoCache → defaultBranch → createWorktree 的顺序调用；缓存不可用
+ * （没建过、被删了、半截克隆）就直接抛错。否则像 ensureRepoCache 那样带默认
+ * GitHub 模板去 fetch，本地裸远端的缓存会被悄悄 re-point 到 github.com 并联网。
+ *
+ * 残留的同路径 worktree（上次没删干净）先 `worktree remove --force`，删不动再物理
+ * 删目录（只允许删 <home>/worktrees/ 之内）。同一缓存上的并发调用排队执行。
  * @returns {{ path: string, branch: string, baseBranch: string, baseSha: string }}
  */
-export async function createWorktree({ home, repo, task, baseBranch, config = {} }) {
-  const cacheDir = await ensureRepoCache({ home, repo, config });
-  const branch = branchName(task);
+export async function createWorktree({ home, repo, task, baseBranch } = {}) {
+  const branch = branchName(task); // 一并校验 task.id 为正整数
+  assertNonEmptyString(baseBranch, 'createWorktree 的 baseBranch');
+  const cacheDir = repoCacheDir(home, repo); // 一并校验 home / repo
   const worktreePath = path.join(home, 'worktrees', `task-${task.id}`);
-  return withLock(cacheDir, async () => {
+  const worktreesRoot = path.join(home, 'worktrees');
+  return withLock(lockKey(cacheDir), async () => {
+    if (!(await isUsableCache(cacheDir))) {
+      throw new Error(`仓库缓存不存在或不可用：${cacheDir}（请先调用 ensureRepoCache）`);
+    }
     await runGit(['worktree', 'prune'], { cwd: cacheDir });
     if (fs.existsSync(worktreePath)) {
       try {
         await runGit(['worktree', 'remove', '--force', worktreePath], { cwd: cacheDir });
       } catch {
-        // git 元数据里已经没有它（缓存重建过等）：物理删目录再清一次元数据
+        // git 元数据里已经没有它（缓存重建过等）：物理删目录再清一次元数据。
+        // 删除守卫在动手之前：只允许删 <home>/worktrees/ 之内的路径。
+        assertDeleteInside(worktreePath, worktreesRoot, '残留 worktree');
         fs.rmSync(worktreePath, { recursive: true, force: true });
         await runGit(['worktree', 'prune'], { cwd: cacheDir });
       }
@@ -367,9 +469,7 @@ async function commitsAheadOfUpstream(dir) {
  * @returns {{ changed: boolean, sha: string|null }} changed 时 sha 为提交后的完整 HEAD sha
  */
 export async function commitAll({ worktree, message, config = {}, baseSha } = {}) {
-  if (typeof worktree !== 'string' || worktree === '') {
-    throw new Error(`commitAll 需要 worktree 路径，当前：${JSON.stringify(worktree)}`);
-  }
+  assertNonEmptyString(worktree, 'commitAll 的 worktree 路径');
   if (typeof message !== 'string' || message.trim() === '') {
     throw new Error(`commitAll 需要非空的提交说明，当前：${JSON.stringify(message)}`);
   }
@@ -444,9 +544,12 @@ function tailBuffer() {
  * 在 worktree 里跑测试命令：`sh -c <command>`，独立进程组（detached），stdin 忽略。
  * - command 为 null/undefined/纯空白：不跑任何东西，返回 { ok: true, skipped: true }。
  * - 超时（timeoutMs 显式给出，否则 config.testTimeoutMinutes 分钟，默认 15）：
- *   先 SIGTERM 整个进程组（连 sh 的孙进程一起），2 秒后还活着再 SIGKILL 整组。
- * - 进程退出后若输出管道还被后台孙进程占着（`xxx &` 那种），最多再等 500ms 就收尾，
- *   不会一直挂着；收尾时销毁管道，仍在写管道的孙进程会收到 EPIPE 退出。
+ *   先 SIGTERM 整个进程组（连 sh 的孙进程一起），宽限后仍存活再 SIGKILL 整组。
+ * - 测试命令**不允许留下任何进程**：正常退出也一样——resolve 前对整个进程组
+ *   SIGTERM、宽限后 SIGKILL，后台孙进程（`xxx &`）一并清掉（孙进程自己 setsid
+ *   换进程组的拦不住）。所有善后定时器都 unref，不会独自把事件循环拖住。
+ * - 进程退出后若输出管道还被后台孙进程占着，最多再等 CLOSE_GRACE_MS 就收尾；
+ *   收尾时销毁管道，仍在写管道的孙进程会收到 EPIPE。
  * - output 是 stdout+stderr 合并（按到达顺序交错）后的最后 64KiB，按 UTF-8 解码。
  * - 启动失败（sh 不存在、worktree 不存在）不抛错，ok:false，错误信息在 output 里。
  * @returns {{ ok: boolean, skipped: boolean, exitCode: number|null, timedOut: boolean,
@@ -457,6 +560,7 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
   if (command === null || command === undefined || String(command).trim() === '') {
     return { ok: true, skipped: true };
   }
+  assertNonEmptyString(worktree, 'runTestCommand 的 worktree 路径');
   const minutes = config?.testTimeoutMinutes ?? DEFAULT_CONFIG.testTimeoutMinutes;
   const timeout = timeoutMs === null || timeoutMs === undefined
     ? minutes * 60000
@@ -471,7 +575,7 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
     try {
       child = spawn('sh', ['-c', String(command)], {
         cwd: worktree,
-        detached: true, // 独立进程组：超时能把 sh 和它的子孙一起杀掉
+        detached: true, // 独立进程组：超时/收尾能把 sh 和它的子孙一起杀掉
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
@@ -491,11 +595,20 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
     let closeGraceTimer = null;
 
     const killGroup = (signal) => {
+      if (typeof child.pid !== 'number') return;
       try {
         process.kill(-child.pid, signal);
       } catch {
         // 进程组已经不在了，没事
       }
+    };
+
+    // 清理整个进程组：先 SIGTERM，宽限期后仍存活再 SIGKILL。定时器 unref——
+    // 事件循环活着时照常触发，但绝不独自拖住进程。
+    const killGroupEscalating = () => {
+      killGroup('SIGTERM');
+      const killTimer = setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS);
+      killTimer.unref();
     };
 
     const settle = (exitCode) => {
@@ -506,6 +619,7 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
       // 主动收尾时关掉管道：还占着写端的孙进程会收到 EPIPE 而退出
       child.stdout.destroy();
       child.stderr.destroy();
+      killGroupEscalating(); // 正常退出也清场：`xxx &` 留下的后台进程不能活着
       resolve({
         ok: launchErr === null && !timedOut && exitCode === 0,
         skipped: false,
@@ -518,11 +632,9 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
 
     const termTimer = setTimeout(() => {
       timedOut = true;
-      killGroup('SIGTERM');
-      // 有的孙进程会忽略 SIGTERM、或还占着输出管道：宽限后整组 SIGKILL。
-      // 这个定时器故意保留到触发（不 unref、不在 settle 里清），专门兜漏网的孙进程。
-      setTimeout(() => killGroup('SIGKILL'), KILL_GRACE_MS);
+      killGroupEscalating();
     }, timeout);
+    termTimer.unref();
 
     child.on('error', (err) => {
       if (settled) return;
@@ -537,6 +649,7 @@ export async function runTestCommand({ worktree, command, timeoutMs, config = {}
       }
       // 正常退出：等 'close'（管道里剩余输出到齐），最多 CLOSE_GRACE_MS。
       closeGraceTimer = setTimeout(() => settle(code), CLOSE_GRACE_MS);
+      closeGraceTimer.unref();
     });
     child.on('close', (code) => {
       if (!settled) settle(code);
@@ -560,16 +673,40 @@ function failedToLaunch(err, startedAt) {
 }
 
 /**
- * 推送 worktree 的当前提交到远端同名分支。--force-with-lease：重试覆盖时
- * 只有远端仍停在本地上次看到的提交上才允许（防止抹掉别人的提交）。
- * 只接受 night-shift/ 开头的分支名，其他一律拒绝（防止误推 main 等长期分支）。
+ * worktree 所属的仓库缓存目录：linked worktree 的 `--git-common-dir` 指向共享的
+ * <缓存>/.git，取上一级即缓存目录本身。取不到（worktree 不存在等）返回 null，
+ * 调用方退回按 worktree 路径加锁——随后的 push 自己会以更清晰的错误失败。
+ */
+async function worktreeCacheDir(worktree) {
+  try {
+    const { stdout } = await runGit(['rev-parse', '--git-common-dir'], { cwd: worktree });
+    const commonDir = stdout.trim();
+    if (commonDir === '') return null;
+    return lockKey(path.dirname(path.resolve(worktree, commonDir)));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 推送 worktree 的当前提交到远端同名分支。
+ * - `--force-with-lease`（不带参数）：以缓存里的远端跟踪 ref 为准——重试覆盖时
+ *   只有远端仍停在我们见过的位置上才允许，防止抹掉别人的提交。缓存重新克隆/重新
+ *   fetch 后跟踪 ref 与远端一致，覆盖旧分支总是成功；有人在我们上次 fetch 之后
+ *   动过远端分支则被拒（stale info）——这是刻意的保护，再跑一次 ensureRepoCache
+ *   （fetch 刷新跟踪 ref）即可恢复可推。
+ * - push 会更新共享缓存仓库里的远端跟踪 ref，因此与 fetch / worktree 操作排
+ *   同一条队列（从 worktree 反推出的缓存目录，与 ensureRepoCache 用的锁 key 归一）。
+ * - 只接受 night-shift/ 开头的分支名，其他一律拒绝（防止误推 main 等长期分支）。
  * @returns {{ branch: string, sha: string|null }}
  */
 export async function pushBranch({ worktree, branch }) {
   if (typeof branch !== 'string' || !branch.startsWith('night-shift/')) {
     throw new Error(`只允许推送 night-shift/ 命名空间下的分支，当前：${JSON.stringify(branch)}`);
   }
-  return withLock(worktree, async () => {
+  assertNonEmptyString(worktree, 'pushBranch 的 worktree 路径');
+  const key = (await worktreeCacheDir(worktree)) ?? lockKey(worktree);
+  return withLock(key, async () => {
     await runGit(['push', '--force-with-lease', 'origin', `HEAD:refs/heads/${branch}`], { cwd: worktree });
     return { branch, sha: await headSha(worktree) };
   });
@@ -589,6 +726,8 @@ function ghBinOf(config = {}) {
  * env 会叠加进 gh 子进程环境（测试里用来传 FAKE_GH_* 变量并剥掉真实凭据）。
  */
 export async function findOpenPr({ repo, branch, config = {}, env } = {}) {
+  parseRepo(repo); // 校验 owner/name 形状
+  assertNonEmptyString(branch, 'findOpenPr 的 branch');
   const ghBin = ghBinOf(config);
   const args = ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'open', '--json', 'url'];
   const { stdout, stderr } = await runGh(ghBin, args, { env });
@@ -610,13 +749,20 @@ export async function findOpenPr({ repo, branch, config = {}, env } = {}) {
 
 /**
  * 开 PR。先 findOpenPr：已有 open PR 就直接返回它（existed: true，重试幂等）；
- * 否则把 body 写进临时文件（os.tmpdir() 下的独立目录，用完必删），执行
+ * 否则把 body 写进临时文件（os.tmpdir() 下的独立目录，用完必删——gh 启动失败、
+ * 退出非 0、取不到地址等所有路径都走同一个 finally），执行
  * `<ghBin> pr create --repo … --head … --base … --title … --body-file <file>`，
- * 从 stdout 取最后一个 https://…/pull/<数字> 地址。退出码非 0（runGh 抛错）或
- * 取不到地址都抛 GitError（带 stderr）。
+ * 从 stdout 取最后一个 https://…/pull/<数字> 地址。title/base 含空格、Unicode
+ * 或以 '-' 开头都安全：参数数组不经 shell，'--title' 的下一个 token 一律是值。
+ * 退出码非 0（runGh 抛错）或取不到地址都抛 GitError（带 stderr）。
  * @returns {{ url: string, existed: boolean }}
  */
 export async function createPr({ repo, branch, base, title, body, config = {}, env } = {}) {
+  parseRepo(repo); // 校验 owner/name 形状
+  assertNonEmptyString(branch, 'createPr 的 branch');
+  assertNonEmptyString(base, 'createPr 的 base');
+  assertNonEmptyString(title, 'createPr 的 title');
+
   const existing = await findOpenPr({ repo, branch, config, env });
   if (existing !== null) return { url: existing, existed: true };
 
@@ -630,7 +776,7 @@ export async function createPr({ repo, branch, base, title, body, config = {}, e
       '--repo', repo,
       '--head', branch,
       '--base', base,
-      '--title', String(title ?? ''),
+      '--title', title,
       '--body-file', bodyFile,
     ];
     const { stdout, stderr } = await runGh(ghBin, args, { env });
@@ -645,7 +791,12 @@ export async function createPr({ repo, branch, base, title, body, config = {}, e
     }
     return { url, existed: false };
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    // 临时目录清不掉（如 EBUSY）不应吞掉真正的失败原因；os.tmpdir() 系统终会回收
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // 忽略
+    }
   }
 }
 
@@ -810,16 +961,23 @@ function appendFooter(main) {
 /**
  * 删掉任务的 worktree（--force，未提交的改动也一并丢弃）并清 worktree 元数据；
  * 分支保留（远端还有，PR 还挂着）。目录本来就不存在：什么都不做，不报错。
- * 缓存目录没了但 worktree 还在：直接删目录。返回值无意义（undefined）。
+ *
+ * 删除守卫先于一切动作：只允许删 <home>/worktrees/ 严格之内的路径，别的路径
+ * （包括 <home>/worktrees 本身、'..' 越界、指向外部的符号链接）直接抛错——
+ * rm -rf 绝不落到调用方随手传进来的任意路径上。
+ *
+ * 缓存不可用（没了、坏了，或 home 在别人的 checkout 里被误认）：只物理删目录，
+ * 不对父仓库跑 worktree remove/prune。返回 undefined。
  */
-export async function removeWorktree({ home, repo, worktree }) {
-  if (typeof worktree !== 'string' || worktree === '') {
-    throw new Error(`removeWorktree 需要 worktree 路径，当前：${JSON.stringify(worktree)}`);
-  }
-  const cacheDir = repoCacheDir(home, repo);
-  return withLock(cacheDir, async () => {
+export async function removeWorktree({ home, repo, worktree } = {}) {
+  assertNonEmptyString(worktree, 'removeWorktree 的 worktree 路径');
+  const cacheDir = repoCacheDir(home, repo); // 一并校验 home / repo
+  const worktreesRoot = path.join(home, 'worktrees');
+  return withLock(lockKey(cacheDir), async () => {
+    const usable = await isUsableCache(cacheDir);
     if (fs.existsSync(worktree)) {
-      if (await isUsableRepo(cacheDir)) {
+      assertDeleteInside(worktree, worktreesRoot, 'worktree'); // 守卫先于一切删除动作
+      if (usable) {
         try {
           await runGit(['worktree', 'remove', '--force', worktree], { cwd: cacheDir });
         } catch {
@@ -830,7 +988,8 @@ export async function removeWorktree({ home, repo, worktree }) {
         fs.rmSync(worktree, { recursive: true, force: true });
       }
     }
-    if (await isUsableRepo(cacheDir)) {
+    // 目录已不存在时也 prune 一次：目录被手动删过的场合，元数据还挂在 worktree list 里
+    if (usable) {
       await runGit(['worktree', 'prune'], { cwd: cacheDir });
     }
   });
