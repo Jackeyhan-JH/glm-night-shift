@@ -140,6 +140,19 @@ const MIGRATIONS = [
       CREATE INDEX idx_runs_open ON runs (status);
     `);
   },
+  /**
+   * 版本 2：tasks 加 not_before（issue #9 调度器）。
+   * - 限流退避的最早重试时刻（UTC ISO 字符串，与其他时间列一样字典序即时间序；
+   *   写入方 finishTask 会先规范化成 UTC ISO，比较才可靠）。NULL = 立刻可领。
+   * - claimNextTask 跳过 not_before > now 的任务；retryTask 重置任务时清空它。
+   * - idx_tasks_not_before 帮「队列里有不少退避任务」时的领取过滤缩小扫描面。
+   */
+  (db) => {
+    db.exec(`
+      ALTER TABLE tasks ADD COLUMN not_before TEXT NULL;
+      CREATE INDEX idx_tasks_not_before ON tasks (not_before);
+    `);
+  },
 ];
 
 /**

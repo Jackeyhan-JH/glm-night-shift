@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { openDb, MIGRATIONS } from '../src/db.js';
 import {
-  createTask, getTask, listTasks, claimNextTask, finishTask, cancelTask, retryTask,
+  createTask, getTask, listTasks, claimNextTask, claimTaskById, finishTask, cancelTask, retryTask,
   recoverStaleRunning, startRun, setRunLogPath, finishRun, listRuns,
   ValidationError, NotFoundError, InvalidTransitionError,
 } from '../src/tasks.js';
@@ -42,6 +42,7 @@ test('createTask 默认值与字段形状：驼峰、真布尔、null 保留', (
   assert.equal(task.branch, null);
   assert.equal(task.prUrl, null);
   assert.equal(task.lastError, null);
+  assert.equal(task.notBefore, null);
   assert.equal(task.startedAt, null);
   assert.equal(task.finishedAt, null);
   assert.ok(Number.isInteger(task.id));
@@ -176,6 +177,79 @@ test('验收: allowPeakOnly true 时只领取 allowPeak 为 true 的任务', (t)
   );
 });
 
+test('验收: claimNextTask 跳过 not_before > now 的任务；now 缺省为当前时间，接受 Date 或 ISO 串', (t) => {
+  const db = openMemory(t);
+  const now = new Date('2026-10-10T07:00:00Z');
+  const backoff = createTask(db, { ...VALID, priority: 5 }); // 优先级更高，但马上进入退避
+  const ready = createTask(db, { ...VALID, priority: 0 });
+  claimNextTask(db, { now }); // 先领走 backoff（此刻还没有 not_before）
+  finishTask(db, backoff.id, {
+    status: 'queued',
+    lastError: '被限流',
+    notBefore: new Date('2026-10-10T07:15:00Z'),
+    refundAttempt: true,
+  });
+  assert.equal(getTask(db, backoff.id).notBefore, '2026-10-10T07:15:00.000Z');
+
+  // now = 07:00 < 07:15：跳过退避中的，领到 ready
+  const got = claimNextTask(db, { now });
+  assert.equal(got.id, ready.id);
+  finishTask(db, ready.id, { status: 'succeeded' });
+
+  // now = 07:15 恰好到点（含等于）：退避结束，可领
+  const atEdge = claimNextTask(db, { now: '2026-10-10T07:15:00Z' });
+  assert.equal(atEdge.id, backoff.id);
+  finishTask(db, backoff.id, { status: 'failed', lastError: 'x' });
+
+  // 不传 now：按真实当前时间判断
+  const fresh = createTask(db, { ...VALID });
+  assert.equal(claimNextTask(db).id, fresh.id);
+
+  // 非法 now 报 ValidationError（field='now'）
+  assert.throws(
+    () => claimNextTask(db, { now: 'not a date' }),
+    (err) => err instanceof ValidationError && err.field === 'now',
+  );
+});
+
+test('全部任务都在退避中时 claimNextTask 返回 null', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  const now = new Date('2026-10-10T07:00:00Z');
+  claimNextTask(db, { now });
+  finishTask(db, task.id, { status: 'queued', notBefore: new Date('2026-10-10T08:00:00Z') });
+  assert.equal(claimNextTask(db, { now }), null);
+  assert.equal(claimNextTask(db, { now: new Date('2026-10-10T08:00:01Z') }).id, task.id);
+});
+
+test('验收: claimTaskById 只领 queued（无视 not_before），attempts + 1；其余状态抛错', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  // 造一个 not_before 在未来的 queued 任务：claimTaskById 不看它（runNow 语义）
+  claimNextTask(db);
+  finishTask(db, task.id, { status: 'queued', notBefore: new Date('2999-01-01T00:00:00Z') });
+
+  const claimed = claimTaskById(db, task.id);
+  assert.equal(claimed.id, task.id);
+  assert.equal(claimed.status, 'running');
+  assert.equal(claimed.attempts, 2); // 第二次领取
+  assert.ok(!Number.isNaN(Date.parse(claimed.startedAt)));
+
+  // running 不能再领（不是 queued）
+  assert.throws(
+    () => claimTaskById(db, task.id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'running' && err.to === 'running',
+  );
+  finishTask(db, task.id, { status: 'succeeded' });
+  assert.throws(
+    () => claimTaskById(db, task.id),
+    (err) => err instanceof InvalidTransitionError && err.from === 'succeeded',
+  );
+  assert.throws(() => claimTaskById(db, 999), (err) => err instanceof NotFoundError && err.id === 999);
+  assert.throws(() => claimTaskById(db, 0), ValidationError);
+  assert.throws(() => claimTaskById(db, 1.5), ValidationError);
+});
+
 test('listTasks：queued 按队列序，其他状态与不传 status 按 created_at DESC（同毫秒 id DESC）', (t) => {
   const db = openMemory(t);
   const a = createTask(db, { ...VALID, prompt: 'a' });
@@ -247,6 +321,67 @@ test('finishTask → queued（重试）：清 finished_at、保留 started_at，
   assert.equal(reclaimed.id, task.id);
   assert.equal(reclaimed.attempts, 2);
   assert.ok(reclaimed.startedAt >= again.startedAt);
+});
+
+test('验收: finishTask queued 支持 notBefore 与 refundAttempt：写 not_before、attempts − 1 不低于 0', (t) => {
+  const db = openMemory(t);
+  // notBefore 在过去，领取不设障碍（跳过逻辑另测）
+  const afterBackoff = new Date('2026-10-10T09:00:00Z');
+  // 第一次：attempts 1 → 退还到 0，并写退避时刻
+  const task = createTask(db, { ...VALID });
+  claimNextTask(db, { now: afterBackoff });
+  const requeued = finishTask(db, task.id, {
+    status: 'queued',
+    lastError: '被限流，稍后重试',
+    notBefore: '2026-10-10T08:00:00Z',
+    refundAttempt: true,
+  });
+  assert.equal(requeued.status, 'queued');
+  assert.equal(requeued.attempts, 0);
+  assert.equal(requeued.notBefore, '2026-10-10T08:00:00.000Z');
+  assert.equal(requeued.finishedAt, null);
+  assert.equal(getTask(db, task.id).notBefore, '2026-10-10T08:00:00.000Z');
+
+  // 再领再退：attempts 已是 1 → 0，不会变负
+  claimNextTask(db, { now: afterBackoff });
+  const again = finishTask(db, task.id, { status: 'queued', refundAttempt: true });
+  assert.equal(again.attempts, 0);
+  // 不给 notBefore：保持原值（本次是停机中断语义——不写退避）
+  assert.equal(again.notBefore, '2026-10-10T08:00:00.000Z');
+
+  // notBefore 传 null 显式清空
+  claimNextTask(db, { now: afterBackoff });
+  const cleared = finishTask(db, task.id, { status: 'queued', notBefore: null });
+  assert.equal(cleared.notBefore, null);
+  claimNextTask(db, { now: afterBackoff });
+  finishTask(db, task.id, { status: 'failed', lastError: 'x' });
+});
+
+test('finishTask 的 notBefore / refundAttempt 参数校验与「仅 queued 可用」', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  claimNextTask(db);
+  assert.throws(
+    () => finishTask(db, task.id, { status: 'queued', refundAttempt: 'yes' }),
+    (err) => err instanceof ValidationError && err.field === 'refundAttempt',
+  );
+  assert.throws(
+    () => finishTask(db, task.id, { status: 'queued', notBefore: 'not a date' }),
+    (err) => err instanceof ValidationError && err.field === 'notBefore',
+  );
+  // 成功/失败是终态，没有重试语义
+  assert.throws(
+    () => finishTask(db, task.id, { status: 'failed', lastError: 'x', refundAttempt: true }),
+    (err) => err instanceof ValidationError && err.field === 'refundAttempt',
+  );
+  assert.throws(
+    () => finishTask(db, task.id, { status: 'failed', lastError: 'x', notBefore: new Date() }),
+    (err) => err instanceof ValidationError && err.field === 'notBefore',
+  );
+  // 不带这两个字段的传统用法不受影响
+  const done = finishTask(db, task.id, { status: 'failed', lastError: 'x' });
+  assert.equal(done.attempts, 1); // 不退还
+  assert.equal(done.notBefore, null);
 });
 
 test('finishTask 只允许 running → succeeded|failed|queued，其余抛 InvalidTransitionError', (t) => {
@@ -345,6 +480,24 @@ test('验收: retryTask 把 failed 任务变回 queued 且 attempts 归零、las
   finishTask(db, succeeded.id, { status: 'succeeded' });
   assert.throws(() => retryTask(db, succeeded.id), (err) => err.from === 'succeeded');
   assert.throws(() => retryTask(db, 999), (err) => err instanceof NotFoundError && err.id === 999);
+});
+
+test('retryTask 清空 not_before（人工重试不再受限流退避约束）', (t) => {
+  const db = openMemory(t);
+  const task = createTask(db, { ...VALID });
+  claimNextTask(db);
+  finishTask(db, task.id, {
+    status: 'queued',
+    lastError: '被限流',
+    notBefore: new Date('2999-01-01T00:00:00Z'),
+    refundAttempt: true,
+  });
+  // 人工取消后重试（retryTask 只收 failed | canceled）：not_before 清空，立刻可领
+  cancelTask(db, task.id);
+  const retried = retryTask(db, task.id);
+  assert.equal(retried.notBefore, null);
+  assert.equal(retried.lastError, null);
+  assert.equal(claimNextTask(db).id, task.id); // 无需等到 2999 年
 });
 
 // ---------------------------------------------------------------- 崩溃恢复
@@ -555,7 +708,7 @@ test('listRuns：taskId / since / limit 过滤，started_at DESC → id DESC，s
 
 // ---------------------------------------------------------------- 持久性与并发
 
-test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_version 等于迁移步数（当前为 1），迁移不重跑', (t) => {
+test('验收: 关闭再用 openDb 打开同一文件，数据仍在，user_version 等于迁移步数，迁移不重跑', (t) => {
   const file = tempDbFile(t);
   const db = openDb(file);
   const task = createTask(db, { ...VALID, priority: 2 });
