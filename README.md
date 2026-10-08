@@ -110,6 +110,8 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `oneTaskPerRepo` | `true` | 某仓库已有 running 任务时先不领它的其他排队任务（只在 concurrency > 1 时看得到；`false` 允许同一仓库并行，但它们都往同一默认分支开 PR，容易打架；不限制排队条数，同一仓库不分分支算同一把锁） | — |
 | `autoFollowReviews` | `false` | `true` 时调度器在非高峰自动扫描已成功任务的 PR 评审（`follow --all` 同一套判定），有 CHANGES_REQUESTED 就入队跟进；`false` 时调度器不轮询、任何一轮都不为此调用 `gh`，想跟进手动跑 `follow` | — |
 | `followPollMinutes` | `30` | 两次自动扫描至少间隔的分钟数（正数）；高峰期间不扫也不计时，高峰一结束的下一轮就能扫 | — |
+| `prStatus` | `false` | `true` 时调度器定期用 `gh pr view` 查已成功任务 PR 的 state，把结论记到任务上（详情页出现「PR 结果：已合并 / 已关闭」行）；打开后**高峰也会查**（与 `autoFollowReviews` 相反），只写 `prOutcome`、不改变任务 status，已是 `merged` / `closed` 的不再查；`false` 时调度器不轮询、任何一轮都不为此调用 `gh` | — |
+| `prStatusPollMinutes` | `30` | 两次 PR 状态查询至少间隔的分钟数（正数），高峰、手动暂停、限流退避期间照样计时 | — |
 
 环境变量总览（详情见 [docs/configuration.md](docs/configuration.md)）：`NIGHT_SHIFT_HOME`
 （数据目录）、`NIGHT_SHIFT_CLAUDE_BIN`、`NIGHT_SHIFT_GH_BIN`、`NIGHT_SHIFT_SYSTEMCTL_BIN`、

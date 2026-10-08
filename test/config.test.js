@@ -39,6 +39,8 @@ const EXPECTED_DEFAULTS = {
   oneTaskPerRepo: true,
   autoFollowReviews: false,
   followPollMinutes: 30,
+  prStatus: false,
+  prStatusPollMinutes: 30,
 };
 
 test('默认配置与规格一致，且被深层冻结', () => {

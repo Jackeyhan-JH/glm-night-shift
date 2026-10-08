@@ -120,6 +120,9 @@ export class DependencyBlockedError extends InvalidTransitionError {
  * @property {number} maxAttempts
  * @property {?string} branch
  * @property {?string} prUrl
+ * @property {?('open'|'merged'|'closed')} prOutcome PR 在 GitHub 上的结论（#56）：调度器
+ *   开 prStatus 时由 gh pr view 的 state 映射写入（OPEN/MERGED/CLOSED → open/merged/closed），
+ *   未查过为 null；只记录结论，不改变任务自身的 status
  * @property {?string} lastError
  * @property {?string} notBefore UTC ISO，限流退避的最早重试时刻（claimNextTask 在
  *   not_before > now 时跳过该任务）；null = 立刻可领
@@ -1375,6 +1378,7 @@ function rowToTask(row, dependsOn = [], blockedBy = []) {
     maxAttempts: row.max_attempts,
     branch: row.branch,
     prUrl: row.pr_url,
+    prOutcome: row.pr_outcome ?? null,
     lastError: row.last_error,
     notBefore: row.not_before,
     createdAt: row.created_at,

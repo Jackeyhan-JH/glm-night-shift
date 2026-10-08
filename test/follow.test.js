@@ -169,7 +169,12 @@ test('验收: 打开没有 git_ref 列的旧库，user_version 只加 1，旧任
 
   const db = openDb(file);
   t.after(() => db.close());
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, previous.length + 1, '迁移后 = 迁移前 + 1');
+  // git_ref 之后又追加了迁移（#56 的 pr_outcome 等）时，这次升级会一并补到最新：
+  // 增量不再恰好是 1，只断言 user_version 前进到了当前步数（不写死数字）。
+  assert.ok(
+    db.prepare('PRAGMA user_version').get().user_version > previous.length,
+    '迁移后 user_version 应前进',
+  );
   assert.equal(db.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
   const row = db.prepare('SELECT title, git_ref FROM tasks WHERE id = 1').get();
   assert.equal(row.title, '旧标题', '旧任务还在');

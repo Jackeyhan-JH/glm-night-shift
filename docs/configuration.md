@@ -242,6 +242,26 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
 等满一个间隔。扫描中 `gh` 失败同样算查过（调度器记一条日志、本轮不再扫其余父任务），
 至少隔这么多分钟才会再试。
 
+### prStatus
+
+布尔值，默认 `false`。`true` 时调度器（`serve` / `start`）定期用
+`gh pr view --json state,mergedAt` 查询已成功任务的 PR state，把结论记在任务上
+（详情页 PR 行后面出现「PR 结果」：`MERGED` → 已合并、`CLOSED` → 已关闭）。
+默认 `false` 时调度器不轮询：任何一轮 tick 都不会为这件事调用 `gh`。
+
+- 与 `autoFollowReviews` 相反，打开后**高峰也会查**；手动 `pause`、限流退避期间
+  同样查（只写结论，不领取、不入队）。
+- 只把结论写进任务的 `prOutcome`，**不改变任务 status**（成功仍是成功）；已经是
+  `merged` / `closed` 的不再查，`open` 的下一轮间隔到了还会再查。
+- gh 返回的 state 不是 `OPEN` / `MERGED` / `CLOSED`（大小写敏感）、或输出不是
+  JSON 对象时，记一条日志、跳过该任务，不写入任何结论。
+
+### prStatusPollMinutes
+
+两次 PR 状态查询至少间隔的分钟数，正数，默认 `30`。间隔按调度器自己的时钟计算，
+从未查过时第一次符合条件的 tick 立刻查（包括高峰）。`gh` 失败同样算查过（调度器记
+一条日志、本轮停止，不查后面的任务），至少隔这么多分钟才会再试。
+
 ## 完整 config.json 示例
 
 下面的值全部等于默认值，可以直接拷去改（删掉不想显式写的键即可，缺省键自动用默认值）：
@@ -279,7 +299,9 @@ claude 返回 429 / rate limit 时的退避时长，分钟数，正数，默认 
   "systemctlBin": "systemctl",
   "oneTaskPerRepo": true,
   "autoFollowReviews": false,
-  "followPollMinutes": 30
+  "followPollMinutes": 30,
+  "prStatus": false,
+  "prStatusPollMinutes": 30
 }
 ```
 
