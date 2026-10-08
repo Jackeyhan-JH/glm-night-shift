@@ -136,19 +136,22 @@ export function canFollow(task) {
 
 /**
  * 建任务详情页。浏览器里不传参（见文件末尾的自动引导）；测试传 doc / location /
- * EventSource / timers 桩。返回 page 对象：refs 暴露关键节点（测试断言用），
+ * EventSource / timers / confirm 桩。返回 page 对象：refs 暴露关键节点（测试断言用），
  * busy 是最近一次异步操作的 Promise（测试等待用）。
  * @param {object} [options]
  * @param {Document} [options.doc]
  * @param {{ search: string }} [options.location]
  * @param {typeof EventSource} [options.EventSource]
  * @param {object} [options.timers] { setInterval, clearInterval, setTimeout, clearTimeout }
+ * @param {(message: string) => boolean} [options.confirm=globalThis.confirm] 「立刻跑」的
+ *   二次确认（#83）；返回值不是严格 true 就不发请求
  */
 export function createPage(options = {}) {
   const doc = options.doc ?? globalThis.document;
   const where = options.location ?? globalThis.location;
   const EventSourceCtor = options.EventSource ?? globalThis.EventSource;
   const timers = options.timers ?? globalThis;
+  const confirmBox = options.confirm ?? globalThis.confirm;
   if (doc === undefined || doc === null) throw new Error('createPage 需要 document');
   if (where === undefined || where === null) throw new Error('createPage 需要 location');
 
@@ -190,12 +193,15 @@ export function createPage(options = {}) {
   cancelBtn.textContent = '取消';
   const retryBtn = doc.createElement('button');
   retryBtn.textContent = '重试';
+  const runNowBtn = doc.createElement('button');
+  runNowBtn.textContent = '立刻跑';
   const followBtn = doc.createElement('button');
   followBtn.textContent = '跟进';
   const actionMsg = doc.createElement('span');
   actionMsg.className = 'action-msg';
   actions.appendChild(cancelBtn);
   actions.appendChild(retryBtn);
+  actions.appendChild(runNowBtn);
   actions.appendChild(followBtn);
   actions.appendChild(actionMsg);
   taskHead.appendChild(headTitle);
@@ -292,6 +298,9 @@ export function createPage(options = {}) {
   retryBtn.addEventListener('click', () => {
     page.busy = runAction(retryBtn, `/api/tasks/${state.id}/retry`);
   });
+  runNowBtn.addEventListener('click', () => {
+    page.busy = runRunNow();
+  });
   followBtn.addEventListener('click', () => {
     page.busy = runFollow();
   });
@@ -360,6 +369,29 @@ export function createPage(options = {}) {
       actionMsg.textContent = err?.message ?? String(err);
     } finally {
       btn.disabled = false;
+    }
+  }
+
+  /**
+   * 「立刻跑」（#83）：先二次确认——立刻跑会无视高峰、额度和暂停，代价要说在前头；
+   * 依赖没完成的不会跑（服务端 claimTaskById 挡着），这句也一并说清。confirm 的返回
+   * 值不是严格 true 就不发请求。确认后 POST /api/tasks/:id/run-now（body {}，api()
+   * 自带 JSON Content-Type）。202 后 doRefresh（状态变为 running；不为这次成功去
+   * closeStream——已有日志流接着用）；409 / 404 及其他失败把 api() 抛出的 error
+   * 文本写到 actionMsg（与取消失败同一处），不当成成功刷新掉。
+   */
+  async function runRunNow() {
+    const ok = confirmBox('立刻跑会无视高峰、额度和暂停；依赖没完成的不会跑。确定现在就跑？');
+    if (ok !== true) return;
+    runNowBtn.disabled = true;
+    actionMsg.textContent = '';
+    try {
+      await api(`/api/tasks/${state.id}/run-now`, { method: 'POST', body: {} });
+      await doRefresh();
+    } catch (err) {
+      actionMsg.textContent = err?.message ?? String(err);
+    } finally {
+      runNowBtn.disabled = false;
     }
   }
 
@@ -586,6 +618,9 @@ export function createPage(options = {}) {
     headBadge.textContent = statusLabel(task.status);
     cancelBtn.style.display = task.status === 'queued' || task.status === 'running' ? '' : 'none';
     retryBtn.style.display = task.status === 'failed' || task.status === 'canceled' ? '' : 'none';
+    // 「立刻跑」（#83）：只对排队中的任务露出（running 已在跑、终态各有 cancel/retry/
+    // follow 的去处）；与取消 / 重试同一手法——不满足时 display 'none'，元素留在骨架里。
+    runNowBtn.style.display = task.status === 'queued' ? '' : 'none';
     // 「跟进」（#68）：与取消 / 重试同一手法——不满足时 display 'none'，元素留在骨架里。
     followBtn.style.display = canFollow(task) ? '' : 'none';
 
@@ -827,8 +862,8 @@ export function createPage(options = {}) {
   const page = {
     /** 关键节点，测试断言用；页面逻辑不该依赖从这里读。 */
     refs: {
-      root, app, fields, promptFold, promptBody, cancelBtn, retryBtn, followBtn, actionMsg,
-      runsTBody, logLabel, logView, rawBtn, simpleBtn, rawLogLink, jumpBtn, headBadge,
+      root, app, fields, promptFold, promptBody, cancelBtn, retryBtn, runNowBtn, followBtn,
+      actionMsg, runsTBody, logLabel, logView, rawBtn, simpleBtn, rawLogLink, jumpBtn, headBadge,
     },
     /** 最近一次异步操作（refresh / 选运行 / 取消重试）的 Promise，测试等待用。 */
     busy: null,
