@@ -107,7 +107,7 @@ night-shift add --repo owner/name --prompt "在地基上盖楼" --depends-on 1
 | `diagnoseModel` | `"glm-5.3-flash"` | 失败诊断用的模型（只读，不开思考） | — |
 | `diagnoseTimeoutMinutes` | `5` | 单次诊断的超时（分钟） | — |
 | `systemctlBin` | `"systemctl"` | install-service / uninstall-service 调用的 systemctl | `NIGHT_SHIFT_SYSTEMCTL_BIN` |
-| `oneTaskPerRepo` | `true` | 某仓库已有 running 任务时先不领它的其他排队任务（只在 concurrency > 1 时看得到；`false` 允许同一仓库并行，但它们都往同一默认分支开 PR，容易打架；不限制排队条数，同一仓库不分分支算同一把锁） | — |
+| `oneTaskPerRepo` | `true` | 某仓库已有 running 任务时先不领它的其他排队任务（只在 concurrency > 1 时看得到；`false` 允许同一仓库并行，但它们都往同一默认分支开 PR，容易打架；不限制排队条数，同一仓库不分分支算同一把锁）「同仓库一个」（`oneTaskPerRepo`，默认 `true`）开着时，排队任务的仓库字符串和另一条正在跑的任务相同，队列行、详情页多出来的一行，以及命令行 list / show 的状态文字里都会出现「等这个仓库」；详情页这一行不替换暂停、额度、高峰或调度器没在跑。同仓库上其他还在排队的不算，只有正在跑的那条算；这句读的是磁盘上的配置，和正在跑的进程可能要等到重启才一致，也不改变谁会被领走。 | — |
 | `autoFollowReviews` | `false` | `true` 时调度器在非高峰自动扫描已成功任务的 PR 评审（`follow --all` 同一套判定），有 CHANGES_REQUESTED 就入队跟进；`false` 时调度器不轮询、任何一轮都不为此调用 `gh`，想跟进手动跑 `follow` | — |
 | `followPollMinutes` | `30` | 两次自动扫描至少间隔的分钟数（正数）；高峰期间不扫也不计时，高峰一结束的下一轮就能扫 | — |
 | `prStatus` | `false` | `true` 时调度器定期用 `gh pr view` 查已成功任务 PR 的 state，把结论记到任务上（详情页出现「PR 结果：已合并 / 已关闭」行）；打开后**高峰也会查**（与 `autoFollowReviews` 相反），只写 `prOutcome`、不改变任务 status，已是 `merged` / `closed` 的不再查；`false` 时调度器不轮询、任何一轮都不为此调用 `gh` | — |
