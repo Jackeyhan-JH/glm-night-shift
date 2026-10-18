@@ -9,7 +9,7 @@
 - 时间存 UTC ISO 字符串，显示才转本地时区。
 
 ## 测试
-- `npm test`，要在 Node 24 和 Node 22.13 各跑一遍：`PATH=/tmp/node-v22.13.0-linux-x64/bin:$PATH npm test`。跑完 `git status` 必须干净。
+- `npm test`，要在 Node 24 和 Node 22.13 各跑一遍：`PATH=/tmp/node-v22.13.0-linux-x64/bin:$PATH npm test`（Node 22.13 的路径按本机实际位置替换）。跑完 `git status` 必须干净。
 - 每条验收标准对应一个测试，测试名以「验收:」开头，断言字面值。
 - 测试里的 `claude`、`gh`、`systemctl` 一律用 `test/fixtures/` 里的假替身（`fake-claude.mjs`、`fake-gh.mjs`、`fake-systemctl.mjs`），环境用 `fakeEnv({...})`，临时目录用 `makeTempHome(t)`。不碰 `~/.glm-night-shift`，不联网（本机回环 HTTP 可以）。
 - 绝不在测试里调用真实 claude / gh，不消耗 GLM 额度。需要隔离验证时用 `/workspace/glm-night-shift-work/sandbox-test.sh <目录> <命令>`，结果里 `trap_hits` 必须是 0。
@@ -19,7 +19,7 @@
 ## 禁止
 - 不读也不打印 `~/.claude/settings.json`，不在日志、提交、PR 里出现任何 token / key；不改 `~/.claude` 全局配置。
 - 不碰其他 worktree、其他团队的目录和脚本；不杀不是自己起的进程。
-- 不 merge PR，不改 issue 标签，不给 issue 打 `ready`。
+- 不 merge PR。只给 #1 或规格明确写了「开发可自己打 ready」的 issue 打 `ready`，其余不改标签。
 - `gh issue view` 要加 `--json`（不加会因 Projects-classic 弃用报错）；`gh pr edit` 同理会失败，改标题/正文用 REST 或 MCP。
 
 ## 分支、提交、PR
